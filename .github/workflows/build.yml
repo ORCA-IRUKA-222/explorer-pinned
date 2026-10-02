@@ -39,14 +39,19 @@ jobs:
           if-no-files-found: error
 
   e2e:
-    name: End-to-end test (${{ matrix.os }})
+    name: End-to-end test (${{ matrix.os }} seed ${{ matrix.seed }} wait ${{ matrix.wait }})
     needs: build
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-2022, windows-2025]
+        os: [windows-2025]
+        seed: ["0", "1"]
+        wait: ["0", "10000"]
+    env:
+      EP_E2E_SEED: ${{ matrix.seed }}
+      EP_E2E_SEED_WAIT: ${{ matrix.wait }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -85,7 +90,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: screenshots-${{ matrix.os }}
+          name: screenshots-${{ matrix.os }}-${{ matrix.seed }}-${{ matrix.wait }}
           path: screenshots
           if-no-files-found: ignore
 
