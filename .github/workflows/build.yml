@@ -179,6 +179,7 @@ jobs:
           if (Test-Path -LiteralPath "HKCU:\Software\Classes\*\shell\ExplorerPinned.Pin") { throw "menu left behind" }
           if (Test-Path "HKCU:\Software\ExplorerPinned") { throw "settings left behind" }
           if (Test-Path "$env:LOCALAPPDATA\ExplorerPinned") { throw "log left behind" }
+          if (Test-Path "$env:ProgramData\ExplorerPinned") { throw "schema file left behind" }
           if ((Get-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run).ExplorerPinned) { throw "startup entry left behind" }
           $schemas = Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\PropertySystem\PropertySchema" -ErrorAction SilentlyContinue |
             ForEach-Object { (Get-ItemProperty $_.PSPath).PSObject.Properties.Value } | Where-Object { "$_" -like "*ExplorerPinned*" }

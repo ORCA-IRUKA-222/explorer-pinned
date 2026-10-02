@@ -10,6 +10,7 @@ set(EP_SOURCES
     src/agent.cpp
     src/comutil.cpp
     src/console.cpp
+    src/displaycheck.cpp
     src/main.cpp
     src/pinstore.cpp
     src/setup.cpp

@@ -18,8 +18,17 @@ void SetStartupEnabled(bool enabled);
 // Property description that gives the "Pinned" group its label.
 // Registration writes to HKLM and therefore needs administrator rights.
 bool IsSchemaRegistered();
-HRESULT RegisterSchema();
+HRESULT RegisterSchema();    // also removes earlier registrations of this program
 HRESULT UnregisterSchema();
+std::wstring SchemaPath();   // %ProgramData%\ExplorerPinned\ExplorerPinnedGroup.propdesc
+
+struct SchemaRegistration {
+    std::wstring path;
+    bool legacy;  // ExplorerPinned.propdesc of version 1.0.x
+    bool exists;
+};
+std::vector<SchemaRegistration> SchemaRegistrations();
+
 // Runs this executable elevated with `args` and waits for it. Returns its exit code (or -1).
 int RunElevated(const std::wstring& args);
 

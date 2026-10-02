@@ -482,6 +482,34 @@ bool IsPinnedInRegistry(const std::wstring& path) {
     return ok;
 }
 
+// The schema file of version 1.0.x (ExplorerPinned.propdesc with the old property keys).
+void WriteLegacySchema(const std::wstring& path) {
+    std::wstring xml =
+        L"<?xml version=\"1.0\" encoding=\"utf-16\"?>\r\n"
+        L"<schema xmlns=\"http://schemas.microsoft.com/windows/2006/propertydescription\" schemaVersion=\"1.0\">\r\n"
+        L"  <propertyDescriptionList publisher=\"ExplorerPinned\" product=\"ExplorerPinned\">\r\n";
+    for (int i = 0; i < 2; i++) {
+        xml += std::wstring(L"    <propertyDescription name=\"") + kLegacyPinStateNames[i] + L"\" formatID=\"" +
+               kLegacyPinStateFormatId + L"\" propID=\"" + std::to_wstring(kLegacyPinStateKeys[i].pid) + L"\">\r\n"
+               L"      <searchInfo inInvertedIndex=\"false\" isColumn=\"false\"/>\r\n"
+               L"      <typeInfo type=\"UInt32\" isInnate=\"true\" isViewable=\"true\" groupingRange=\"Enumerated\"/>\r\n"
+               L"      <labelInfo label=\"ピン止め\"/>\r\n"
+               L"      <displayInfo displayType=\"Enumerated\" defaultColumnWidth=\"12\">\r\n"
+               L"        <enumeratedList><enum name=\"Pinned\" value=\"0\" text=\"ピン止め\"/></enumeratedList>\r\n"
+               L"      </displayInfo>\r\n"
+               L"    </propertyDescription>\r\n";
+    }
+    xml += L"  </propertyDescriptionList>\r\n</schema>\r\n";
+    SHCreateDirectoryExW(nullptr, ParentPath(path).c_str(), nullptr);
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD written;
+    const WCHAR bom = 0xFEFF;
+    WriteFile(h, &bom, sizeof(bom), &written, nullptr);
+    WriteFile(h, xml.c_str(), (DWORD)(xml.size() * sizeof(wchar_t)), &written, nullptr);
+    CloseHandle(h);
+}
+
 void WriteBytes(const std::wstring& path, const void* data, size_t size) {
     HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return;
@@ -596,9 +624,39 @@ int wmain(int argc, wchar_t** argv) {
     Check(ExeString(IDS_MENU_PIN_FILE, kJapanese) == L"このファイルをピン止めする", L"Japanese string table");
     Check(ExeString(IDS_MENU_PIN_FILE, kEnglish) == L"Pin this file to the top", L"English string table");
 
+    // --- a machine where version 1.0.x registered ExplorerPinned.propdesc from two folders
+    // and one of the files was deleted afterwards (registration then fails partly and
+    // Explorer can show every item as "Unspecified"); setup must clean that up
+    {
+        std::wstring first = std::wstring(tmp) + L"ep_old_portable\\ExplorerPinned.propdesc";
+        std::wstring second = std::wstring(tmp) + L"ep_old_installed\\ExplorerPinned.propdesc";
+        WriteLegacySchema(first);
+        WriteLegacySchema(second);
+        HRESULT a = PSRegisterPropertySchema(first.c_str());
+        HRESULT b = PSRegisterPropertySchema(second.c_str());
+        DeleteFileW(first.c_str());
+        RemoveDirectoryW(ParentPath(first).c_str());
+        PSRefreshPropertySchema();
+        wchar_t text[96];
+        swprintf_s(text, L"old registrations: 0x%08lx, 0x%08lx", (unsigned long)a, (unsigned long)b);
+        Print(text);
+        Print(L"schemas before setup: " + RegisteredSchemas());
+    }
+
     // --- setup (in Japanese, like the user's machine)
     RegWriteString(HKEY_CURRENT_USER, kRegRoot, L"Language", L"ja");
     Check(RunExe(L"setup --no-startup --no-agent --quiet") == 0, L"setup exits with 0");
+    {
+        std::wstring schemas = RegisteredSchemas();
+        Print(L"schemas after setup: " + schemas);
+        Check(schemas.find(L"\\ExplorerPinned.propdesc") == std::wstring::npos,
+              L"setup removes the registrations of version 1.0.x", schemas);
+        Check(schemas.find(L"\\ExplorerPinned\\ExplorerPinnedGroup.propdesc") != std::wstring::npos &&
+                  schemas.find(L"ExplorerPinnedGroup.propdesc") == schemas.rfind(L"ExplorerPinnedGroup.propdesc"),
+              L"setup registers one schema in ProgramData", schemas);
+        Check(CountLogLines(L"RegisterSchema(") >= 1 && CountLogLines(L"hr=0x000401a0") == 0,
+              L"schema registration succeeds completely");
+    }
     PSRefreshPropertySchema();
     for (int i = 0; i < 2; i++) {
         IPropertyDescription* desc = nullptr;
@@ -780,6 +838,29 @@ int wmain(int argc, wchar_t** argv) {
         Check(WaitFor([&] { return IsEqualPropertyKey(w.GroupBy(), before); }, 15000),
               L"Downloads: original grouping is restored after unpinning");
         DeleteFileW(file.c_str());
+        w.Navigate(g_dir);
+    }
+
+    // --- a folder Explorer saved with the grouping of version 1.0.x (old property key)
+    {
+        std::wstring old = g_dir + L"\\oldgroup";
+        CreateDirectoryW(old.c_str(), nullptr);
+        TouchFile(old + L"\\g1.txt", 2020);
+        TouchFile(old + L"\\g2.txt", 2021);
+        RunExe(L"pin \"" + old + L"\\g1.txt\"");
+        w.Navigate(old);
+        ExpectPinned(w, {L"g1"}, L"old grouping: folder is grouped");
+        w.Refresh();
+        w.view->SetGroupBy(kLegacyPinStateKeys[0], TRUE);
+        Pump(1500);
+        w.Navigate(L"C:\\Windows");
+        w.Navigate(old);
+        ExpectPinned(w, {L"g1"}, L"old grouping: replaced by the pinned group when the folder opens");
+        RunExe(L"unpin \"" + old + L"\\g1.txt\"");
+        ExpectNoPinnedGroup(w, L"old grouping: grouping is removed after unpinning");
+        PROPERTYKEY k = w.GroupBy();
+        Check(!IsEqualPropertyKey(k, kLegacyPinStateKeys[0]) && !IsEqualPropertyKey(k, kLegacyPinStateKeys[1]),
+              L"old grouping: not restored to the old pinned grouping", L"group-by pid " + std::to_wstring(k.pid));
         w.Navigate(g_dir);
     }
 
@@ -986,6 +1067,9 @@ int wmain(int argc, wchar_t** argv) {
         HKEY k;
         Check(RegOpenKeyExW(HKEY_CURRENT_USER, kRegRoot, 0, KEY_READ, &k) != ERROR_SUCCESS, L"uninstall removes settings");
         Check(!PathExists(LogDirectory()), L"uninstall removes the log", LogDirectory());
+        wchar_t programData[MAX_PATH] = L"";
+        GetEnvironmentVariableW(L"ProgramData", programData, MAX_PATH);
+        Check(!PathExists(std::wstring(programData) + L"\\ExplorerPinned"), L"uninstall removes the schema file");
         auto file = MenuItems(g_dir + L"\\alpha.txt");
         Check(!Contains(file, pinLabel), L"uninstall removes the menu", Join(file));
     }

@@ -12,10 +12,12 @@
 #include <set>
 
 #include "comutil.h"
+#include "displaycheck.h"
 #include "pinstore.h"
 #include "resource.h"
 #include "setup.h"
 #include "util.h"
+#include "version.h"
 
 namespace ep {
 namespace {
@@ -81,6 +83,12 @@ int KeyIndex(const PROPERTYKEY& key) {
     return -1;
 }
 
+// Also the keys of version 1.0.x, which Explorer may still have saved for a folder.
+bool IsPinKey(const PROPERTYKEY& key) {
+    return KeyIndex(key) >= 0 || IsEqualPropertyKey(key, kLegacyPinStateKeys[0]) ||
+           IsEqualPropertyKey(key, kLegacyPinStateKeys[1]);
+}
+
 bool IsDisconnected(HRESULT hr) {
     return hr == RPC_E_DISCONNECTED || hr == HRESULT_FROM_WIN32(RPC_S_SERVER_UNAVAILABLE) ||
            hr == HRESULT_FROM_WIN32(RPC_S_CALL_FAILED) || hr == CO_E_OBJNOTCONNECTED;
@@ -88,9 +96,10 @@ bool IsDisconnected(HRESULT hr) {
 
 // Grouping that a folder had before the agent took it over, restored when the
 // folder no longer contains pins.
-void SavePreviousGroupBy(const std::wstring& folder, const PROPERTYKEY& key, BOOL ascending) {
+void SavePreviousGroupBy(const std::wstring& folder, PROPERTYKEY key, BOOL ascending) {
     std::wstring existing;
     if (RegReadString(HKEY_CURRENT_USER, kRegPreviousGroupBy, folder.c_str(), &existing)) return;
+    if (IsPinKey(key)) key = PROPERTYKEY{GUID_NULL, 0};
     wchar_t guid[64];
     StringFromGUID2(key.fmtid, guid, ARRAYSIZE(guid));
     RegWriteString(HKEY_CURRENT_USER, kRegPreviousGroupBy, folder.c_str(),
@@ -110,7 +119,7 @@ bool ReadPreviousGroupBy(const std::wstring& folder, PROPERTYKEY* key, BOOL* asc
     key->fmtid = g;
     key->pid = (DWORD)wcstoul(value.substr(c1 + 1, c2 - c1 - 1).c_str(), nullptr, 10);
     *ascending = value.substr(c2 + 1) != L"0";
-    if (KeyIndex(*key) >= 0) *key = PROPERTYKEY{GUID_NULL, 0};  // never "restore" to our own grouping
+    if (IsPinKey(*key)) *key = PROPERTYKEY{GUID_NULL, 0};  // never "restore" to our own grouping
     return true;
 }
 
@@ -201,6 +210,7 @@ struct TrackedWindow {
     int churn = 0;           // regroups in a row that came soon after the previous one
     bool dropped = false;    // Explorer dropped the values of the grouping applied last
     bool gaveUp = false;     // the grouping did not hold; left alone until the pins change
+    bool displayLogged = false;  // what Explorer shows was written to the log
 };
 
 class Agent {
@@ -259,6 +269,36 @@ private:
 
 Agent* g_agent = nullptr;
 
+// Version, Windows build and the state of the property schema, for diagnosing problems.
+void LogEnvironment(size_t pinCount) {
+    const wchar_t* nt = L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
+    std::wstring product, display, build;
+    RegReadString(HKEY_LOCAL_MACHINE, nt, L"ProductName", &product);
+    RegReadString(HKEY_LOCAL_MACHINE, nt, L"DisplayVersion", &display);
+    RegReadString(HKEY_LOCAL_MACHINE, nt, L"CurrentBuild", &build);
+    DWORD ubr = 0, size = sizeof(ubr);
+    RegGetValueW(HKEY_LOCAL_MACHINE, nt, L"UBR", RRF_RT_REG_DWORD, nullptr, &ubr, &size);
+    LogLine(L"agent " EP_VERSION_STRING_W L" started on %s %s (build %s.%lu), %zu pin(s)", product.c_str(), display.c_str(),
+            build.c_str(), ubr, pinCount);
+    for (const auto& key : kPinStateKeys) {
+        IPropertyDescription* desc = nullptr;
+        HRESULT hr = PSGetPropertyDescription(key, IID_PPV_ARGS(&desc));
+        if (FAILED(hr)) {
+            LogLine(L"  property %lu: not available (0x%08lX)", key.pid, (unsigned long)hr);
+            continue;
+        }
+        PWSTR text = nullptr;
+        PROPVARIANT pinned;
+        InitPropVariantFromUInt32(kPinnedValue, &pinned);
+        desc->FormatForDisplay(pinned, PDFF_DEFAULT, &text);
+        LogLine(L"  property %lu: \"%s\"", key.pid, text ? text : L"?");
+        CoTaskMemFree(text);
+        desc->Release();
+    }
+    for (const auto& r : SchemaRegistrations())
+        LogLine(L"  schema %s%s%s", r.path.c_str(), r.legacy ? L" (old)" : L"", r.exists ? L"" : L" (missing)");
+}
+
 LRESULT CALLBACK Agent::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (g_agent && g_agent->hwnd_ == hwnd) return g_agent->OnMessage(msg, wp, lp);
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -293,7 +333,7 @@ int Agent::Run() {
     SetTimer(hwnd_, kTimerPoll, kPollIntervalMs, nullptr);
     rescanPending_ = true;
     ArmWorkTimer();
-    LogLine(L"agent started, %zu pin(s)", pins_.size());
+    LogEnvironment(pins_.size());
 
     MSG msg;
     for (;;) {
@@ -553,6 +593,7 @@ bool Agent::AcquireView(TrackedWindow& w, bool* newSession) {
     w.churn = 0;
     w.dropped = false;
     w.gaveUp = false;
+    w.displayLogged = false;
     // A view found without seeing its navigation (e.g. when the agent starts) may still be
     // loading; give it a moment.
     if (!w.loading) w.lastLoad = GetTickCount();
@@ -712,7 +753,7 @@ void Agent::ProcessWindow(TrackedWindow& w) {
     int current = KeyIndex(groupKey);
 
     if (names.empty()) {
-        if (current >= 0) RestoreGrouping(w, /*forget=*/true);
+        if (IsPinKey(groupKey)) RestoreGrouping(w, /*forget=*/true);
         // Take over again as soon as a pinned item shows up in this view.
         w.initialized = false;
         w.enforce = false;
@@ -724,6 +765,7 @@ void Agent::ProcessWindow(TrackedWindow& w) {
 
     if (w.enforce) {
         // The pins changed (or "reapply"): start over, also in a view the agent gave up on.
+        w.displayLogged = false;
         w.attempts = 0;
         w.churn = 0;
         w.dropped = false;
@@ -734,6 +776,13 @@ void Agent::ProcessWindow(TrackedWindow& w) {
         w.dropped = false;
         w.initialized = true;
         w.enforce = false;
+        if (!w.displayLogged) {
+            // Record what Explorer actually shows (the values can be in place while Explorer
+            // still lists every item as "Unspecified", e.g. when the schema is not usable).
+            w.displayLogged = true;
+            SHANDLE_PTR hwnd = 0;
+            if (SUCCEEDED(w.browser->get_HWND(&hwnd)) && hwnd) LogDisplayedGroups(reinterpret_cast<HWND>(hwnd), w.folderPath);
+        }
         return;
     }
     // Respect a grouping the user picked in this view after the pinned group was shown;
@@ -753,7 +802,7 @@ void Agent::ProcessWindow(TrackedWindow& w) {
         // Stop instead of reloading the view forever, and don't leave every item in the
         // "Unspecified" group.
         LogLine(L"grouping does not hold in %s after %d attempts; giving up", w.folderPath.c_str(), w.attempts);
-        if (current >= 0) RestoreGrouping(w, /*forget=*/false);
+        if (IsPinKey(groupKey)) RestoreGrouping(w, /*forget=*/false);
         w.gaveUp = true;
         w.enforce = false;
         return;
@@ -820,7 +869,7 @@ void Agent::LeaveView(TrackedWindow& w) {
     if (!w.view || w.folderPath.empty() || w.leaving) return;
     PROPERTYKEY groupKey = {};
     BOOL ascending = TRUE;
-    if (FAILED(w.view->GetGroupBy(&groupKey, &ascending)) || KeyIndex(groupKey) < 0) return;
+    if (FAILED(w.view->GetGroupBy(&groupKey, &ascending)) || !IsPinKey(groupKey)) return;
     w.view->SetRedraw(FALSE);  // the view is about to go away; don't show the regrouping
     RestoreGrouping(w, /*forget=*/false);
     w.leaving = true;
@@ -832,7 +881,7 @@ void Agent::RestoreAll() {
         if (!w->view || w->folderPath.empty()) continue;
         PROPERTYKEY groupKey = {};
         BOOL ascending = TRUE;
-        if (SUCCEEDED(w->view->GetGroupBy(&groupKey, &ascending)) && KeyIndex(groupKey) >= 0)
+        if (SUCCEEDED(w->view->GetGroupBy(&groupKey, &ascending)) && IsPinKey(groupKey))
             RestoreGrouping(*w, /*forget=*/false);
     }
 }
@@ -1129,7 +1178,7 @@ void RestoreFolderInWindow(const GroupedEntry& entry) {
         view = BrowseTo(browser.Get(), folder, reinterpret_cast<PCIDLIST_ABSOLUTE>(entry.idList.data()));
     PROPERTYKEY current = {};
     BOOL ascending = TRUE;
-    if (view && SUCCEEDED(view->GetGroupBy(&current, &ascending)) && KeyIndex(current) >= 0) {
+    if (view && SUCCEEDED(view->GetGroupBy(&current, &ascending)) && IsPinKey(current)) {
         PROPERTYKEY key;
         ReadPreviousGroupBy(folder, &key, &ascending);
         view->SetGroupBy(key, ascending);

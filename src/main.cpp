@@ -94,6 +94,8 @@ std::wstring SchemaLabel() {
 int Status() {
     std::wstring s;
     s += L"schema: " + std::wstring(IsSchemaRegistered() ? L"registered (" + SchemaLabel() + L")" : L"not registered") + L"\n";
+    for (const auto& r : SchemaRegistrations())
+        s += L"  " + r.path + (r.legacy ? L" (old)" : L"") + (r.exists ? L"" : L" (missing)") + L"\n";
     s += L"menu: " + std::wstring(IsContextMenuRegistered() ? L"registered" : L"not registered") + L"\n";
     s += L"startup: " + std::wstring(IsStartupEnabled() ? L"on" : L"off") + L"\n";
     s += L"agent: " + std::wstring(FindAgentWindow() ? L"running" : L"not running") + L"\n";
