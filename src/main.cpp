@@ -44,7 +44,8 @@ void StopAgent() {
     HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, pid);
     PostMessageW(agent, kMsgExit, 1, 0);
     if (process) {
-        WaitForSingleObject(process, 10000);
+        // Restoring the grouping of closed folders opens a hidden window per folder.
+        WaitForSingleObject(process, 60000);
         CloseHandle(process);
     }
 }
@@ -128,7 +129,11 @@ bool EnsureSchema() {
     return IsSchemaRegistered();
 }
 
-int Setup(bool startup, bool startAgent, bool quiet) {
+// `language` is the value of --lang, if given: it becomes the user's language setting so that
+// the menu, the group label and the notification area menu all use the installer's language.
+int Setup(bool startup, bool startAgent, bool quiet, const std::wstring& language) {
+    if (!language.empty())
+        RegWriteString(HKEY_CURRENT_USER, kRegRoot, L"Language", PRIMARYLANGID(UiLanguage()) == LANG_JAPANESE ? L"ja" : L"en");
     bool schemaOk = EnsureSchema();
     UpdateContextMenu(PinStore::LoadAll());
     if (startup) SetStartupEnabled(true);
@@ -139,7 +144,8 @@ int Setup(bool startup, bool startAgent, bool quiet) {
 }
 
 int Uninstall(bool keepSchema, bool quiet) {
-    StopAgent();  // restores the original grouping of open windows
+    StopAgent();               // restores the original grouping of open windows and saved folders
+    RestoreSavedGroupings();   // in case the agent was not running
     RemoveContextMenu();
     SetStartupEnabled(false);
     RegDeleteTreeW(HKEY_CURRENT_USER, kRegRoot);
@@ -163,13 +169,13 @@ int DefaultStart() {
         if (MessageBoxW(nullptr, LoadStr(IDS_MSG_SETUP_PROMPT).c_str(), LoadStr(IDS_APP_NAME).c_str(),
                         MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
             return kOk;
-        if (Setup(/*startup=*/true, /*startAgent=*/false, /*quiet=*/false) != kOk) return kError;
+        if (Setup(/*startup=*/true, /*startAgent=*/false, /*quiet=*/false, /*language=*/L"") != kOk) return kError;
     }
     return RunAgent();
 }
 
 int Dispatch(const std::wstring& command, const std::vector<std::wstring>& rest,
-             const std::function<bool(const wchar_t*)>& hasFlag) {
+             const std::function<bool(const wchar_t*)>& hasFlag, const std::wstring& language) {
     if (command.empty()) return DefaultStart();
     if (command == L"pin" || command == L"unpin" || command == L"toggle") return ChangePins(rest, command);
     if (command == L"list") return ListPins();
@@ -183,7 +189,7 @@ int Dispatch(const std::wstring& command, const std::vector<std::wstring>& rest,
         return kOk;
     }
     if (command == L"setup")
-        return Setup(!hasFlag(L"--no-startup"), !hasFlag(L"--no-agent"), hasFlag(L"--quiet"));
+        return Setup(!hasFlag(L"--no-startup"), !hasFlag(L"--no-agent"), hasFlag(L"--quiet"), language);
     if (command == L"uninstall") return Uninstall(hasFlag(L"--keep-schema"), hasFlag(L"--quiet"));
     if (command == L"register-schema") return RegisterSchemaCommand();
     if (command == L"unregister-schema") return UnregisterSchemaCommand();
@@ -205,14 +211,16 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     auto hasFlag = [&](const wchar_t* flag) {
         return std::any_of(rest.begin(), rest.end(), [&](const std::wstring& a) { return Lower(a) == flag; });
     };
+    std::wstring language;
     for (size_t i = 0; i + 1 < rest.size(); i++)
-        if (Lower(rest[i]) == L"--lang") SetUiLanguage(Lower(rest[i + 1]));
+        if (Lower(rest[i]) == L"--lang") language = Lower(rest[i + 1]);
+    if (!language.empty()) SetUiLanguage(language);
 
     if (command == L"agent") return RunAgent();  // initializes OLE itself
 
     // The property system and shell APIs used below need COM.
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    int code = Dispatch(command, rest, hasFlag);
+    int code = Dispatch(command, rest, hasFlag, language);
     if (SUCCEEDED(hr)) CoUninitialize();
     return code;
 }

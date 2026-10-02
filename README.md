@@ -20,6 +20,7 @@ English summary is [below](#english).
 - エクスプローラー本体を書き換えたり、エクスプローラーに DLL を読み込ませたりしません
   （Windows が公開している COM の API だけを使っています）
 - ファイル自体には何も書き込みません（名前も更新日時も変わりません）
+- 日本語と英語に対応（インストーラーで選んだ言語。ポータブル版は Windows の表示言語）
 - 無料・オープンソース（MIT ライセンス）
 
 ## 動作環境
@@ -181,7 +182,7 @@ Pinned items are shown in a **"Pinned"** group at the top, whatever the sort ord
   (`IFolderView2::SetViewProperty` + `SetGroupBy`). Unpinned items appear in Explorer's built-in "Unspecified" group.
 - Install with `ExplorerPinned-Setup-<version>.exe` from [Releases](https://github.com/ORCA-IRUKA-222/explorer-pinned/releases)
   (administrator permission is needed once to register the "Pinned" label), or unzip the portable build and run `ExplorerPinned.exe`.
-- The UI is in Japanese on Japanese Windows and in English otherwise.
+- The UI is in Japanese or English: the language chosen in the installer, or the Windows display language for the portable build.
 - Limitations: the background process must be running; only one grouping can be active, so the default date groups
   of Downloads are replaced while pins exist in that folder; pins are stored by path (renaming/moving an item unpins it);
   `IFolderView2::SetViewProperty` is marked deprecated in the Windows SDK, so a future Windows update could break it.

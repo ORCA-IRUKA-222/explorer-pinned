@@ -698,10 +698,23 @@ int wmain(int argc, wchar_t** argv) {
         Check(status.find(L"registered (Pinned)") != std::wstring::npos, L"English group label", status);
     }
 
+    // --- a folder that is not open when the agent exits keeps Explorer's saved "Pinned" grouping
+    std::wstring other = g_dir + L"\\other";
+    CreateDirectoryW(other.c_str(), nullptr);
+    TouchFile(other + L"\\o1.txt", 2020);
+    TouchFile(other + L"\\o2.txt", 2021);
+    RunExe(L"pin \"" + other + L"\\o1.txt\"");
+    w.Navigate(other);
+    ExpectPinned(w, {L"o1"}, L"second folder is grouped");
+    w.Navigate(g_dir);
+
     // --- exit restores the grouping; uninstall cleans up
     RunExe(L"exit");
     Check(WaitFor([] { return FindWindowW(kAgentWindowClass, nullptr) == nullptr; }, 10000), L"exit stops the agent");
     ExpectNoPinnedGroup(w, L"exit restores the original grouping");
+    w.Navigate(other);
+    ExpectNoPinnedGroup(w, L"exit restores the grouping of folders that were not open");
+    w.Navigate(g_dir);
     Check(RunExe(L"uninstall --quiet") == 0, L"uninstall exits with 0");
     Print(L"schemas after uninstall: " + RegisteredSchemas());
     {

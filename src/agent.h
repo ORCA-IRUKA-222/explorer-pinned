@@ -14,4 +14,8 @@ HWND FindAgentWindow();
 // Starts the agent in a new process when none is running.
 bool EnsureAgentRunning();
 
+// Explorer saves each folder's grouping. For folders the agent grouped that are not open,
+// opens each one in a hidden Explorer window and puts its original grouping back.
+void RestoreSavedGroupings();
+
 }  // namespace ep

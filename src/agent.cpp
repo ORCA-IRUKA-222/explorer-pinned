@@ -230,7 +230,11 @@ int Agent::Run() {
         if (quit) break;
     }
 
-    if (restoreOnExit_) RestoreAll();
+    if (restoreOnExit_) {
+        RestoreAll();
+        windows_.clear();
+        RestoreSavedGroupings();
+    }
     windows_.clear();
     shellWindowsEvents_.Reset();
     shellWindows_.Reset();
@@ -713,7 +717,97 @@ void Agent::OnCommand(UINT id) {
     }
 }
 
+void PumpFor(DWORD ms) {
+    DWORD end = GetTickCount() + ms;
+    do {
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) continue;  // already quitting
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        MsgWaitForMultipleObjects(0, nullptr, FALSE, 20, QS_ALLINPUT);
+    } while ((int)(end - GetTickCount()) > 0);
+}
+
+std::vector<std::wstring> SavedGroupingFolders() {
+    std::vector<std::wstring> folders;
+    HKEY key;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegPreviousGroupBy, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) return folders;
+    wchar_t name[32768];
+    for (DWORD i = 0;; i++) {
+        DWORD len = ARRAYSIZE(name);
+        if (RegEnumValueW(key, i, name, &len, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+        folders.emplace_back(name, len);
+    }
+    RegCloseKey(key);
+    return folders;
+}
+
+// Opens `folder` in a new, hidden Explorer window and restores its grouping; closing the
+// window makes Explorer save the restored view state.
+void RestoreFolderInHiddenWindow(const std::wstring& folder) {
+    ComPtr<IWebBrowser2> browser;
+    if (FAILED(CoCreateInstance(CLSID_ShellBrowserWindow, nullptr, CLSCTX_LOCAL_SERVER,
+                                IID_PPV_ARGS(browser.Put()))))
+        return;
+    browser->put_Visible(VARIANT_FALSE);
+    VARIANT target, empty;
+    VariantInit(&empty);
+    target.vt = VT_BSTR;
+    target.bstrVal = SysAllocString(folder.c_str());
+    browser->Navigate2(&target, &empty, &empty, &empty, &empty);
+    VariantClear(&target);
+
+    ComPtr<IFolderView2> view;
+    for (int i = 0; i < 50 && !view; i++) {
+        PumpFor(100);
+        ComPtr<IServiceProvider> sp = browser.As<IServiceProvider>();
+        ComPtr<IShellBrowser> sb;
+        ComPtr<IShellView> sv;
+        if (sp && SUCCEEDED(sp->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(sb.Put()))) &&
+            SUCCEEDED(sb->QueryActiveShellView(sv.Put()))) {
+            ComPtr<IFolderView2> candidate = sv.As<IFolderView2>();
+            ComPtr<IPersistFolder2> pf;
+            PIDLIST_ABSOLUTE pidl = nullptr;
+            if (candidate && SUCCEEDED(candidate->GetFolder(IID_PPV_ARGS(pf.Put()))) &&
+                SUCCEEDED(pf->GetCurFolder(&pidl))) {
+                PWSTR path = nullptr;
+                if (SUCCEEDED(SHGetNameFromIDList(pidl, SIGDN_FILESYSPATH, &path))) {
+                    if (PathEqualsI(NormalizePath(path), folder)) view = candidate;
+                    CoTaskMemFree(path);
+                }
+                CoTaskMemFree(pidl);
+            }
+        }
+    }
+    if (view) {
+        PROPERTYKEY current = {};
+        BOOL ascending = TRUE;
+        if (SUCCEEDED(view->GetGroupBy(&current, &ascending)) && KeyIndex(current) >= 0) {
+            PROPERTYKEY key;
+            TakePreviousGroupBy(folder, &key, &ascending);
+            view->SetGroupBy(key, ascending);
+            PumpFor(300);
+            LogLine(L"restored grouping of %s", folder.c_str());
+        } else {
+            RegDeleteValueIn(HKEY_CURRENT_USER, kRegPreviousGroupBy, folder.c_str());
+        }
+    }
+    browser->Quit();
+    PumpFor(200);
+}
+
 }  // namespace
+
+void RestoreSavedGroupings() {
+    for (const auto& folder : SavedGroupingFolders()) {
+        if (PathExists(folder))
+            RestoreFolderInHiddenWindow(folder);
+        else
+            RegDeleteValueIn(HKEY_CURRENT_USER, kRegPreviousGroupBy, folder.c_str());
+    }
+}
 
 HWND FindAgentWindow() { return FindWindowW(kAgentWindowClass, nullptr); }
 
