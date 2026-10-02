@@ -154,7 +154,7 @@ static std::wstring TakeEvents() {
 }
 
 // ---------------- files ----------------
-static std::wstring g_exe, g_epExe, g_big, g_downloads;
+static std::wstring g_exe, g_epExe, g_big, g_downloads, g_dir;
 
 static void SetTimes(const std::wstring& path, int hoursAgo) {
     HANDLE h = CreateFileW(path.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
@@ -712,6 +712,61 @@ static void Try(const PROPERTYKEY& key, const wchar_t* label) {
     Uia(label);
 }
 
+static const GUID kOurFmt = {0x11aabe88, 0x6952, 0x4b06, {0x91, 0x80, 0x0b, 0xc4, 0x96, 0x4e, 0x31, 0x58}};
+
+// Our real schema (names, keys, labels) as version 1.0.1 writes it.
+static std::wstring OurXml() {
+    std::wstring xml =
+        L"<?xml version=\"1.0\" encoding=\"utf-16\"?>\r\n"
+        L"<schema xmlns=\"http://schemas.microsoft.com/windows/2006/propertydescription\" schemaVersion=\"1.0\">\r\n"
+        L"  <propertyDescriptionList publisher=\"ExplorerPinned\" product=\"ExplorerPinned\">\r\n";
+    for (int pid = 2; pid <= 3; pid++) {
+        xml += std::wstring(L"    <propertyDescription name=\"") + (pid == 2 ? L"ExplorerPinned.PinState" : L"ExplorerPinned.PinStateAlt") +
+               L"\" formatID=\"" + GuidStr(kOurFmt) + L"\" propID=\"" + std::to_wstring(pid) + L"\">\r\n";
+        xml += L"      <searchInfo inInvertedIndex=\"false\" isColumn=\"false\"/>\r\n"
+               L"      <typeInfo type=\"UInt32\" isInnate=\"true\" isViewable=\"true\" groupingRange=\"Enumerated\"/>\r\n"
+               L"      <labelInfo label=\"Pinned\"/>\r\n"
+               L"      <displayInfo displayType=\"Enumerated\" defaultColumnWidth=\"12\">\r\n"
+               L"        <enumeratedList>\r\n"
+               L"          <enum name=\"Pinned\" value=\"0\" text=\"Pinned\"/>\r\n"
+               L"        </enumeratedList>\r\n"
+               L"      </displayInfo>\r\n"
+               L"    </propertyDescription>\r\n";
+    }
+    xml += L"  </propertyDescriptionList>\r\n</schema>\r\n";
+    return xml;
+}
+
+static const wchar_t kSchemaKey[] = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\PropertySystem\\PropertySchema";
+
+// Paths of the registered schemas named ExplorerPinned.propdesc.
+static std::vector<std::pair<std::wstring, std::wstring>> OurEntries() {
+    std::vector<std::pair<std::wstring, std::wstring>> result;  // subkey, path
+    HKEY root;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kSchemaKey, 0, KEY_READ, &root) != ERROR_SUCCESS) return result;
+    wchar_t sub[256];
+    for (DWORD i = 0;; i++) {
+        DWORD len = 256;
+        if (RegEnumKeyExW(root, i, sub, &len, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) break;
+        wchar_t path[1024] = L"", uri[256] = L"";
+        DWORD pl = sizeof(path), ul = sizeof(uri);
+        RegGetValueW(root, sub, NULL, RRF_RT_REG_SZ, NULL, path, &pl);
+        RegGetValueW(root, sub, L"URI", RRF_RT_REG_SZ, NULL, uri, &ul);
+        if (_wcsicmp(uri, L"explorerpinned.propdesc") == 0) result.push_back({sub, path});
+    }
+    RegCloseKey(root);
+    return result;
+}
+
+static void TryOurs(const wchar_t* label) {
+    Navigate(L"C:\\Windows\\Help");
+    Navigate(g_dir);
+    g_view.fv->SetCurrentViewMode(FVM_DETAILS);
+    Try({kOurFmt, 2}, label);
+    std::wstring l3 = std::wstring(label) + L" (key 3)";
+    Try({kOurFmt, 3}, l3.c_str());
+}
+
 int wmain() {
     g_t0 = GetTickCount();
     SetConsoleOutputCP(CP_UTF8);
@@ -719,97 +774,109 @@ int wmain() {
     wchar_t tmp[MAX_PATH];
     GetTempPathW(MAX_PATH, tmp);
     std::wstring base = LongPath(tmp);
-    std::wstring dir = base + L"ep_schema";
-    SHCreateDirectoryExW(NULL, dir.c_str(), NULL);
-    for (const wchar_t* n : {L"\\alpha.txt", L"\\bravo.txt", L"\\charlie.txt", L"\\delta.txt"}) WriteBytes(dir + n, "x", 1);
+    g_dir = base + L"ep_schema";
+    SHCreateDirectoryExW(NULL, g_dir.c_str(), NULL);
+    for (const wchar_t* n : {L"\\alpha.txt", L"\\bravo.txt", L"\\charlie.txt", L"\\delta.txt"}) WriteBytes(g_dir + n, "x", 1);
     g_pins = {L"bravo.txt", L"delta.txt"};
-    DumpSchemas(L"start");
-    if (!OpenWindow(dir)) {
+    if (!OpenWindow(g_dir)) {
         Log(L"window not found");
         return 1;
     }
     g_view.fv->SetCurrentViewMode(FVM_DETAILS);
     Pump(1500);
 
-    Log(L"######## S0 control");
-    {
-        std::wstring p = base + L"s0\\ExplorerPinned.propdesc";
-        WriteUtf16(p, Xml(Fmt(0), L"ProbeS0", L"Label0", L"Pinned0"));
-        Reg(p);
-        Try({Fmt(0), 2}, L"S0");
-    }
-    Log(L"######## S1 key that was never registered");
-    Try({Fmt(1), 2}, L"S1");
+    std::wstring portable = base + L"portable\\ExplorerPinned.propdesc";
+    std::wstring installed = L"C:\\Program Files\\Explorer Pinned Probe\\ExplorerPinned.propdesc";
+    Log(L"######## U1 a portable copy registers first, then the installed copy");
+    WriteUtf16(portable, OurXml());
+    WriteUtf16(installed, OurXml());
+    Reg(portable);
+    Reg(installed);
+    DumpSchemas(L"U1");
+    TryOurs(L"U1");
 
-    Log(L"######## S2 the same schema registered from two paths");
-    {
-        std::wstring a = base + L"s2a\\ExplorerPinned.propdesc", b = base + L"s2b\\ExplorerPinned.propdesc";
-        WriteUtf16(a, Xml(Fmt(2), L"ProbeS2", L"LabelA", L"PinnedA"));
-        WriteUtf16(b, Xml(Fmt(2), L"ProbeS2", L"LabelB", L"PinnedB"));
-        Reg(a);
-        Reg(b);
-        DumpSchemas(L"S2");
-        Try({Fmt(2), 2}, L"S2 both");
-        Log(L"  -- delete the first file");
-        DeleteFileW(a.c_str());
-        PSRefreshPropertySchema();
-        Navigate(L"C:\\Windows\\Help");
-        Navigate(dir);
-        Try({Fmt(2), 3}, L"S2 first deleted");
-        Log(L"  -- register the second again");
-        Unreg(b);
-        Unreg(b);
-        Reg(b);
-        Try({Fmt(2), 2}, L"S2 second again");
-        Log(L"  -- remove the first entry too");
-        Unreg(a);
-        DumpSchemas(L"S2 after unregister a");
-        Unreg(b);
-        Reg(b);
-        Navigate(L"C:\\Windows\\Help");
-        Navigate(dir);
-        Try({Fmt(2), 3}, L"S2 cleaned");
-    }
+    Log(L"######## U2 the portable copy is deleted (the user's state?)");
+    DeleteFileW(portable.c_str());
+    RemoveDirectoryW((base + L"portable").c_str());
+    PSRefreshPropertySchema();
+    TryOurs(L"U2");
 
-    Log(L"######## S3 same names, different property keys (an older schema with another format ID)");
+    Log(L"######## R1 unregister and register the installed copy again (what 1.0.1 does)");
+    Unreg(installed);
+    Unreg(installed);
+    Reg(installed);
+    DumpSchemas(L"R1");
+    TryOurs(L"R1");
+
+    Log(L"######## R2 recreate the missing file, unregister it, delete it; register the installed copy");
+    WriteUtf16(portable, OurXml());
+    Unreg(portable);
+    Unreg(portable);
+    DeleteFileW(portable.c_str());
+    RemoveDirectoryW((base + L"portable").c_str());
+    Unreg(installed);
+    Reg(installed);
+    DumpSchemas(L"R2");
+    for (auto& e : OurEntries()) Log(L"  entry %s -> %s exists=%d", e.first.c_str(), e.second.c_str(), GetFileAttributesW(e.second.c_str()) != INVALID_FILE_ATTRIBUTES);
+    TryOurs(L"R2");
+
+    Log(L"######## R3 a new window");
     {
-        std::wstring a = base + L"s3a\\ExplorerPinned.propdesc", b = base + L"s3b\\ExplorerPinned.propdesc";
-        WriteUtf16(a, Xml(Fmt(30), L"ProbeS3", L"LabelOld", L"PinnedOld"));
-        WriteUtf16(b, Xml(Fmt(31), L"ProbeS3", L"LabelNew", L"PinnedNew"));
-        Reg(a);
-        Reg(b);
-        Try({Fmt(31), 2}, L"S3 new key");
+        g_view.Release();
+        g_view.wb->Quit();
+        Pump(1500);
+        g_view = View();
+        if (!OpenWindow(g_dir)) {
+            Log(L"window not found");
+            return 1;
+        }
+        TryOurs(L"R3");
     }
 
-    Log(L"######## S4 same path registered twice, and unregister + register in one process");
+    Log(L"######## R4 delete leftover registry entries directly");
     {
-        std::wstring p = base + L"s4\\ExplorerPinned.propdesc";
-        WriteUtf16(p, Xml(Fmt(4), L"ProbeS4", L"Label4", L"Pinned4"));
-        Reg(p);
-        Reg(p);
-        DumpSchemas(L"S4 twice");
-        Unreg(p);
-        Unreg(p);
-        Unreg(p);
-        WriteUtf16(p, Xml(Fmt(4), L"ProbeS4", L"Label4b", L"Pinned4b"));
-        Reg(p);
-        Try({Fmt(4), 2}, L"S4");
+        auto entries = OurEntries();
+        HKEY root;
+        RegOpenKeyExW(HKEY_LOCAL_MACHINE, kSchemaKey, 0, KEY_ALL_ACCESS, &root);
+        for (auto& e : entries)
+            if (_wcsicmp(e.second.c_str(), installed.c_str()) != 0) Log(L"  delete %s: %ld", e.first.c_str(), RegDeleteTreeW(root, e.first.c_str()));
+        RegCloseKey(root);
+        Unreg(installed);
+        Reg(installed);
+        DumpSchemas(L"R4");
+        TryOurs(L"R4");
     }
 
-    Log(L"######## S5 Japanese text in a path with spaces");
+    Log(L"######## R5 restart Explorer");
     {
-        std::wstring p = base + L"s5 dir\\ExplorerPinned.propdesc";
-        WriteUtf16(p, Xml(Fmt(5), L"ProbeS5", L"ピン止め", L"ピン止め"));
-        Reg(p);
-        Try({Fmt(5), 2}, L"S5");
+        g_view.Release();
+        system("taskkill /F /IM explorer.exe");
+        Pump(2000);
+        ShellExecuteW(NULL, L"open", L"explorer.exe", NULL, NULL, SW_SHOWNORMAL);
+        Pump(8000);
+        g_view = View();
+        if (!OpenWindow(g_dir)) {
+            Log(L"window not found after restart");
+        } else {
+            TryOurs(L"R5");
+        }
+    }
+
+    Log(L"######## F1 fresh start: one copy at a fixed path, a second copy elsewhere is then removed");
+    {
+        // clean everything of ours
+        for (auto& e : OurEntries()) {
+            WriteUtf16(e.second, OurXml());
+            Unreg(e.second);
+        }
+        DumpSchemas(L"F1 clean");
     }
 
     DumpSchemas(L"end");
-    for (const wchar_t* p : {L"s0", L"s2a", L"s2b", L"s3a", L"s3b", L"s4", L"s5 dir"})
-        PSUnregisterPropertySchema((base + p + L"\\ExplorerPinned.propdesc").c_str());
-    PSRefreshPropertySchema();
-    g_view.Release();
-    g_view.wb->Quit();
+    if (g_view.wb) {
+        g_view.Release();
+        g_view.wb->Quit();
+    }
     Log(L"done");
     OleUninitialize();
     return 0;
