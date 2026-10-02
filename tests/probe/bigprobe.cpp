@@ -1,4 +1,4 @@
-// Research probe: grouping by a view property in large folders (icon view, mixed file types).
+// Research probe: grouping by a view property in large folders (icon view, mixed file types, network, logon).
 #ifndef UNICODE
 #define UNICODE
 #endif
