@@ -715,7 +715,26 @@ int wmain(int argc, wchar_t** argv) {
     w.Navigate(other);
     ExpectNoPinnedGroup(w, L"exit restores the grouping of folders that were not open");
     w.Navigate(g_dir);
+    // A folder whose saved grouping still uses the property when it is unregistered
+    std::wstring third = g_dir + L"\\third";
+    CreateDirectoryW(third.c_str(), nullptr);
+    TouchFile(third + L"\\t1.txt", 2020);
+    TouchFile(third + L"\\t2.txt", 2021);
+    w.Navigate(third);
+    w.Refresh();
+    w.view->SetGroupBy(kPinStateKeys[0], TRUE);
+    Pump(1000);
+    w.Navigate(g_dir);
     Check(RunExe(L"uninstall --quiet") == 0, L"uninstall exits with 0");
+    w.Navigate(third);
+    {
+        PROPERTYKEY k = w.GroupBy();
+        Groups g = ReadGroups(w.hwnd);
+        wchar_t d[128];
+        swprintf_s(d, L"saved grouping after uninstall: pid %lu, ", k.pid);
+        Print(d + g.Describe());
+    }
+    w.Navigate(g_dir);
     Print(L"schemas after uninstall: " + RegisteredSchemas());
     {
         std::wstring status = RunExeOutput(L"status");

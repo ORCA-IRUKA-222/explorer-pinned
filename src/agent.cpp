@@ -100,6 +100,8 @@ bool TakePreviousGroupBy(const std::wstring& folder, PROPERTYKEY* key, BOOL* asc
     return KeyIndex(*key) < 0;  // never "restore" to our own grouping
 }
 
+std::vector<std::wstring> SavedGroupingFolders();
+
 struct TrackedWindow {
     ComPtr<IWebBrowser2> browser;
     ComPtr<IUnknown> identity;
@@ -160,6 +162,7 @@ private:
     bool busy_ = false;
     bool dropPending_ = false;
     bool restoreOnExit_ = false;
+    bool restoreClosedOnExit_ = false;
 
     ComPtr<IShellWindows> shellWindows_;
     EventConnection shellWindowsEvents_;
@@ -232,8 +235,17 @@ int Agent::Run() {
 
     if (restoreOnExit_) {
         RestoreAll();
-        windows_.clear();
-        RestoreSavedGroupings();
+        // Folders that are not open are restored through hidden Explorer windows. Creating
+        // them fails from this process while it shuts down, so a helper process does it.
+        if (restoreClosedOnExit_ && !SavedGroupingFolders().empty()) {
+            std::wstring cmd = L"\"" + ExePath() + L"\" restore-groupings";
+            STARTUPINFOW si = {sizeof(si)};
+            PROCESS_INFORMATION pi = {};
+            if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+            }
+        }
     }
     windows_.clear();
     shellWindowsEvents_.Reset();
@@ -265,7 +277,10 @@ LRESULT Agent::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
             ArmWorkTimer();
             return 0;
         case kMsgExit:
+            // wParam: 0 = just exit, 1 = restore open windows (the caller restores the rest),
+            // 2 = restore open windows and closed folders.
             restoreOnExit_ = wp != 0;
+            restoreClosedOnExit_ = wp == 2;
             PostQuitMessage(0);
             return 0;
         case kMsgTray:
@@ -712,6 +727,7 @@ void Agent::OnCommand(UINT id) {
             break;
         case kCmdExit:
             restoreOnExit_ = true;
+            restoreClosedOnExit_ = true;
             PostQuitMessage(0);
             break;
     }
@@ -771,7 +787,11 @@ ComPtr<IFolderView2> ViewShowing(IWebBrowser2* browser, const std::wstring& fold
 // closing the window makes Explorer save the restored view state.
 void RestoreFolderInHiddenWindow(const std::wstring& folder) {
     ComPtr<IWebBrowser2> browser;
-    HRESULT hr = CoCreateInstance(CLSID_ShellBrowserWindow, nullptr, CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(browser.Put()));
+    HRESULT hr = E_FAIL;
+    for (int attempt = 0; attempt < 3 && FAILED(hr); attempt++) {
+        if (attempt) PumpFor(500);
+        hr = CoCreateInstance(CLSID_ShellBrowserWindow, nullptr, CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(browser.Put()));
+    }
     if (FAILED(hr)) {
         LogLine(L"ShellBrowserWindow failed 0x%08x", hr);
         return;
@@ -813,6 +833,9 @@ void RestoreFolderInHiddenWindow(const std::wstring& folder) {
 }  // namespace
 
 void RestoreSavedGroupings() {
+    // An elevated process would talk to an elevated copy of Explorer, not the user's windows
+    // (this happens when the installer stops the program before an upgrade).
+    if (IsUacElevated()) return;
     auto folders = SavedGroupingFolders();
     LogLine(L"restoring %zu saved grouping(s)", folders.size());
     for (const auto& folder : folders) {

@@ -44,8 +44,7 @@ void StopAgent() {
     HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, pid);
     PostMessageW(agent, kMsgExit, 1, 0);
     if (process) {
-        // Restoring the grouping of closed folders opens a hidden window per folder.
-        WaitForSingleObject(process, 60000);
+        WaitForSingleObject(process, 15000);
         CloseHandle(process);
     }
 }
@@ -144,8 +143,8 @@ int Setup(bool startup, bool startAgent, bool quiet, const std::wstring& languag
 }
 
 int Uninstall(bool keepSchema, bool quiet) {
-    StopAgent();               // restores the original grouping of open windows and saved folders
-    RestoreSavedGroupings();   // in case the agent was not running
+    StopAgent();              // restores the original grouping of open windows
+    RestoreSavedGroupings();  // and of folders that are not open
     RemoveContextMenu();
     SetStartupEnabled(false);
     RegDeleteTreeW(HKEY_CURRENT_USER, kRegRoot);
@@ -186,6 +185,11 @@ int Dispatch(const std::wstring& command, const std::vector<std::wstring>& rest,
     }
     if (command == L"exit") {
         StopAgent();
+        RestoreSavedGroupings();
+        return kOk;
+    }
+    if (command == L"restore-groupings") {
+        RestoreSavedGroupings();
         return kOk;
     }
     if (command == L"setup")

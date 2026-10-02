@@ -28,6 +28,8 @@ bool RegReadString(HKEY root, const std::wstring& key, const wchar_t* name, std:
 bool RegDeleteValueIn(HKEY root, const std::wstring& key, const wchar_t* name);
 
 bool IsElevated();
+// True when running elevated through a UAC prompt (Explorer itself is not elevated then).
+bool IsUacElevated();
 
 void LogLine(const wchar_t* fmt, ...);
 

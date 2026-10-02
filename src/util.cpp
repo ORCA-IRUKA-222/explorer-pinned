@@ -150,6 +150,16 @@ bool IsElevated() {
     return ok && elevation.TokenIsElevated;
 }
 
+bool IsUacElevated() {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    TOKEN_ELEVATION_TYPE type = TokenElevationTypeDefault;
+    DWORD size = 0;
+    BOOL ok = GetTokenInformation(token, TokenElevationType, &type, sizeof(type), &size);
+    CloseHandle(token);
+    return ok && type == TokenElevationTypeFull;
+}
+
 // Diagnostics go to OutputDebugString always, and to
 // %LOCALAPPDATA%\ExplorerPinned\agent.log when HKCU\Software\ExplorerPinned\Log = "1".
 void LogLine(const wchar_t* fmt, ...) {
