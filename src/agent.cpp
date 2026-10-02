@@ -829,11 +829,12 @@ void Agent::ProcessWindow(TrackedWindow& w) {
     if (!written) {
         // The view does not have the items yet (Explorer is still filling it) or does not
         // show them (hidden items). Grouping now would only show "Unspecified": try again
-        // later, less and less often, without counting it as a failed grouping.
+        // every second for a while, then every ten seconds, without counting it as a
+        // failed grouping.
         if (++w.writeFailures == 1 || w.writeFailures % 10 == 0)
             LogLine(L"cannot set the pinned value in %s yet (0x%08lX, try %d)", w.folderPath.c_str(),
                     (unsigned long)failure, w.writeFailures);
-        Schedule(&w, std::min<DWORD>(30000, 500u << std::min(w.writeFailures, 6)), false);
+        Schedule(&w, w.writeFailures < 20 ? 1000 : 10000, false);
         return;
     }
     w.writeFailures = 0;
