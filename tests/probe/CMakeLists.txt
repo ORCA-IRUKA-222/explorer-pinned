@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(schemaprobe CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+add_executable(schemaprobe schemaprobe.cpp)
+target_compile_definitions(schemaprobe PRIVATE UNICODE _UNICODE)
+target_compile_options(schemaprobe PRIVATE /utf-8)
+target_link_libraries(schemaprobe ole32 oleaut32 shell32 shlwapi propsys uuid user32 windowscodecs)
