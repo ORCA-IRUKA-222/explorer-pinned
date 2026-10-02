@@ -876,6 +876,48 @@ ComPtr<IWebBrowser2> OpenMinimizedWindow(const std::wstring& folder, ComPtr<IFol
 
 // Restores the grouping of `folder` in a window opened for it and closes the window again,
 // which makes Explorer save the restored view state.
+// Navigates `browser` to `folder` the way Explorer's own navigation does (an ID list parsed
+// from the path), so that the folder's saved view state is the one that gets loaded.
+ComPtr<IFolderView2> BrowseTo(IWebBrowser2* browser, const std::wstring& folder) {
+    ComPtr<IShellBrowser> sb;
+    ComPtr<IServiceProvider> sp;
+    browser->QueryInterface(IID_PPV_ARGS(sp.Put()));
+    if (sp) sp->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(sb.Put()));
+    PIDLIST_ABSOLUTE pidl = nullptr;
+    if (!sb || FAILED(SHParseDisplayName(folder.c_str(), nullptr, &pidl, 0, nullptr))) return ComPtr<IFolderView2>();
+    // Leave the folder first so that the navigation creates a new view.
+    PIDLIST_ABSOLUTE parent = ILClone(pidl);
+    if (parent && ILRemoveLastID(parent)) {
+        sb->BrowseObject(parent, SBSP_SAMEBROWSER | SBSP_ABSOLUTE);
+        PumpFor(500);
+    }
+    CoTaskMemFree(parent);
+    sb->BrowseObject(pidl, SBSP_SAMEBROWSER | SBSP_ABSOLUTE);
+    CoTaskMemFree(pidl);
+    return WaitForView(browser, folder, 50);
+}
+
+std::wstring GroupByText(IFolderView2* view) {
+    PROPERTYKEY key = {};
+    BOOL ascending = TRUE;
+    HRESULT hr = view ? view->GetGroupBy(&key, &ascending) : E_POINTER;
+    wchar_t text[64];
+    swprintf_s(text, L"hr=0x%08lx pid=%lu ours=%d", (unsigned long)hr, key.pid, KeyIndex(key) >= 0);
+    std::wstring result = text;
+    ComPtr<IPersistFolder2> pf;
+    PIDLIST_ABSOLUTE pidl = nullptr;
+    if (view && SUCCEEDED(view->GetFolder(IID_PPV_ARGS(pf.Put()))) && SUCCEEDED(pf->GetCurFolder(&pidl))) {
+        PWSTR name = nullptr;
+        if (SUCCEEDED(SHGetNameFromIDList(pidl, SIGDN_DESKTOPABSOLUTEEDITING, &name))) {
+            result += L" idlist=" + std::wstring(name);
+            CoTaskMemFree(name);
+        }
+        result += L" size=" + std::to_wstring(ILGetSize(pidl));
+        CoTaskMemFree(pidl);
+    }
+    return result;
+}
+
 void RestoreFolderInWindow(const std::wstring& folder) {
     ComPtr<IFolderView2> view;
     bool ownWindow = true;
@@ -883,6 +925,18 @@ void RestoreFolderInWindow(const std::wstring& folder) {
     if (!browser) browser = OpenMinimizedWindow(folder, &view, &ownWindow);
     if (!browser || !view) {
         LogLine(L"could not open %s to restore its grouping", folder.c_str());
+        return;
+    }
+    LogLine(L"opened %s: %s", folder.c_str(), GroupByText(view.Get()).c_str());
+    PumpFor(1500);
+    view = ViewShowing(browser.Get(), folder);
+    LogLine(L"after 1.5s: %s", GroupByText(view.Get()).c_str());
+    view = BrowseTo(browser.Get(), folder);
+    PumpFor(500);
+    if (view) view = ViewShowing(browser.Get(), folder);
+    LogLine(L"after browsing again: %s", GroupByText(view.Get()).c_str());
+    if (!view) {
+        if (ownWindow) browser->Quit();
         return;
     }
     PROPERTYKEY current = {};

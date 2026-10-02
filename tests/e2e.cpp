@@ -719,6 +719,18 @@ int wmain(int argc, wchar_t** argv) {
     Check(WaitFor([] { return FindWindowW(kAgentWindowClass, nullptr) == nullptr; }, 10000), L"exit stops the agent");
     ExpectNoPinnedGroup(w, L"exit restores the original grouping");
     w.Navigate(other);
+    {
+        PIDLIST_ABSOLUTE pidl = nullptr;
+        IPersistFolder2* pf = nullptr;
+        if (w.Refresh() && SUCCEEDED(w.view->GetFolder(IID_PPV_ARGS(&pf))) && SUCCEEDED(pf->GetCurFolder(&pidl))) {
+            PWSTR name = nullptr;
+            SHGetNameFromIDList(pidl, SIGDN_DESKTOPABSOLUTEEDITING, &name);
+            Print(L"test window shows " + std::wstring(name ? name : L"?") + L" size=" + std::to_wstring(ILGetSize(pidl)));
+            CoTaskMemFree(name);
+            CoTaskMemFree(pidl);
+        }
+        if (pf) pf->Release();
+    }
     ExpectNoPinnedGroup(w, L"exit restores the grouping of folders that were not open");
     w.Navigate(g_dir);
     // --- uninstall restores the saved grouping of folders that are not open; when the
