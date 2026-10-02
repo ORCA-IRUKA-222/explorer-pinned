@@ -1,8 +1,0 @@
-cmake_minimum_required(VERSION 3.20)
-project(bigprobe CXX)
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
-add_executable(bigprobe bigprobe.cpp)
-target_compile_definitions(bigprobe PRIVATE UNICODE _UNICODE)
-target_compile_options(bigprobe PRIVATE /utf-8)
-target_link_libraries(bigprobe ole32 oleaut32 shell32 shlwapi propsys uuid user32 windowscodecs)
