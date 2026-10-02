@@ -7,7 +7,7 @@ Windows のエクスプローラーで、よく使うファイルやフォルダ
 ![Windows 11 のエクスプローラーで、ピン止めした bravo と delta が「ピン止め」グループとして一番上に表示されている](docs/screenshot-windows11.png)
 
 *更新日時の新しい順に並べても、ピン止めした項目は一番上の「ピン止め」グループに表示されます。
-（自動テスト環境の画面です。Windows が英語のため、もう一方のグループ名が「Unspecified」になっています。日本語の Windows では「指定なし」と表示されます。）*
+（自動テスト環境の画面です。Windows が英語のため、もう一方のグループ名が「Unspecified」になっています。日本語の Windows では「未指定」と表示されます。）*
 
 English summary is [below](#english).
 
@@ -68,7 +68,9 @@ English summary is [below](#english).
 
 - ピン止めした項目があるフォルダーを開くと、エクスプローラーの「グループ化」が自動で「ピン止め」になり、
   ピン止めした項目が一番上の「ピン止め」グループにまとまります。
-- それ以外の項目は「指定なし」グループに入ります（このグループ名は Windows が決めているため変更できません）。
+- それ以外の項目は「未指定」グループに入ります（このグループ名は Windows が決めているため変更できません）。
+- 項目が多いフォルダーやネットワーク上のフォルダーでは、エクスプローラーがフォルダーを読み込み終わってから
+  ピン止めグループになるため、表示まで数秒かかることがあります。
 - 並べ替え（名前・更新日時・種類・サイズなど）は普段どおり自由に変えられます。どの並べ替えでもピン止めグループが一番上です。
 - 一時的に別のグループ化（例: 種類）を選ぶと、そのウィンドウではそのまま維持されます。フォルダーを開き直すと「ピン止め」グループに戻ります。
 - フォルダー内のピン止めをすべて外すと、元のグループ化（例: ダウンロードの「更新日時」グループ）に戻ります。
@@ -83,6 +85,14 @@ English summary is [below](#english).
 | Windows の起動時に開始 | 自動起動のオン/オフ |
 | 終了 | 常駐を終了し、ピン止めグループにしていたフォルダーのグループ化を元に戻します |
 
+### うまく表示されないとき
+
+- 通知領域のアイコン →「開いているウィンドウに再適用」を試してください。
+- ピン止めグループにできなかったフォルダーは、何度も表示し直すことはせず、元のグループ化に戻します
+  （そのフォルダーを開き直すか、ピン止めを変更すると再び試します）。
+- 動作の記録が `%LOCALAPPDATA%\ExplorerPinned\agent.log` に保存されています（最大約 1 MB、アンインストールで削除されます）。
+  [Issues](https://github.com/ORCA-IRUKA-222/explorer-pinned/issues) で報告していただく際に添付していただけると、原因を調べやすくなります。
+
 ## 制限事項
 
 - **常駐プロセスが必要です。** 「ピン止め」グループは常駐中のプロセスがエクスプローラーに指示して表示しています。
@@ -93,7 +103,7 @@ English summary is [below](#english).
 - **ピン止めはパスで記録します。** ピン止めした項目の名前を変えたり別のフォルダーへ移動したりすると、ピン止めは外れます。
   削除した項目と同じ名前の項目が後から作られると、再びピン止めされた状態になります。
 - ファイルを開く/保存するダイアログ、「PC」「ホーム」「ライブラリ」、検索結果などの仮想フォルダーでは使えません。
-- ピン止めしていない項目が入る「指定なし」グループの名前は変更できません（Windows の仕様）。
+- ピン止めしていない項目が入る「未指定」グループの名前は変更できません（Windows の仕様）。
 - 同じフォルダーを表示していても、隠しファイルとして非表示になっている項目はピン止めグループに出ません。
 - エクスプローラーの `IFolderView2::SetViewProperty` という API を使っています。現在の Windows 10 / 11 で動作しますが、
   Microsoft の SDK では「非推奨」と記載されているため、将来の Windows の更新で動かなくなる可能性があります。
@@ -188,6 +198,8 @@ Pinned items are shown in a **"Pinned"** group at the top, whatever the sort ord
 - Install with `ExplorerPinned-Setup-<version>.exe` from [Releases](https://github.com/ORCA-IRUKA-222/explorer-pinned/releases)
   (administrator permission is needed once to register the "Pinned" label), or unzip the portable build and run `ExplorerPinned.exe`.
 - The UI is in Japanese or English: the language chosen in the installer, or the Windows display language for the portable build.
+- If the "Pinned" group does not show up, try "Re-apply to open windows" in the notification area menu. The agent writes
+  a log to `%LOCALAPPDATA%\ExplorerPinned\agent.log` (at most about 1 MB; removed on uninstall), which helps when reporting an issue.
 - Limitations: the background process must be running; only one grouping can be active, so the default date groups
   of Downloads are replaced while pins exist in that folder; pins are stored by path (renaming/moving an item unpins it);
   `IFolderView2::SetViewProperty` is marked deprecated in the Windows SDK, so a future Windows update could break it.
