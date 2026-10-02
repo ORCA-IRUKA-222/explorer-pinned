@@ -166,7 +166,8 @@ build\Release\ExplorerPinnedE2E.exe build\Release\ExplorerPinned.exe
 ```
 
 GitHub Actions（`.github/workflows/build.yml`）では、push のたびにビルドとこのテストを Windows Server 2022 / 2025 で実行し、
-インストーラーと zip を作成します。`v1.2.3` のようなタグを push すると Releases に公開されます。
+インストーラーと zip を作成します。Releases への公開は、`src/version.h` のバージョンを上げてから
+Actions の「Build」→「Run workflow」で `release` にチェックを入れて実行します（`v1.2.3` のようなタグの push でも公開されます）。
 
 ## ライセンス
 
