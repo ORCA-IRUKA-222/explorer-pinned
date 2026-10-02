@@ -198,6 +198,7 @@ struct TrackedWindow {
     DWORD lastLoad = 0;      // last time a load started or finished
     DWORD waitSince = 0;     // first time processing was put off for a load
     int attempts = 0;        // groupings applied in this view since the grouping last held
+    int churn = 0;           // regroups in a row that came soon after the previous one
     bool dropped = false;    // Explorer dropped the values of the grouping applied last
     bool gaveUp = false;     // the grouping did not hold; left alone until the pins change
 };
@@ -549,6 +550,7 @@ bool Agent::AcquireView(TrackedWindow& w, bool* newSession) {
     w.leaving = false;
     w.waitSince = 0;
     w.attempts = 0;
+    w.churn = 0;
     w.dropped = false;
     w.gaveUp = false;
     // A view found without seeing its navigation (e.g. when the agent starts) may still be
@@ -723,6 +725,7 @@ void Agent::ProcessWindow(TrackedWindow& w) {
     if (w.enforce) {
         // The pins changed (or "reapply"): start over, also in a view the agent gave up on.
         w.attempts = 0;
+        w.churn = 0;
         w.dropped = false;
         w.gaveUp = false;
     }
@@ -755,13 +758,16 @@ void Agent::ProcessWindow(TrackedWindow& w) {
         w.enforce = false;
         return;
     }
-    // Something keeps clearing the values (e.g. a pinned file that is written to
-    // continuously); don't regroup more than about once a second.
+    // A pinned item that keeps changing (e.g. a file that is being written) loses its value
+    // each time. Regroup at most about once a second, and less and less often (down to twice
+    // a minute) while that goes on, since every regroup makes Explorer reload the view.
     DWORD now = GetTickCount();
-    if (now - w.lastRegroup < 1000) {
-        Schedule(&w, 1000 - (now - w.lastRegroup), false);
+    DWORD gap = w.churn < 3 ? 1000 : std::min<DWORD>(30000, 1000u << std::min(w.churn - 2, 5));
+    if (now - w.lastRegroup < gap) {
+        Schedule(&w, gap - (now - w.lastRegroup), false);
         return;
     }
+    w.churn = w.lastRegroup && now - w.lastRegroup < gap + 10000 ? w.churn + 1 : 0;
 
     // Explorer only re-groups items when the group-by key changes: write the values to the
     // key that is not active and switch to it.

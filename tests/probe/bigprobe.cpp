@@ -815,7 +815,7 @@ int wmain(int argc, wchar_t** argv) {
         {
             DWORD lastTouch = 0;
             int n = 0;
-            Watch(20000, L"L3", [&] {
+            Watch(45000, L"L3", [&] {
                 if (GetTickCount() - lastTouch < 300) return;
                 lastTouch = GetTickCount();
                 std::string data(100 + (n++ % 50), 'x');
