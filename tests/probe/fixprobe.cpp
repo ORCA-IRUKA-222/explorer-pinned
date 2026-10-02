@@ -809,7 +809,7 @@ int wmain(int argc, wchar_t** argv) {
     wchar_t full[MAX_PATH];
     GetFullPathNameW(argv[1], MAX_PATH, full, NULL);
     g_epExe = full;
-    std::wstring variant = argc > 2 ? argv[2] : L"A";
+    std::wstring variant = argc > 2 ? argv[2] : L"P";
     Log(L"variant %s", variant.c_str());
     wchar_t tmp[MAX_PATH];
     GetTempPathW(MAX_PATH, tmp);
@@ -826,18 +826,7 @@ int wmain(int argc, wchar_t** argv) {
     RegSetValueExW(k, L"Language", 0, REG_SZ, (const BYTE*)L"ja", 6);
     RegCloseKey(k);
 
-    // F, G: no folder window before the fix, and the fix right after the seeding (like the E2E test)
-    bool early = variant != L"F" && variant != L"G";
-    if (early) {
-        if (!OpenWindow(g_dir)) {
-            Log(L"window not found");
-            return 1;
-        }
-        g_view.fv->SetCurrentViewMode(FVM_DETAILS);
-        Pump(1500);
-    }
-
-    if (variant != L"E") {
+    if (variant != L"R") {
         Log(L"######## seed: old schema registered from two folders, the first file deleted");
         std::wstring first = base + L"ep_old_portable\\ExplorerPinned.propdesc";
         std::wstring second = base + L"ep_old_installed\\ExplorerPinned.propdesc";
@@ -849,45 +838,54 @@ int wmain(int argc, wchar_t** argv) {
         RemoveDirectoryW((base + L"ep_old_portable").c_str());
         PSRefreshPropertySchema();
         DumpSchemas(L"seeded");
-        if (variant != L"F") Pump(2000);
     }
 
-    Log(L"######## fix");
-    RunEp(L"register-schema --lang ja", true);
-    if (variant == L"B") {
-        Pump(3000);
-        RunEp(L"register-schema --lang ja", true);
-    } else if (variant == L"D") {
-        g_view.Release();
-        system("taskkill /F /IM explorer.exe");
-        Pump(2000);
-        ShellExecuteW(NULL, L"open", L"explorer.exe", NULL, NULL, SW_SHOWNORMAL);
-        Pump(8000);
-        g_view = View();
-        if (!OpenWindow(g_dir)) {
-            Log(L"window not found after restart");
-            return 1;
-        }
-    }
-    if (!early) {
-        if (!OpenWindow(g_dir)) {
-            Log(L"window not found");
-            return 1;
-        }
-        g_view.fv->SetCurrentViewMode(FVM_DETAILS);
+    Log(L"######## setup");
+    RunEp(L"setup --no-startup --no-agent --quiet", true);
+    PSRefreshPropertySchema();
+    Describe(kNewKey, L"right after setup");
+    DumpSchemas(L"after setup");
+
+    bool agent = variant != L"Q";
+    if (agent) {
+        RunEp(L"agent", false);
         Pump(1500);
+        RunEp(L"pin \"" + g_dir + L"\\bravo.txt\" \"" + g_dir + L"\\delta.txt\"", true);
+        RunEp(L"pin \"" + g_dir2 + L"\\bravo.txt\" \"" + g_dir2 + L"\\delta.txt\"", true);
     }
-    DumpSchemas(L"after fix");
-    Describe(kNewKey, L"new key");
-    Check(L"right after");
-    Pump(variant == L"C" ? 15000 : 5000);
-    Check(L"a bit later");
-
-    Log(L"######## re-register once more");
+    if (!OpenWindow(g_dir)) {
+        Log(L"window not found");
+        return 1;
+    }
+    g_view.fv->SetCurrentViewMode(FVM_DETAILS);
+    if (agent) {
+        Pump(6000);
+        Uia(L"agent, first window");
+        Pump(4000);
+        Uia(L"agent, first window later");
+        View saved = g_view;
+        g_view = View();
+        if (OpenWindow(g_dir2)) {
+            Pump(6000);
+            Uia(L"agent, second window");
+            g_view.Release();
+            g_view.wb->Quit();
+        }
+        g_view = saved;
+        g_view.Acquire();
+        Navigate(L"C:\\Windows\\Help");
+        Navigate(g_dir);
+        Pump(6000);
+        Uia(L"agent, first window after navigating");
+        RunEp(L"exit", true);
+        Pump(2000);
+    }
+    Check(L"probe groups");
     RunEp(L"register-schema --lang ja", true);
-    Check(L"after another registration");
+    Pump(2000);
+    Check(L"probe groups after another registration");
 
-    RunEp(L"unregister-schema", true);
+    RunEp(L"uninstall --quiet", true);
     DumpSchemas(L"end");
     g_view.Release();
     g_view.wb->Quit();
