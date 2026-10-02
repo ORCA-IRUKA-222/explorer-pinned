@@ -39,6 +39,8 @@ inline constexpr UINT kPinnedValue = 0;
 inline constexpr wchar_t kRegRoot[] = L"Software\\ExplorerPinned";
 inline constexpr wchar_t kRegPins[] = L"Software\\ExplorerPinned\\Pins";
 inline constexpr wchar_t kRegPreviousGroupBy[] = L"Software\\ExplorerPinned\\PreviousGroupBy";
+// Folders whose view Explorer may have saved while grouped by pins.
+inline constexpr wchar_t kRegGroupedFolders[] = L"Software\\ExplorerPinned\\GroupedFolders";
 inline constexpr wchar_t kRegRun[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 inline constexpr wchar_t kRunValueName[] = L"ExplorerPinned";
 

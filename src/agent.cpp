@@ -83,12 +83,11 @@ void SavePreviousGroupBy(const std::wstring& folder, const PROPERTYKEY& key, BOO
                    std::wstring(guid) + L"," + std::to_wstring(key.pid) + L"," + (ascending ? L"1" : L"0"));
 }
 
-bool TakePreviousGroupBy(const std::wstring& folder, PROPERTYKEY* key, BOOL* ascending) {
+bool ReadPreviousGroupBy(const std::wstring& folder, PROPERTYKEY* key, BOOL* ascending) {
     std::wstring value;
     *key = PROPERTYKEY{GUID_NULL, 0};
     *ascending = TRUE;
     if (!RegReadString(HKEY_CURRENT_USER, kRegPreviousGroupBy, folder.c_str(), &value)) return false;
-    RegDeleteValueIn(HKEY_CURRENT_USER, kRegPreviousGroupBy, folder.c_str());
     size_t c1 = value.find(L',');
     size_t c2 = value.find(L',', c1 + 1);
     if (c1 == std::wstring::npos || c2 == std::wstring::npos) return false;
@@ -97,7 +96,18 @@ bool TakePreviousGroupBy(const std::wstring& folder, PROPERTYKEY* key, BOOL* asc
     key->fmtid = g;
     key->pid = (DWORD)wcstoul(value.substr(c1 + 1, c2 - c1 - 1).c_str(), nullptr, 10);
     *ascending = value.substr(c2 + 1) != L"0";
-    return KeyIndex(*key) < 0;  // never "restore" to our own grouping
+    if (KeyIndex(*key) >= 0) *key = PROPERTYKEY{GUID_NULL, 0};  // never "restore" to our own grouping
+    return true;
+}
+
+// Explorer saves a folder's view state when the view goes away. Folders are marked while
+// their view is grouped by pins, so that grouping left behind (e.g. Explorer was closed while
+// the agent was not running) can be cleaned up on exit and uninstall.
+void MarkGrouped(const std::wstring& folder, bool grouped) {
+    if (grouped)
+        RegWriteString(HKEY_CURRENT_USER, kRegGroupedFolders, folder.c_str(), L"1");
+    else
+        RegDeleteValueIn(HKEY_CURRENT_USER, kRegGroupedFolders, folder.c_str());
 }
 
 std::vector<std::wstring> SavedGroupingFolders();
@@ -120,6 +130,8 @@ struct TrackedWindow {
     bool enforce = false;
     DWORD due = 0;
     DWORD lastRegroup = 0;
+    bool leaving = false;  // the original grouping was put back because the view is going away
+    DWORD leaveTick = 0;
     bool seen = false;
 };
 
@@ -145,7 +157,8 @@ private:
     PITEMID_CHILD ParseChild(TrackedWindow& w, const std::wstring& name);
     void WriteKey(TrackedWindow& w, int keyIndex, const NameSet& names);
     bool KeyMatches(TrackedWindow& w, int keyIndex, const NameSet& names);
-    void RestoreGrouping(TrackedWindow& w);
+    void RestoreGrouping(TrackedWindow& w, bool forget);
+    void LeaveView(TrackedWindow& w);
     void RestoreAll();
 
     void ArmPinsWatch();
@@ -235,8 +248,9 @@ int Agent::Run() {
 
     if (restoreOnExit_) {
         RestoreAll();
-        // Folders that are not open are restored through hidden Explorer windows. Creating
-        // them fails from this process while it shuts down, so a helper process does it.
+        // Folders whose saved view still has the pinned grouping (rare: Explorer closed while
+        // the agent was not running) are fixed through Explorer windows; that fails from this
+        // process while it shuts down, so a helper process does it.
         if (restoreClosedOnExit_ && !SavedGroupingFolders().empty()) {
             std::wstring cmd = L"\"" + ExePath() + L"\" restore-groupings";
             STARTUPINFOW si = {sizeof(si)};
@@ -406,6 +420,11 @@ void Agent::RescanWindows() {
         w->seen = true;
         TrackedWindow* raw = w.get();
         w->browserEvents.Connect(browser.Get(), DIID_DWebBrowserEvents2, [this, raw](DISPID id) {
+            if (id == DISPID_BEFORENAVIGATE2 || id == DISPID_ONQUIT) {
+                // Explorer saves the view state when the view goes away; put the original
+                // grouping back first (synchronously, while Explorer waits for this event).
+                LeaveView(*raw);
+            }
             if (id == DISPID_NAVIGATECOMPLETE2 || id == DISPID_DOCUMENTCOMPLETE) {
                 Schedule(raw, 30, false);
                 ArmWorkTimer();
@@ -450,6 +469,7 @@ bool Agent::AcquireView(TrackedWindow& w, bool* newSession) {
     w.applied[0].clear();
     w.applied[1].clear();
     w.initialized = false;
+    w.leaving = false;
     view->GetFolder(IID_PPV_ARGS(w.folder.Put()));
     if (ComPtr<IPersistFolder2> pf = w.folder.As<IPersistFolder2>()) {
         PIDLIST_ABSOLUTE pidl = nullptr;
@@ -533,6 +553,16 @@ bool Agent::KeyMatches(TrackedWindow& w, int k, const NameSet& names) {
 void Agent::ProcessWindow(TrackedWindow& w) {
     bool newSession = false;
     if (!AcquireView(w, &newSession) || !w.folder || w.folderPath.empty()) return;
+    if (w.leaving) {
+        // Still the same view: the navigation is in progress, or it was cancelled.
+        if (GetTickCount() - w.leaveTick < 2000) {
+            Schedule(&w, 500, false);
+            return;
+        }
+        w.view->SetRedraw(TRUE);
+        w.leaving = false;
+        w.enforce = true;
+    }
 
     // Only pins whose item exists count; a stale pin must not keep the folder grouped.
     NameSet names;
@@ -553,7 +583,7 @@ void Agent::ProcessWindow(TrackedWindow& w) {
     int current = KeyIndex(groupKey);
 
     if (names.empty()) {
-        if (current >= 0) RestoreGrouping(w);
+        if (current >= 0) RestoreGrouping(w, /*forget=*/true);
         // Take over again as soon as a pinned item shows up in this view.
         w.initialized = false;
         w.enforce = false;
@@ -565,6 +595,7 @@ void Agent::ProcessWindow(TrackedWindow& w) {
         if (w.initialized && !w.enforce) return;
         SavePreviousGroupBy(w.folderPath, groupKey, ascending);
         WriteKey(w, 0, names);
+        MarkGrouped(w.folderPath, true);
         w.view->SetGroupBy(kPinStateKeys[0], TRUE);
         LogLine(L"group %s (%zu pinned)", w.folderPath.c_str(), names.size());
     } else if (!ascending || !KeyMatches(w, current, names)) {
@@ -585,14 +616,31 @@ void Agent::ProcessWindow(TrackedWindow& w) {
     w.enforce = false;
 }
 
-void Agent::RestoreGrouping(TrackedWindow& w) {
+// Puts back the grouping the folder had before. `forget` drops the saved grouping (the
+// folder no longer has pins).
+void Agent::RestoreGrouping(TrackedWindow& w, bool forget) {
     PROPERTYKEY key;
     BOOL ascending;
-    TakePreviousGroupBy(w.folderPath, &key, &ascending);
+    ReadPreviousGroupBy(w.folderPath, &key, &ascending);
+    if (forget) RegDeleteValueIn(HKEY_CURRENT_USER, kRegPreviousGroupBy, w.folderPath.c_str());
     w.view->SetGroupBy(key, ascending);
+    MarkGrouped(w.folderPath, false);
     // The values stay in the view's cache; `applied` keeps tracking them so they are
     // cleared when the folder is grouped again.
     LogLine(L"restore grouping %s", w.folderPath.c_str());
+}
+
+// Called while Explorer is about to navigate away from the view or close the window: the
+// view state it saves then must not contain the pinned grouping.
+void Agent::LeaveView(TrackedWindow& w) {
+    if (!w.view || w.folderPath.empty() || w.leaving) return;
+    PROPERTYKEY groupKey = {};
+    BOOL ascending = TRUE;
+    if (FAILED(w.view->GetGroupBy(&groupKey, &ascending)) || KeyIndex(groupKey) < 0) return;
+    w.view->SetRedraw(FALSE);  // the view is about to go away; don't show the regrouping
+    RestoreGrouping(w, /*forget=*/false);
+    w.leaving = true;
+    w.leaveTick = GetTickCount();
 }
 
 void Agent::RestoreAll() {
@@ -600,7 +648,8 @@ void Agent::RestoreAll() {
         if (!w->view || w->folderPath.empty()) continue;
         PROPERTYKEY groupKey = {};
         BOOL ascending = TRUE;
-        if (SUCCEEDED(w->view->GetGroupBy(&groupKey, &ascending)) && KeyIndex(groupKey) >= 0) RestoreGrouping(*w);
+        if (SUCCEEDED(w->view->GetGroupBy(&groupKey, &ascending)) && KeyIndex(groupKey) >= 0)
+            RestoreGrouping(*w, /*forget=*/false);
     }
 }
 
@@ -749,7 +798,7 @@ void PumpFor(DWORD ms) {
 std::vector<std::wstring> SavedGroupingFolders() {
     std::vector<std::wstring> folders;
     HKEY key;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegPreviousGroupBy, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) return folders;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegGroupedFolders, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) return folders;
     wchar_t name[32768];
     for (DWORD i = 0;; i++) {
         DWORD len = ARRAYSIZE(name);
@@ -897,27 +946,6 @@ ComPtr<IFolderView2> BrowseTo(IWebBrowser2* browser, const std::wstring& folder)
     return WaitForView(browser, folder, 50);
 }
 
-std::wstring GroupByText(IFolderView2* view) {
-    PROPERTYKEY key = {};
-    BOOL ascending = TRUE;
-    HRESULT hr = view ? view->GetGroupBy(&key, &ascending) : E_POINTER;
-    wchar_t text[64];
-    swprintf_s(text, L"hr=0x%08lx pid=%lu ours=%d", (unsigned long)hr, key.pid, KeyIndex(key) >= 0);
-    std::wstring result = text;
-    ComPtr<IPersistFolder2> pf;
-    PIDLIST_ABSOLUTE pidl = nullptr;
-    if (view && SUCCEEDED(view->GetFolder(IID_PPV_ARGS(pf.Put()))) && SUCCEEDED(pf->GetCurFolder(&pidl))) {
-        PWSTR name = nullptr;
-        if (SUCCEEDED(SHGetNameFromIDList(pidl, SIGDN_DESKTOPABSOLUTEEDITING, &name))) {
-            result += L" idlist=" + std::wstring(name);
-            CoTaskMemFree(name);
-        }
-        result += L" size=" + std::to_wstring(ILGetSize(pidl));
-        CoTaskMemFree(pidl);
-    }
-    return result;
-}
-
 void RestoreFolderInWindow(const std::wstring& folder) {
     ComPtr<IFolderView2> view;
     bool ownWindow = true;
@@ -927,32 +955,24 @@ void RestoreFolderInWindow(const std::wstring& folder) {
         LogLine(L"could not open %s to restore its grouping", folder.c_str());
         return;
     }
-    LogLine(L"opened %s: %s", folder.c_str(), GroupByText(view.Get()).c_str());
-    PumpFor(1500);
-    view = ViewShowing(browser.Get(), folder);
-    LogLine(L"after 1.5s: %s", GroupByText(view.Get()).c_str());
-    view = BrowseTo(browser.Get(), folder);
-    PumpFor(500);
-    if (view) view = ViewShowing(browser.Get(), folder);
-    LogLine(L"after browsing again: %s", GroupByText(view.Get()).c_str());
-    if (!view) {
-        if (ownWindow) browser->Quit();
-        return;
-    }
     PROPERTYKEY current = {};
     BOOL ascending = TRUE;
-    if (SUCCEEDED(view->GetGroupBy(&current, &ascending)) && KeyIndex(current) >= 0) {
+    if (FAILED(view->GetGroupBy(&current, &ascending)) || KeyIndex(current) < 0) {
+        // "explorer.exe <path>" may describe the folder with a different ID list than the
+        // one Explorer saved the view state under; browse to it the usual way.
+        view = BrowseTo(browser.Get(), folder);
+        if (!view || FAILED(view->GetGroupBy(&current, &ascending))) current = PROPERTYKEY{GUID_NULL, 0};
+    }
+    if (KeyIndex(current) >= 0) {
         PROPERTYKEY key;
-        TakePreviousGroupBy(folder, &key, &ascending);
+        ReadPreviousGroupBy(folder, &key, &ascending);
         view->SetGroupBy(key, ascending);
         PumpFor(300);
         LogLine(L"restored grouping of %s", folder.c_str());
-    } else {
-        RegDeleteValueIn(HKEY_CURRENT_USER, kRegPreviousGroupBy, folder.c_str());
-        LogLine(L"%s is no longer grouped by pins", folder.c_str());
     }
     if (ownWindow) browser->Quit();
-    PumpFor(300);
+    PumpFor(500);  // let Explorer save the view state before reporting the folder as done
+    MarkGrouped(folder, false);
 }
 
 // Starts a program as the user of the desktop (not elevated), through Explorer.
@@ -1020,7 +1040,7 @@ void RestoreSavedGroupings() {
         if (PathExists(folder))
             RestoreFolderInWindow(folder);
         else
-            RegDeleteValueIn(HKEY_CURRENT_USER, kRegPreviousGroupBy, folder.c_str());
+            MarkGrouped(folder, false);
     }
 }
 

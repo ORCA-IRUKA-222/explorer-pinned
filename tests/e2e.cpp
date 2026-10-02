@@ -312,8 +312,8 @@ struct Window {
     }
 };
 
-bool OpenWindow(Window* w) {
-    ShellExecuteW(nullptr, L"open", L"explorer.exe", g_dir.c_str(), nullptr, SW_SHOWNORMAL);
+bool OpenWindow(Window* w, const std::wstring& path = g_dir) {
+    ShellExecuteW(nullptr, L"open", L"explorer.exe", path.c_str(), nullptr, SW_SHOWNORMAL);
     return WaitFor(
         [&] {
             IShellWindows* sw = nullptr;
@@ -332,7 +332,7 @@ bool OpenWindow(Window* w) {
                 disp->Release();
                 if (!browser) continue;
                 w->browser = browser;
-                if (w->Refresh() && _wcsicmp(w->Path().c_str(), g_dir.c_str()) == 0) {
+                if (w->Refresh() && _wcsicmp(w->Path().c_str(), path.c_str()) == 0) {
                     SHANDLE_PTR h = 0;
                     browser->get_HWND(&h);
                     w->hwnd = (HWND)h;
@@ -714,10 +714,29 @@ int wmain(int argc, wchar_t** argv) {
     ExpectPinned(w, {L"o1"}, L"second folder is grouped");
     w.Navigate(g_dir);
 
+    // --- closing a window puts the original grouping back before Explorer saves it
+    std::wstring fourth = g_dir + L"\\fourth";
+    CreateDirectoryW(fourth.c_str(), nullptr);
+    TouchFile(fourth + L"\\f1.txt", 2020);
+    TouchFile(fourth + L"\\f2.txt", 2021);
+    RunExe(L"pin \"" + fourth + L"\\f1.txt\"");
+    {
+        Window w2;
+        if (OpenWindow(&w2, fourth)) {
+            ExpectPinned(w2, {L"f1"}, L"second window is grouped");
+            w2.browser->Quit();
+            Pump(1500);
+        } else {
+            Check(false, L"open a second window");
+        }
+    }
+
     // --- exit restores the grouping; uninstall cleans up
     Check(RunExe(L"exit") == 0, L"exit command exits with 0");
     Check(WaitFor([] { return FindWindowW(kAgentWindowClass, nullptr) == nullptr; }, 10000), L"exit stops the agent");
     ExpectNoPinnedGroup(w, L"exit restores the original grouping");
+    w.Navigate(fourth);
+    ExpectNoPinnedGroup(w, L"a closed window's folder keeps its original grouping");
     w.Navigate(other);
     {
         PIDLIST_ABSOLUTE pidl = nullptr;
@@ -731,7 +750,7 @@ int wmain(int argc, wchar_t** argv) {
         }
         if (pf) pf->Release();
     }
-    ExpectNoPinnedGroup(w, L"exit restores the grouping of folders that were not open");
+    ExpectNoPinnedGroup(w, L"leaving a folder puts its original grouping back before Explorer saves it");
     w.Navigate(g_dir);
     // --- uninstall restores the saved grouping of folders that are not open; when the
     // uninstaller is elevated this runs as the desktop user (forced here for the test)
@@ -744,6 +763,7 @@ int wmain(int argc, wchar_t** argv) {
     w.view->SetGroupBy(kPinStateKeys[0], TRUE);
     Pump(1000);
     RegWriteString(HKEY_CURRENT_USER, kRegPreviousGroupBy, third.c_str(), L"{00000000-0000-0000-0000-000000000000},0,1");
+    RegWriteString(HKEY_CURRENT_USER, kRegGroupedFolders, third.c_str(), L"1");
     w.Navigate(g_dir);
     SetEnvironmentVariableW(L"EXPLORERPINNED_TEST_DELEGATE", L"1");
     Check(RunExe(L"uninstall --quiet") == 0, L"uninstall exits with 0");
