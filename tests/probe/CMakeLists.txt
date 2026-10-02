@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(fixprobe CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+add_executable(fixprobe fixprobe.cpp)
+target_compile_definitions(fixprobe PRIVATE UNICODE _UNICODE)
+target_compile_options(fixprobe PRIVATE /utf-8)
+target_link_libraries(fixprobe ole32 oleaut32 shell32 shlwapi propsys uuid user32 windowscodecs)

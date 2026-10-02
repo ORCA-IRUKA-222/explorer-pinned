@@ -1,0 +1,32 @@
+name: Probe
+on:
+  push:
+    branches: ["fix/large-folder-regroup"]
+    paths: ["tests/probe/**", ".github/workflows/probe.yml"]
+jobs:
+  probe:
+    name: Probe (${{ matrix.variant }})
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [A, B, C, D, E]
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -B build -A x64 -DEP_BUILD_TESTS=OFF
+          cmake --build build --config Release
+          cmake -S tests/probe -B build-probe -A x64
+          cmake --build build-probe --config Release
+      - name: Run
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath build-probe\Release\fixprobe.exe -ArgumentList "build\Release\ExplorerPinned.exe", "${{ matrix.variant }}" `
+            -NoNewWindow -PassThru -RedirectStandardOutput out.txt
+          $null = $p.Handle
+          if (-not $p.WaitForExit(900000)) { "TIMEOUT"; $p.Kill() }
+          Get-Content out.txt -Encoding utf8
+          Write-Host "---- agent.log"
+          Get-Content "$env:LOCALAPPDATA\ExplorerPinned\agent.log" -Encoding utf8 -ErrorAction SilentlyContinue
