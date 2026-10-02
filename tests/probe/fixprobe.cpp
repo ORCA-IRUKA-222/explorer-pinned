@@ -841,9 +841,16 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     Log(L"######## setup");
-    RunEp(L"setup --no-startup --no-agent --quiet", true);
-    PSRefreshPropertySchema();
-    Describe(kNewKey, L"right after setup");
+    if (variant == L"S") {
+        RunEp(L"register-schema --lang ja", true);  // no refresh from a process with an old view
+    } else {
+        RunEp(L"setup --no-startup --no-agent --quiet", true);
+        int refreshes = variant == L"T" ? 3 : 1;
+        for (int i = 0; i < refreshes; i++) {
+            PSRefreshPropertySchema();
+            Describe(kNewKey, L"right after setup");
+        }
+    }
     DumpSchemas(L"after setup");
 
     bool agent = variant != L"Q";

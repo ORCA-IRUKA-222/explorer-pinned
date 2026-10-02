@@ -9,7 +9,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [P, Q, R]
+        variant: [S, T, P]
         rep: [1]
     runs-on: windows-2025
     timeout-minutes: 20
