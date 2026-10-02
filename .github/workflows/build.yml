@@ -33,6 +33,7 @@ jobs:
     name: End-to-end test (${{ matrix.os }})
     needs: build
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -129,6 +130,7 @@ jobs:
     name: Installer test
     needs: package
     runs-on: windows-2025
+    timeout-minutes: 15
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -140,7 +142,9 @@ jobs:
           $ErrorActionPreference = "Stop"
           [Console]::OutputEncoding = [Text.Encoding]::UTF8
           $setup = Get-ChildItem packages\ExplorerPinned-Setup-*.exe | Select-Object -First 1
-          Start-Process $setup.FullName -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LANG=japanese", "/LOG=install.log" -Wait
+          # Start-Process -Wait would also wait for the agent that setup starts, so wait for setup only.
+          $p = Start-Process $setup.FullName -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LANG=japanese", "/LOG=install.log" -PassThru
+          if (-not $p.WaitForExit(300000)) { throw "setup timed out" }
           $exe = "$env:ProgramFiles\Explorer Pinned\ExplorerPinned.exe"
           if (-not (Test-Path $exe)) { Get-Content install.log; throw "not installed" }
           Start-Sleep -Seconds 3
@@ -155,13 +159,16 @@ jobs:
           if ($menu -ne "このファイルをピン止めする") { throw "unexpected menu text" }
 
           $uninstaller = Get-ChildItem "$env:ProgramFiles\Explorer Pinned\unins*.exe" | Select-Object -First 1
-          Start-Process $uninstaller.FullName -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait
-          Start-Sleep -Seconds 5
+          $p = Start-Process $uninstaller.FullName -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -PassThru
+          if (-not $p.WaitForExit(300000)) { throw "uninstall timed out" }
+          # The uninstaller copies itself to %TEMP% and finishes there.
+          for ($i = 0; $i -lt 30 -and (Test-Path $exe); $i++) { Start-Sleep -Seconds 1 }
+          Start-Sleep -Seconds 3
           if (Test-Path $exe) { throw "files left behind" }
           if (Test-Path -LiteralPath "HKCU:\Software\Classes\*\shell\ExplorerPinned.Pin") { throw "menu left behind" }
           if (Test-Path "HKCU:\Software\ExplorerPinned") { throw "settings left behind" }
           if ((Get-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run).ExplorerPinned) { throw "startup entry left behind" }
-          $schemas = Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\PropertySystem\PropertySchema" |
+          $schemas = Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\PropertySystem\PropertySchema" -ErrorAction SilentlyContinue |
             ForEach-Object { (Get-ItemProperty $_.PSPath).PSObject.Properties.Value } | Where-Object { "$_" -like "*ExplorerPinned*" }
           if ($schemas) { throw "schema left behind: $schemas" }
           if (Get-Process ExplorerPinned -ErrorAction SilentlyContinue) { throw "agent still running" }

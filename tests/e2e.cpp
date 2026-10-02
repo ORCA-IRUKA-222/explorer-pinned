@@ -633,6 +633,40 @@ int wmain(int argc, wchar_t** argv) {
     ExpectPinned(w, {L"charlie"}, L"pinned group returns when the item comes back");
     Check(RunExe(L"list") == 0, L"list command");
 
+    // --- multiple selection: Explorer starts one "pin" process per item at the same time
+    {
+        std::wstring multi = g_dir + L"\\multi";
+        CreateDirectoryW(multi.c_str(), nullptr);
+        std::vector<HANDLE> procs;
+        for (int i = 1; i <= 6; i++) {
+            std::wstring file = multi + L"\\m" + std::to_wstring(i) + L".txt";
+            TouchFile(file, 2024);
+            std::wstring cmdline = L"\"" + g_exe + L"\" pin \"" + file + L"\"";
+            STARTUPINFOW s2 = {sizeof(s2)};
+            PROCESS_INFORMATION p2 = {};
+            if (CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &s2, &p2)) {
+                CloseHandle(p2.hThread);
+                procs.push_back(p2.hProcess);
+            }
+        }
+        WaitForMultipleObjects((DWORD)procs.size(), procs.data(), TRUE, 30000);
+        for (HANDLE h : procs) CloseHandle(h);
+        bool allStored = true;
+        for (int i = 1; i <= 6; i++) allStored &= IsPinnedInRegistry(multi + L"\\m" + std::to_wstring(i) + L".txt");
+        Check(allStored, L"concurrent pin commands store every pin");
+        bool menusOk = WaitFor(
+            [&] {
+                for (int i = 1; i <= 6; i++)
+                    if (!Contains(MenuItems(multi + L"\\m" + std::to_wstring(i) + L".txt"), unpinLabel)) return false;
+                return true;
+            },
+            10000);
+        Check(menusOk, L"menus are in sync after concurrent pin commands");
+        std::wstring args = L"unpin";
+        for (int i = 1; i <= 6; i++) args += L" \"" + multi + L"\\m" + std::to_wstring(i) + L".txt\"";
+        RunExe(args);
+    }
+
     // --- the Downloads folder (grouped by date by default on client editions)
     {
         PWSTR dl = nullptr;

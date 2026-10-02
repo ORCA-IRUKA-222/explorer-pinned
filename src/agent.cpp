@@ -595,6 +595,9 @@ void Agent::OnPinsChanged() {
     ArmPinsWatch();
     std::vector<std::wstring> old = std::move(pins_);
     pins_ = PinStore::LoadAll();
+    // Several "pin" processes may run at once (multiple selection); whichever wrote the
+    // menu conditions last may have missed a pin, so rewrite them from the final list.
+    UpdateContextMenu(pins_);
     for (auto& w : windows_) {
         if (w->folderPath.empty()) continue;
         auto before = PinStore::NamesInFolder(old, w->folderPath);
