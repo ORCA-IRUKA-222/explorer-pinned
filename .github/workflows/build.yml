@@ -1,0 +1,194 @@
+name: Build
+
+on:
+  push:
+    branches: [main, "feature/**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: windows-2022
+    strategy:
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -G "Visual Studio 17 2022" -A ${{ matrix.arch == 'x64' && 'x64' || 'ARM64' }} -DEP_BUILD_TESTS=${{ matrix.arch == 'x64' && 'ON' || 'OFF' }}
+      - name: Build
+        run: cmake --build build --config Release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.arch }}
+          path: build/Release/*.exe
+          if-no-files-found: error
+
+  e2e:
+    name: End-to-end test (${{ matrix.os }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-x64
+          path: bin
+      - name: Run
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force screenshots | Out-Null
+          New-Item -Path HKCU:\Software\ExplorerPinned -Force | Out-Null
+          Set-ItemProperty -Path HKCU:\Software\ExplorerPinned -Name Log -Value "1"
+          $p = Start-Process -FilePath bin\ExplorerPinnedE2E.exe -ArgumentList "bin\ExplorerPinned.exe", "$PWD\screenshots" `
+            -NoNewWindow -PassThru -RedirectStandardOutput e2e.txt
+          $null = $p.Handle
+          $finished = $p.WaitForExit(600000)
+          if (-not $finished) { $p.Kill() }
+          Get-Content e2e.txt -Encoding utf8
+          Write-Host "---- agent.log"
+          Get-Content "$env:LOCALAPPDATA\ExplorerPinned\agent.log" -Encoding utf8 -ErrorAction SilentlyContinue
+          if (-not $finished) { Write-Error "E2E timed out"; exit 1 }
+          exit $p.ExitCode
+      - name: Convert screenshot
+        if: always()
+        shell: pwsh
+        run: |
+          $bmp = "$PWD\screenshots\sorted-by-date.bmp"
+          if (Test-Path $bmp) {
+            Add-Type -AssemblyName System.Drawing
+            $img = [System.Drawing.Image]::FromFile($bmp)
+            $img.Save("$PWD\screenshots\sorted-by-date.png", [System.Drawing.Imaging.ImageFormat]::Png)
+            $img.Dispose()
+            Remove-Item $bmp
+          }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshots-${{ matrix.os }}
+          path: screenshots
+          if-no-files-found: ignore
+
+  package:
+    name: Package
+    needs: build
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-x64
+          path: dist/x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-arm64
+          path: dist/arm64
+      - name: Read version
+        id: version
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path src/version.h -Pattern 'EP_VERSION_STRING "(.+)"').Matches[0].Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress | Out-Null
+          }
+          & $iscc /DAppVersion=${{ steps.version.outputs.version }} /DBinDir=..\dist installer\ExplorerPinned.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build zip
+        shell: pwsh
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          foreach ($arch in "x64", "arm64") {
+            $dir = "dist\ExplorerPinned-$v-$arch"
+            New-Item -ItemType Directory -Force $dir | Out-Null
+            Copy-Item "dist\$arch\ExplorerPinned.exe" $dir
+            Copy-Item README.md, LICENSE $dir
+            Compress-Archive -Path "$dir\*" -DestinationPath "dist\ExplorerPinned-$v-$arch.zip" -Force
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: |
+            dist/ExplorerPinned-Setup-*.exe
+            dist/ExplorerPinned-*.zip
+          if-no-files-found: error
+
+  installer-test:
+    name: Installer test
+    needs: package
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: packages
+      - name: Install, check, uninstall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          [Console]::OutputEncoding = [Text.Encoding]::UTF8
+          $setup = Get-ChildItem packages\ExplorerPinned-Setup-*.exe | Select-Object -First 1
+          # Start-Process -Wait would also wait for the agent that setup starts, so wait for setup only.
+          $p = Start-Process $setup.FullName -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LANG=japanese", "/LOG=install.log" -PassThru
+          if (-not $p.WaitForExit(300000)) { throw "setup timed out" }
+          $exe = "$env:ProgramFiles\Explorer Pinned\ExplorerPinned.exe"
+          if (-not (Test-Path $exe)) { Get-Content install.log; throw "not installed" }
+          Start-Sleep -Seconds 3
+          $status = & $exe status | Out-String
+          Write-Host $status
+          if ($status -notmatch "schema: registered \(ピン止め\)") { throw "schema not registered in Japanese" }
+          if ($status -notmatch "menu: registered") { throw "menu not registered" }
+          if ($status -notmatch "startup: on") { throw "startup entry missing" }
+          if ($status -notmatch "agent: running") { throw "agent not running" }
+          $menu = (Get-ItemProperty -LiteralPath "HKCU:\Software\Classes\*\shell\ExplorerPinned.Pin").MUIVerb
+          Write-Host "menu text: $menu"
+          if ($menu -ne "このファイルをピン止めする") { throw "unexpected menu text" }
+
+          $uninstaller = Get-ChildItem "$env:ProgramFiles\Explorer Pinned\unins*.exe" | Select-Object -First 1
+          $p = Start-Process $uninstaller.FullName -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -PassThru
+          if (-not $p.WaitForExit(300000)) { throw "uninstall timed out" }
+          # The uninstaller copies itself to %TEMP% and finishes there.
+          for ($i = 0; $i -lt 30 -and (Test-Path $exe); $i++) { Start-Sleep -Seconds 1 }
+          Start-Sleep -Seconds 3
+          if (Test-Path $exe) { throw "files left behind" }
+          if (Test-Path -LiteralPath "HKCU:\Software\Classes\*\shell\ExplorerPinned.Pin") { throw "menu left behind" }
+          if (Test-Path "HKCU:\Software\ExplorerPinned") { throw "settings left behind" }
+          if ((Get-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run).ExplorerPinned) { throw "startup entry left behind" }
+          $schemas = Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\PropertySystem\PropertySchema" -ErrorAction SilentlyContinue |
+            ForEach-Object { (Get-ItemProperty $_.PSPath).PSObject.Properties.Value } | Where-Object { "$_" -like "*ExplorerPinned*" }
+          if ($schemas) { throw "schema left behind: $schemas" }
+          if (Get-Process ExplorerPinned -ErrorAction SilentlyContinue) { throw "agent still running" }
+          Write-Host "installer test passed"
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [e2e, package, installer-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: packages
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" packages/* \
+            --repo "$GITHUB_REPOSITORY" --title "Explorer Pinned ${GITHUB_REF_NAME#v}" --generate-notes
