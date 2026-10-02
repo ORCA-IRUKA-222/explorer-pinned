@@ -396,6 +396,12 @@ std::vector<std::wstring> MenuItems(const std::wstring& path) {
     return items;
 }
 
+int KeyIndexOf(const PROPERTYKEY& k) {
+    for (int i = 0; i < 2; i++)
+        if (IsEqualPropertyKey(k, kPinStateKeys[i])) return i;
+    return -1;
+}
+
 bool Contains(const std::vector<std::wstring>& v, const std::wstring& s) {
     return std::find(v.begin(), v.end(), s) != v.end();
 }
@@ -715,7 +721,8 @@ int wmain(int argc, wchar_t** argv) {
     w.Navigate(other);
     ExpectNoPinnedGroup(w, L"exit restores the grouping of folders that were not open");
     w.Navigate(g_dir);
-    // A folder whose saved grouping still uses the property when it is unregistered
+    // --- uninstall restores the saved grouping of folders that are not open; when the
+    // uninstaller is elevated this runs as the desktop user (forced here for the test)
     std::wstring third = g_dir + L"\\third";
     CreateDirectoryW(third.c_str(), nullptr);
     TouchFile(third + L"\\t1.txt", 2020);
@@ -724,15 +731,16 @@ int wmain(int argc, wchar_t** argv) {
     w.Refresh();
     w.view->SetGroupBy(kPinStateKeys[0], TRUE);
     Pump(1000);
+    RegWriteString(HKEY_CURRENT_USER, kRegPreviousGroupBy, third, L"{00000000-0000-0000-0000-000000000000},0,1");
     w.Navigate(g_dir);
+    SetEnvironmentVariableW(L"EXPLORERPINNED_TEST_DELEGATE", L"1");
     Check(RunExe(L"uninstall --quiet") == 0, L"uninstall exits with 0");
+    SetEnvironmentVariableW(L"EXPLORERPINNED_TEST_DELEGATE", nullptr);
     w.Navigate(third);
     {
         PROPERTYKEY k = w.GroupBy();
-        Groups g = ReadGroups(w.hwnd);
-        wchar_t d[128];
-        swprintf_s(d, L"saved grouping after uninstall: pid %lu, ", k.pid);
-        Print(d + g.Describe());
+        Check(KeyIndexOf(k) < 0, L"uninstall restores the grouping of folders that were not open",
+              L"group-by pid " + std::to_wstring(k.pid));
     }
     w.Navigate(g_dir);
     Print(L"schemas after uninstall: " + RegisteredSchemas());

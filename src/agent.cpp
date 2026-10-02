@@ -783,36 +783,88 @@ ComPtr<IFolderView2> ViewShowing(IWebBrowser2* browser, const std::wstring& fold
     return match ? view : ComPtr<IFolderView2>();
 }
 
-// Opens `folder` in a new Explorer window that is never shown and restores its grouping;
-// closing the window makes Explorer save the restored view state.
-void RestoreFolderInHiddenWindow(const std::wstring& folder) {
+// Identities of the browsers (windows and tabs) that are open now.
+std::vector<ComPtr<IUnknown>> OpenBrowsers(IShellWindows* windows) {
+    std::vector<ComPtr<IUnknown>> result;
+    long count = 0;
+    windows->get_Count(&count);
+    for (long i = 0; i < count; i++) {
+        VARIANT index;
+        index.vt = VT_I4;
+        index.lVal = i;
+        ComPtr<IDispatch> disp;
+        if (SUCCEEDED(windows->Item(index, disp.Put())) && disp) result.push_back(Identity(disp.Get()));
+    }
+    return result;
+}
+
+// Opens `folder` in a new Explorer window that the user does not see (Windows 10) or, where
+// that is not available (Windows 11), in a minimized window that is not activated.
+ComPtr<IWebBrowser2> OpenFolderWindow(const std::wstring& folder, bool* ownWindow) {
+    *ownWindow = true;
     ComPtr<IWebBrowser2> browser;
-    HRESULT hr = E_FAIL;
-    for (int attempt = 0; attempt < 3 && FAILED(hr); attempt++) {
-        if (attempt) PumpFor(500);
-        hr = CoCreateInstance(CLSID_ShellBrowserWindow, nullptr, CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(browser.Put()));
+    if (SUCCEEDED(CoCreateInstance(CLSID_ShellBrowserWindow, nullptr, CLSCTX_LOCAL_SERVER,
+                                   IID_PPV_ARGS(browser.Put())))) {
+        browser->put_Visible(VARIANT_FALSE);
+        ComPtr<IShellBrowser> sb;
+        if (ComPtr<IServiceProvider> sp = browser.As<IServiceProvider>())
+            sp->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(sb.Put()));
+        PIDLIST_ABSOLUTE pidl = nullptr;
+        if (sb && SUCCEEDED(SHParseDisplayName(folder.c_str(), nullptr, &pidl, 0, nullptr))) {
+            sb->BrowseObject(pidl, SBSP_SAMEBROWSER | SBSP_ABSOLUTE);
+            CoTaskMemFree(pidl);
+            return browser;
+        }
+        browser->Quit();
+        browser.Reset();
     }
-    if (FAILED(hr)) {
-        LogLine(L"ShellBrowserWindow failed 0x%08x", hr);
+
+    ComPtr<IShellWindows> windows;
+    if (FAILED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_ALL, IID_PPV_ARGS(windows.Put()))))
+        return browser;
+    auto before = OpenBrowsers(windows.Get());
+    std::vector<HWND> beforeHwnds;
+    for (auto& id : before) {
+        SHANDLE_PTR h = 0;
+        if (ComPtr<IWebBrowser2> b = id.As<IWebBrowser2>(); b && SUCCEEDED(b->get_HWND(&h))) beforeHwnds.push_back((HWND)h);
+    }
+    ShellExecuteW(nullptr, L"open", L"explorer.exe", (L"\"" + folder + L"\"").c_str(), nullptr, SW_SHOWMINNOACTIVE);
+    for (int i = 0; i < 100 && !browser; i++) {
+        PumpFor(100);
+        for (auto& id : OpenBrowsers(windows.Get())) {
+            if (std::any_of(before.begin(), before.end(), [&](const ComPtr<IUnknown>& b) { return b.Get() == id.Get(); }))
+                continue;
+            ComPtr<IWebBrowser2> candidate = id.As<IWebBrowser2>();
+            if (candidate && ViewShowing(candidate.Get(), folder)) {
+                browser = candidate;
+                break;
+            }
+        }
+    }
+    if (browser) {
+        // Opened as a tab of a window the user already has: leave the tab open rather than
+        // closing the user's window.
+        SHANDLE_PTR h = 0;
+        browser->get_HWND(&h);
+        *ownWindow = std::find(beforeHwnds.begin(), beforeHwnds.end(), (HWND)h) == beforeHwnds.end();
+    }
+    return browser;
+}
+
+// Restores the grouping of `folder` and closes the window again, which makes Explorer
+// save the restored view state.
+void RestoreFolderInWindow(const std::wstring& folder) {
+    bool ownWindow = true;
+    ComPtr<IWebBrowser2> browser = OpenFolderWindow(folder, &ownWindow);
+    if (!browser) {
+        LogLine(L"could not open %s to restore its grouping", folder.c_str());
         return;
-    }
-    browser->put_Visible(VARIANT_FALSE);
-    PIDLIST_ABSOLUTE pidl = nullptr;
-    ComPtr<IShellBrowser> sb;
-    if (ComPtr<IServiceProvider> sp = browser.As<IServiceProvider>())
-        sp->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(sb.Put()));
-    if (sb && SUCCEEDED(SHParseDisplayName(folder.c_str(), nullptr, &pidl, 0, nullptr))) {
-        hr = sb->BrowseObject(pidl, SBSP_SAMEBROWSER | SBSP_ABSOLUTE);
-        CoTaskMemFree(pidl);
-    } else {
-        hr = E_FAIL;
     }
     ComPtr<IFolderView2> view;
     for (int i = 0; i < 50 && !view; i++) {
-        PumpFor(100);
         view = ViewShowing(browser.Get(), folder);
+        if (!view) PumpFor(100);
     }
-    LogLine(L"hidden window for %s: browse 0x%08x, view %d", folder.c_str(), hr, view ? 1 : 0);
     if (view) {
         PROPERTYKEY current = {};
         BOOL ascending = TRUE;
@@ -826,21 +878,74 @@ void RestoreFolderInHiddenWindow(const std::wstring& folder) {
             RegDeleteValueIn(HKEY_CURRENT_USER, kRegPreviousGroupBy, folder.c_str());
         }
     }
-    browser->Quit();
+    if (ownWindow) browser->Quit();
     PumpFor(300);
+}
+
+// Starts a program as the user of the desktop (not elevated), through Explorer.
+// https://devblogs.microsoft.com/oldnewthing/20131118-00/?p=2643
+bool ShellExecuteAsDesktopUser(const std::wstring& file, const std::wstring& args) {
+    ComPtr<IShellWindows> windows;
+    if (FAILED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(windows.Put()))))
+        return false;
+    VARIANT location, empty;
+    location.vt = VT_I4;
+    location.lVal = CSIDL_DESKTOP;
+    VariantInit(&empty);
+    long hwnd = 0;
+    ComPtr<IDispatch> desktop;
+    if (FAILED(windows->FindWindowSW(&location, &empty, SWC_DESKTOP, &hwnd, SWFO_NEEDDISPATCH, desktop.Put())) ||
+        !desktop)
+        return false;
+    ComPtr<IServiceProvider> sp = desktop.As<IServiceProvider>();
+    ComPtr<IShellBrowser> sb;
+    ComPtr<IShellView> sv;
+    ComPtr<IDispatch> background;
+    if (!sp || FAILED(sp->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(sb.Put()))) ||
+        FAILED(sb->QueryActiveShellView(sv.Put())) ||
+        FAILED(sv->GetItemObject(SVGIO_BACKGROUND, IID_PPV_ARGS(background.Put()))))
+        return false;
+    ComPtr<IShellFolderViewDual> folderView = background.As<IShellFolderViewDual>();
+    ComPtr<IDispatch> app;
+    if (!folderView || FAILED(folderView->get_Application(app.Put()))) return false;
+    ComPtr<IShellDispatch2> shell = app.As<IShellDispatch2>();
+    if (!shell) return false;
+    BSTR bstrFile = SysAllocString(file.c_str());
+    VARIANT vArgs, vDir, vOperation, vShow;
+    vArgs.vt = VT_BSTR;
+    vArgs.bstrVal = SysAllocString(args.c_str());
+    VariantInit(&vDir);
+    VariantInit(&vOperation);
+    vShow.vt = VT_I4;
+    vShow.lVal = SW_SHOWNORMAL;
+    HRESULT hr = shell->ShellExecute(bstrFile, vArgs, vDir, vOperation, vShow);
+    SysFreeString(bstrFile);
+    VariantClear(&vArgs);
+    return SUCCEEDED(hr);
 }
 
 }  // namespace
 
 void RestoreSavedGroupings() {
-    // An elevated process would talk to an elevated copy of Explorer, not the user's windows
-    // (this happens when the installer stops the program before an upgrade).
-    if (IsUacElevated()) return;
+    if (SavedGroupingFolders().empty()) return;
+    // An elevated process (the uninstaller) would not reach the user's Explorer, so let a
+    // copy of this program running as the desktop user do it, and wait for it.
+    wchar_t force[8] = L"";
+    bool delegate = IsUacElevated() || GetEnvironmentVariableW(L"EXPLORERPINNED_TEST_DELEGATE", force, 8) > 0;
+    if (delegate) {
+        SetEnvironmentVariableW(L"EXPLORERPINNED_TEST_DELEGATE", nullptr);
+        if (!ShellExecuteAsDesktopUser(ExePath(), L"restore-groupings")) {
+            LogLine(L"could not start the restore helper as the desktop user");
+            return;
+        }
+        for (int i = 0; i < 120 && !SavedGroupingFolders().empty(); i++) PumpFor(500);
+        return;
+    }
     auto folders = SavedGroupingFolders();
     LogLine(L"restoring %zu saved grouping(s)", folders.size());
     for (const auto& folder : folders) {
         if (PathExists(folder))
-            RestoreFolderInHiddenWindow(folder);
+            RestoreFolderInWindow(folder);
         else
             RegDeleteValueIn(HKEY_CURRENT_USER, kRegPreviousGroupBy, folder.c_str());
     }
