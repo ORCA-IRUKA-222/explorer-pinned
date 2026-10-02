@@ -93,6 +93,8 @@ English summary is [below](#english).
 - ファイルを開く/保存するダイアログ、「PC」「ホーム」「ライブラリ」、検索結果などの仮想フォルダーでは使えません。
 - ピン止めしていない項目が入る「指定なし」グループの名前は変更できません（Windows の仕様）。
 - 同じフォルダーを表示していても、隠しファイルとして非表示になっている項目はピン止めグループに出ません。
+- エクスプローラーの `IFolderView2::SetViewProperty` という API を使っています。現在の Windows 10 / 11 で動作しますが、
+  Microsoft の SDK では「非推奨」と記載されているため、将来の Windows の更新で動かなくなる可能性があります。
 
 ## アンインストール
 
@@ -181,6 +183,7 @@ Pinned items are shown in a **"Pinned"** group at the top, whatever the sort ord
   (administrator permission is needed once to register the "Pinned" label), or unzip the portable build and run `ExplorerPinned.exe`.
 - The UI is in Japanese on Japanese Windows and in English otherwise.
 - Limitations: the background process must be running; only one grouping can be active, so the default date groups
-  of Downloads are replaced while pins exist in that folder; pins are stored by path (renaming/moving an item unpins it).
+  of Downloads are replaced while pins exist in that folder; pins are stored by path (renaming/moving an item unpins it);
+  `IFolderView2::SetViewProperty` is marked deprecated in the Windows SDK, so a future Windows update could break it.
 
 Licensed under the [MIT License](LICENSE).

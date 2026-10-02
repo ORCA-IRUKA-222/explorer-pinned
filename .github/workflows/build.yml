@@ -69,11 +69,6 @@ jobs:
             $img.Save("$PWD\screenshots\sorted-by-date.png", [System.Drawing.Imaging.ImageFormat]::Png)
             $img.Dispose()
             Remove-Item $bmp
-            # Printed so the image can be recovered from the log as well.
-            $b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes("$PWD\screenshots\sorted-by-date.png"))
-            for ($i = 0; $i -lt $b64.Length; $i += 4000) {
-              Write-Host ("PNG64:" + $b64.Substring($i, [Math]::Min(4000, $b64.Length - $i)))
-            }
           }
       - uses: actions/upload-artifact@v4
         if: always()
@@ -130,10 +125,52 @@ jobs:
             dist/ExplorerPinned-*.zip
           if-no-files-found: error
 
+  installer-test:
+    name: Installer test
+    needs: package
+    runs-on: windows-2025
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: packages
+      - name: Install, check, uninstall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          [Console]::OutputEncoding = [Text.Encoding]::UTF8
+          $setup = Get-ChildItem packages\ExplorerPinned-Setup-*.exe | Select-Object -First 1
+          Start-Process $setup.FullName -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LANG=japanese", "/LOG=install.log" -Wait
+          $exe = "$env:ProgramFiles\Explorer Pinned\ExplorerPinned.exe"
+          if (-not (Test-Path $exe)) { Get-Content install.log; throw "not installed" }
+          Start-Sleep -Seconds 3
+          $status = & $exe status | Out-String
+          Write-Host $status
+          if ($status -notmatch "schema: registered \(ピン止め\)") { throw "schema not registered in Japanese" }
+          if ($status -notmatch "menu: registered") { throw "menu not registered" }
+          if ($status -notmatch "startup: on") { throw "startup entry missing" }
+          if ($status -notmatch "agent: running") { throw "agent not running" }
+          $menu = (Get-ItemProperty -LiteralPath "HKCU:\Software\Classes\*\shell\ExplorerPinned.Pin").MUIVerb
+          Write-Host "menu text: $menu"
+          if ($menu -ne "このファイルをピン止めする") { throw "unexpected menu text" }
+
+          $uninstaller = Get-ChildItem "$env:ProgramFiles\Explorer Pinned\unins*.exe" | Select-Object -First 1
+          Start-Process $uninstaller.FullName -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait
+          Start-Sleep -Seconds 5
+          if (Test-Path $exe) { throw "files left behind" }
+          if (Test-Path -LiteralPath "HKCU:\Software\Classes\*\shell\ExplorerPinned.Pin") { throw "menu left behind" }
+          if (Test-Path "HKCU:\Software\ExplorerPinned") { throw "settings left behind" }
+          if ((Get-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run).ExplorerPinned) { throw "startup entry left behind" }
+          $schemas = Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\PropertySystem\PropertySchema" |
+            ForEach-Object { (Get-ItemProperty $_.PSPath).PSObject.Properties.Value } | Where-Object { "$_" -like "*ExplorerPinned*" }
+          if ($schemas) { throw "schema left behind: $schemas" }
+          if (Get-Process ExplorerPinned -ErrorAction SilentlyContinue) { throw "agent still running" }
+          Write-Host "installer test passed"
+
   release:
     name: Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [e2e, package]
+    needs: [e2e, package, installer-test]
     runs-on: ubuntu-latest
     permissions:
       contents: write

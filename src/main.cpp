@@ -54,12 +54,13 @@ int ChangePins(const std::vector<std::wstring>& paths, const std::wstring& mode)
     int failures = 0;
     for (const auto& raw : paths) {
         std::wstring path = NormalizePath(raw);
-        if (path.empty() || !PathExists(path)) {
+        bool pin = mode == L"pin" || (mode == L"toggle" && !PinStore::IsPinned(path));
+        // A missing item can still be unpinned.
+        if (path.empty() || (pin && !PathExists(path))) {
             ConsoleWrite(L"not found: " + raw + L"\n");
             failures++;
             continue;
         }
-        bool pin = mode == L"pin" || (mode == L"toggle" && !PinStore::IsPinned(path));
         if (pin)
             PinStore::Add(path);
         else
