@@ -348,13 +348,19 @@ bool OpenWindow(Window* w, const std::wstring& path = g_dir) {
         15000);
 }
 
+// The group label depends on the language the property was registered in (the test
+// re-registers it in English near the end; open windows may still show the old label).
+bool IsPinnedLabel(const std::wstring& name) {
+    return name == g_pinnedLabel || name == L"ピン止め" || name == L"Pinned";
+}
+
 // Waits until the topmost group is the pinned group with exactly `expected` items.
 bool ExpectPinned(Window& w, const std::set<std::wstring>& expected, const std::wstring& what) {
     Groups last;
     bool ok = WaitFor(
         [&] {
             last = ReadGroups(w.hwnd);
-            return !last.order.empty() && last.order[0] == g_pinnedLabel && last.First() == expected;
+            return !last.order.empty() && IsPinnedLabel(last.order[0]) && last.First() == expected;
         },
         15000);
     std::vector<std::wstring> exp(expected.begin(), expected.end());
@@ -367,7 +373,7 @@ bool ExpectNoPinnedGroup(Window& w, const std::wstring& what) {
     bool ok = WaitFor(
         [&] {
             last = ReadGroups(w.hwnd);
-            return std::find(last.order.begin(), last.order.end(), g_pinnedLabel) == last.order.end() &&
+            return std::none_of(last.order.begin(), last.order.end(), IsPinnedLabel) &&
                    !IsEqualPropertyKey(w.GroupBy(), kPinStateKeys[0]) && !IsEqualPropertyKey(w.GroupBy(), kPinStateKeys[1]);
         },
         15000);
@@ -578,7 +584,7 @@ int wmain(int argc, wchar_t** argv) {
     Pump(2500);
     {
         Groups g = ReadGroups(w.hwnd);
-        Check(!g.First().count(L"echo") && !g.order.empty() && g.order[0] == g_pinnedLabel,
+        Check(!g.First().count(L"echo") && !g.order.empty() && IsPinnedLabel(g.order[0]),
               L"new file is not pinned", g.Describe());
     }
     RunExe(L"toggle \"" + g_dir + L"\\echo.txt\"");
@@ -750,7 +756,7 @@ int wmain(int argc, wchar_t** argv) {
         }
         if (pf) pf->Release();
     }
-    ExpectNoPinnedGroup(w, L"leaving a folder puts its original grouping back before Explorer saves it");
+    ExpectNoPinnedGroup(w, L"exit restores the grouping of folders that were not open");
     w.Navigate(g_dir);
     // --- uninstall restores the saved grouping of folders that are not open; when the
     // uninstaller is elevated this runs as the desktop user (forced here for the test)
@@ -763,7 +769,21 @@ int wmain(int argc, wchar_t** argv) {
     w.view->SetGroupBy(kPinStateKeys[0], TRUE);
     Pump(1000);
     RegWriteString(HKEY_CURRENT_USER, kRegPreviousGroupBy, third.c_str(), L"{00000000-0000-0000-0000-000000000000},0,1");
-    RegWriteString(HKEY_CURRENT_USER, kRegGroupedFolders, third.c_str(), L"1");
+    {
+        IPersistFolder2* pf = nullptr;
+        PIDLIST_ABSOLUTE pidl = nullptr;
+        if (w.Refresh() && SUCCEEDED(w.view->GetFolder(IID_PPV_ARGS(&pf))) && SUCCEEDED(pf->GetCurFolder(&pidl))) {
+            HKEY k;
+            if (RegCreateKeyExW(HKEY_CURRENT_USER, kRegGroupedFolders, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &k,
+                                nullptr) == ERROR_SUCCESS) {
+                std::wstring name = third + L"|0";
+                RegSetValueExW(k, name.c_str(), 0, REG_BINARY, reinterpret_cast<const BYTE*>(pidl), ILGetSize(pidl));
+                RegCloseKey(k);
+            }
+            CoTaskMemFree(pidl);
+        }
+        if (pf) pf->Release();
+    }
     w.Navigate(g_dir);
     SetEnvironmentVariableW(L"EXPLORERPINNED_TEST_DELEGATE", L"1");
     Check(RunExe(L"uninstall --quiet") == 0, L"uninstall exits with 0");
