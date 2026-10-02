@@ -25,6 +25,7 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <functional>
 
 #ifdef _MSC_VER
 #pragma warning(disable : 4996)
@@ -379,27 +380,39 @@ struct View {
         fv = NULL;
         id = NULL;
     }
+    // Picks up the active view; events are connected once per view object.
     bool Acquire() {
-        Release();
         IServiceProvider* sp = NULL;
         IShellBrowser* sb = NULL;
         IShellView* sv = NULL;
+        IFolderView2* nfv = NULL;
+        IUnknown* nid = NULL;
         wb->QueryInterface(IID_PPV_ARGS(&sp));
         if (sp) sp->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(&sb));
         if (sb) sb->QueryActiveShellView(&sv);
-        if (sv) sv->QueryInterface(IID_PPV_ARGS(&fv));
-        if (fv) fv->GetFolder(IID_PPV_ARGS(&sf));
-        if (fv) fv->QueryInterface(IID_PPV_ARGS(&id));
+        if (sv) sv->QueryInterface(IID_PPV_ARGS(&nfv));
+        if (nfv) nfv->QueryInterface(IID_PPV_ARGS(&nid));
         if (sv) sv->Release();
         if (sb) sb->Release();
         if (sp) sp->Release();
-        if (fv) {
-            IDispatch* doc = NULL;
-            wb->get_Document(&doc);
-            if (doc) {
-                Advise(doc, DIID_DShellFolderViewEvents, L'V');
-                doc->Release();
-            }
+        if (!nfv) {
+            Release();
+            return false;
+        }
+        if (nid == id) {
+            nfv->Release();
+            nid->Release();
+            return fv && sf;
+        }
+        Release();
+        fv = nfv;
+        id = nid;
+        fv->GetFolder(IID_PPV_ARGS(&sf));
+        IDispatch* doc = NULL;
+        wb->get_Document(&doc);
+        if (doc) {
+            Advise(doc, DIID_DShellFolderViewEvents, L'V');
+            doc->Release();
         }
         return fv && sf;
     }
@@ -458,7 +471,7 @@ static bool OpenWindow(const std::wstring& dir) {
     return false;
 }
 
-static void Navigate(const std::wstring& path) {
+static void Navigate(const std::wstring& path, bool wait = true) {
     PIDLIST_ABSOLUTE pidl = NULL;
     SHParseDisplayName(path.c_str(), NULL, &pidl, 0, NULL);
     IServiceProvider* sp = NULL;
@@ -471,7 +484,12 @@ static void Navigate(const std::wstring& path) {
     if (sp) sp->Release();
     CoTaskMemFree(pidl);
     DWORD t = GetTickCount();
-    while (g_docComplete == before && GetTickCount() - t < 15000) Pump(20);
+    if (!wait) {
+        Log(L"  navigate %s (no wait) hr=0x%08x", path.c_str(), hr);
+        return;
+    }
+    while (g_docComplete == before && GetTickCount() - t < 30000) Pump(20);
+    Log(L"  navigate took %lums", GetTickCount() - t);
     Pump(300);
     bool ok = g_view.Acquire();
     Log(L"  navigate %s hr=0x%08x acquired=%d path=%s", path.c_str(), hr, ok, g_view.Path().c_str());
@@ -525,11 +543,15 @@ static void SetGroup(const PROPERTYKEY& key, BOOL asc = TRUE) {
 }
 
 // Logs changes of item count, grouping, pin values on both keys and events.
-static void Watch(DWORD ms, const wchar_t* label) {
+static void Watch(DWORD ms, const wchar_t* label, const std::function<void()>& tick = nullptr) {
     DWORD end = GetTickCount() + ms;
     std::wstring last;
     int samples = 0;
     while ((int)(end - GetTickCount()) > 0) {
+        if (!g_view.Acquire()) {
+            Pump(50);
+            continue;
+        }
         int count = -1;
         HRESULT hc = g_view.fv->ItemCount(SVGIO_ALLVIEW, &count);
         PROPERTYKEY gk = {};
@@ -543,7 +565,8 @@ static void Watch(DWORD ms, const wchar_t* label) {
             last = state;
         }
         samples++;
-        Pump(100);
+        if (tick) tick();
+        Pump(50);
     }
 }
 
@@ -672,9 +695,17 @@ int wmain(int argc, wchar_t** argv) {
     g_logPath = std::wstring(la) + L"\\ExplorerPinned\\agent.log";
     CoTaskMemFree(la);
 
+    std::wstring huge = LongPath(std::wstring(tmp)) + L"ep_huge";
+    std::wstring unc = L"\\\\localhost\\" + g_big.substr(0, 1) + L"$" + g_big.substr(2);
     auto made = PopulateFolder(g_big);
-    PopulateFolder(g_downloads);
-    Log(L"populated %zu items in %s and %s", made.size(), g_big.c_str(), g_downloads.c_str());
+    PopulateFolder(huge);
+    for (int i = 0; i < 20000; i++) {
+        wchar_t n[64];
+        swprintf_s(n, L"\\bulk_%05d.txt", i);
+        WriteBytes(huge + n, "x", 1);
+    }
+    Log(L"populated %zu items in %s, 20000 more in %s; unc=%s exists=%d", made.size(), g_big.c_str(), huge.c_str(),
+        unc.c_str(), GetFileAttributesW(unc.c_str()) != INVALID_FILE_ATTRIBUTES);
     g_pins = {L"folder_007", L"app_003.exe", L"photo_050.png", L"doc_010.pdf", L"note_100.txt"};
 
     RunEp(L"register-schema --lang en", true);
@@ -684,107 +715,115 @@ int wmain(int argc, wchar_t** argv) {
         return 1;
     }
     Log(L"window open");
+    Pump(2000);
 
-    Log(L"######## T1 details, none -> A -> B -> A");
-    Fresh(g_big, false, &KNONE);
-    AlternateTrial(L"T1");
-
-    Log(L"######## T2 large icons, none -> A -> B -> A");
-    Fresh(g_big, true, &KNONE);
-    AlternateTrial(L"T2");
-
-    Log(L"######## T3 large icons, DateModified -> A -> B -> A");
-    Fresh(g_big, true, &K_DateModified);
-    AlternateTrial(L"T3");
-
-    Log(L"######## T4 relogin, then B");
-    Relogin(g_big);
+    Log(L"######## H1 huge folder, large icons, none -> A -> B -> A");
+    Fresh(huge, true, &KNONE);
+    AlternateTrial(L"H1");
+    Log(L"######## H2 huge folder relogin, then B");
+    Relogin(huge);
     SetPins(KB);
     SetGroup(KB);
-    Watch(8000, L"T4 ->B");
-    Uia(L"T4 ->B");
+    Watch(8000, L"H2 ->B");
+    Uia(L"H2 ->B");
 
-    Log(L"######## T5 relogin, then none, wait, A");
-    Relogin(g_big);
-    SetGroup(KNONE);
-    Watch(4000, L"T5 none");
-    SetPins(KA);
-    SetGroup(KA);
-    Watch(8000, L"T5 ->A");
-    Uia(L"T5 ->A");
-
-    Log(L"######## T6 relogin, then DateModified, wait, A");
-    Relogin(g_big);
-    SetGroup(K_DateModified);
-    Watch(4000, L"T6 date");
-    SetPins(KA);
-    SetGroup(KA);
-    Watch(8000, L"T6 ->A");
-    Uia(L"T6 ->A");
-
-    Log(L"######## T7 relogin, set A in place, wait, then B");
-    Relogin(g_big);
-    SetPins(KA);
-    Watch(3000, L"T7 set A in place");
-    Uia(L"T7 in place");
+    Log(L"######## N1 network path, large icons, none -> A -> B -> A");
+    Fresh(unc, true, &KNONE);
+    AlternateTrial(L"N1");
+    Log(L"######## N2 network path relogin, then B");
+    Relogin(unc);
     SetPins(KB);
     SetGroup(KB);
-    Watch(8000, L"T7 ->B");
-    Uia(L"T7 ->B");
+    Watch(8000, L"N2 ->B");
+    Uia(L"N2 ->B");
 
-    Log(L"######## T8 Downloads default view, -> A -> B -> A");
-    Navigate(L"C:\\Windows\\Help");
-    Navigate(g_downloads);
+    Log(L"######## C1 a file in the folder keeps changing");
     {
-        PROPERTYKEY gk = {};
-        BOOL asc = TRUE;
-        g_view.fv->GetGroupBy(&gk, &asc);
-        UINT mode = 0;
-        g_view.fv->GetCurrentViewMode(&mode);
-        Log(L"  Downloads default group=%s asc=%d mode=%u", KeyName(gk).c_str(), asc, mode);
+        DWORD lastTouch = 0;
+        int n = 0;
+        auto touch = [&] {
+            if (GetTickCount() - lastTouch < 300) return;
+            lastTouch = GetTickCount();
+            std::string data(100 + (n++ % 50), 'x');
+            WriteBytes(g_big + L"\\note_000.txt", data.data(), data.size());
+        };
+        Fresh(g_big, true, &KNONE);
+        SetPins(KA);
+        SetGroup(KA);
+        Watch(6000, L"C1 A", touch);
+        Uia(L"C1 A");
+        SetPins(KB);
+        SetGroup(KB);
+        Watch(6000, L"C1 ->B", touch);
+        Uia(L"C1 ->B");
+        Log(L"######## C2 a pinned file keeps changing");
+        auto touchPinned = [&] {
+            if (GetTickCount() - lastTouch < 300) return;
+            lastTouch = GetTickCount();
+            std::string data(100 + (n++ % 50), 'x');
+            WriteBytes(g_big + L"\\note_100.txt", data.data(), data.size());
+        };
+        SetPins(KA);
+        SetGroup(KA);
+        Watch(6000, L"C2 ->A", touchPinned);
+        Uia(L"C2 ->A");
     }
-    SetIcons();
-    Watch(3000, L"T8 settle");
-    AlternateTrial(L"T8");
 
     if (!g_epExe.empty()) {
-        Log(L"######## T9 agent on ep_big (large icons)");
         HKEY k;
-        RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\ExplorerPinned\\Pins", 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL);
-        for (auto& n : g_pins) {
-            std::wstring p = g_big + L"\\" + n;
-            RegSetValueExW(k, p.c_str(), 0, REG_SZ, (const BYTE*)L"x", 4);
-            p = g_downloads + L"\\" + n;
-            RegSetValueExW(k, p.c_str(), 0, REG_SZ, (const BYTE*)L"x", 4);
-        }
-        RegCloseKey(k);
         RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\ExplorerPinned", 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL);
         RegSetValueExW(k, L"Log", 0, REG_SZ, (const BYTE*)L"1", 4);
         RegCloseKey(k);
-        Fresh(g_big, true, &KNONE);
-        RunEp(L"agent", false);
-        Watch(20000, L"T9 agent");
-        Uia(L"T9 agent");
-        DumpAgentLog(L"T9");
+        RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\ExplorerPinned\\Pins", 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL);
+        for (auto& n : g_pins) {
+            for (auto& dir : {g_big, huge, unc}) {
+                std::wstring p = dir + L"\\" + n;
+                RegSetValueExW(k, p.c_str(), 0, REG_SZ, (const BYTE*)L"x", 4);
+            }
+        }
+        RegCloseKey(k);
 
-        Log(L"######## T10 agent killed, relogin, agent restarted");
+        Log(L"######## L1 agent on the huge folder, then logon simulation (agent starts while it loads)");
+        Fresh(huge, true, &KNONE);
+        RunEp(L"agent", false);
+        Watch(15000, L"L1 agent");
+        Uia(L"L1 agent");
+        DumpAgentLog(L"L1");
         system("taskkill /F /IM ExplorerPinned.exe");
-        Pump(1000);
         Navigate(L"C:\\Windows\\Help");
-        Navigate(g_big);
-        Watch(3000, L"T10 restored");
-        Uia(L"T10 restored");
+        Navigate(huge, false);
         RunEp(L"agent", false);
-        Watch(25000, L"T10 agent");
-        Uia(L"T10 agent");
-        DumpAgentLog(L"T10");
+        Watch(30000, L"L1 logon");
+        Uia(L"L1 logon");
+        DumpAgentLog(L"L1 logon");
 
-        Log(L"######## T11 agent on Downloads");
+        Log(L"######## L2 agent on the network path, then logon simulation");
+        Navigate(unc);
+        Watch(15000, L"L2 agent");
+        Uia(L"L2 agent");
+        DumpAgentLog(L"L2");
+        system("taskkill /F /IM ExplorerPinned.exe");
         Navigate(L"C:\\Windows\\Help");
-        Navigate(g_downloads);
-        Watch(20000, L"T11 agent");
-        Uia(L"T11 agent");
-        DumpAgentLog(L"T11");
+        Navigate(unc, false);
+        RunEp(L"agent", false);
+        Watch(30000, L"L2 logon");
+        Uia(L"L2 logon");
+        DumpAgentLog(L"L2 logon");
+
+        Log(L"######## L3 agent with a pinned file that keeps changing");
+        Navigate(g_big);
+        {
+            DWORD lastTouch = 0;
+            int n = 0;
+            Watch(20000, L"L3", [&] {
+                if (GetTickCount() - lastTouch < 300) return;
+                lastTouch = GetTickCount();
+                std::string data(100 + (n++ % 50), 'x');
+                WriteBytes(g_big + L"\\note_100.txt", data.data(), data.size());
+            });
+        }
+        Uia(L"L3");
+        DumpAgentLog(L"L3");
         RunEp(L"exit", true);
     }
 
