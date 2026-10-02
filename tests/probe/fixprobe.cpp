@@ -826,12 +826,16 @@ int wmain(int argc, wchar_t** argv) {
     RegSetValueExW(k, L"Language", 0, REG_SZ, (const BYTE*)L"ja", 6);
     RegCloseKey(k);
 
-    if (!OpenWindow(g_dir)) {
-        Log(L"window not found");
-        return 1;
+    // F, G: no folder window before the fix, and the fix right after the seeding (like the E2E test)
+    bool early = variant != L"F" && variant != L"G";
+    if (early) {
+        if (!OpenWindow(g_dir)) {
+            Log(L"window not found");
+            return 1;
+        }
+        g_view.fv->SetCurrentViewMode(FVM_DETAILS);
+        Pump(1500);
     }
-    g_view.fv->SetCurrentViewMode(FVM_DETAILS);
-    Pump(1500);
 
     if (variant != L"E") {
         Log(L"######## seed: old schema registered from two folders, the first file deleted");
@@ -845,7 +849,7 @@ int wmain(int argc, wchar_t** argv) {
         RemoveDirectoryW((base + L"ep_old_portable").c_str());
         PSRefreshPropertySchema();
         DumpSchemas(L"seeded");
-        Pump(2000);
+        if (variant != L"F") Pump(2000);
     }
 
     Log(L"######## fix");
@@ -864,6 +868,14 @@ int wmain(int argc, wchar_t** argv) {
             Log(L"window not found after restart");
             return 1;
         }
+    }
+    if (!early) {
+        if (!OpenWindow(g_dir)) {
+            Log(L"window not found");
+            return 1;
+        }
+        g_view.fv->SetCurrentViewMode(FVM_DETAILS);
+        Pump(1500);
     }
     DumpSchemas(L"after fix");
     Describe(kNewKey, L"new key");

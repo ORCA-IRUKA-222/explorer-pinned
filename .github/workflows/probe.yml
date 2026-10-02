@@ -5,11 +5,12 @@ on:
     paths: ["tests/probe/**", ".github/workflows/probe.yml"]
 jobs:
   probe:
-    name: Probe (${{ matrix.variant }})
+    name: Probe (${{ matrix.variant }} ${{ matrix.rep }})
     strategy:
       fail-fast: false
       matrix:
-        variant: [A, B, C, D, E]
+        variant: [F, G]
+        rep: [1, 2]
     runs-on: windows-2025
     timeout-minutes: 20
     steps:
