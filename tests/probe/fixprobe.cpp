@@ -715,7 +715,7 @@ static void Try(const PROPERTYKEY& key, const wchar_t* label) {
 static const GUID kOurFmt = {0x11aabe88, 0x6952, 0x4b06, {0x91, 0x80, 0x0b, 0xc4, 0x96, 0x4e, 0x31, 0x58}};
 
 // Our real schema (names, keys, labels) as version 1.0.1 writes it.
-static std::wstring OurXml() {
+static std::wstring OurXml(const std::wstring& label = L"Pinned", const std::wstring& text = L"Pinned") {
     std::wstring xml =
         L"<?xml version=\"1.0\" encoding=\"utf-16\"?>\r\n"
         L"<schema xmlns=\"http://schemas.microsoft.com/windows/2006/propertydescription\" schemaVersion=\"1.0\">\r\n"
@@ -725,10 +725,10 @@ static std::wstring OurXml() {
                L"\" formatID=\"" + GuidStr(kOurFmt) + L"\" propID=\"" + std::to_wstring(pid) + L"\">\r\n";
         xml += L"      <searchInfo inInvertedIndex=\"false\" isColumn=\"false\"/>\r\n"
                L"      <typeInfo type=\"UInt32\" isInnate=\"true\" isViewable=\"true\" groupingRange=\"Enumerated\"/>\r\n"
-               L"      <labelInfo label=\"Pinned\"/>\r\n"
+               L"      <labelInfo label=\"" + label + L"\"/>\r\n"
                L"      <displayInfo displayType=\"Enumerated\" defaultColumnWidth=\"12\">\r\n"
                L"        <enumeratedList>\r\n"
-               L"          <enum name=\"Pinned\" value=\"0\" text=\"Pinned\"/>\r\n"
+               L"          <enum name=\"Pinned\" value=\"0\" text=\"" + text + L"\"/>\r\n"
                L"        </enumeratedList>\r\n"
                L"      </displayInfo>\r\n"
                L"    </propertyDescription>\r\n";
@@ -830,8 +830,10 @@ int wmain(int argc, wchar_t** argv) {
         Log(L"######## seed: old schema registered from two folders, the first file deleted");
         std::wstring first = base + L"ep_old_portable\\ExplorerPinned.propdesc";
         std::wstring second = base + L"ep_old_installed\\ExplorerPinned.propdesc";
-        WriteUtf16(first, OurXml());
-        WriteUtf16(second, OurXml());
+        std::wstring label = (variant == L"J1" || variant == L"J2") ? L"ピン止め" : L"Pinned";
+        std::wstring text = (variant == L"J1" || variant == L"J3") ? L"ピン止め" : L"Pinned";
+        WriteUtf16(first, OurXml(label, text));
+        WriteUtf16(second, OurXml(label, text));
         Reg(first);
         Reg(second);
         DeleteFileW(first.c_str());
