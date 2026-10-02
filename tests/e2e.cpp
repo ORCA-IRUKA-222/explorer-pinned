@@ -715,7 +715,7 @@ int wmain(int argc, wchar_t** argv) {
     w.Navigate(g_dir);
 
     // --- exit restores the grouping; uninstall cleans up
-    RunExe(L"exit");
+    Check(RunExe(L"exit") == 0, L"exit command exits with 0");
     Check(WaitFor([] { return FindWindowW(kAgentWindowClass, nullptr) == nullptr; }, 10000), L"exit stops the agent");
     ExpectNoPinnedGroup(w, L"exit restores the original grouping");
     w.Navigate(other);

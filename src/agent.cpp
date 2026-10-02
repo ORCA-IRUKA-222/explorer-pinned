@@ -798,27 +798,48 @@ std::vector<ComPtr<IUnknown>> OpenBrowsers(IShellWindows* windows) {
     return result;
 }
 
-// Opens `folder` in a new Explorer window that the user does not see (Windows 10) or, where
-// that is not available (Windows 11), in a minimized window that is not activated.
-ComPtr<IWebBrowser2> OpenFolderWindow(const std::wstring& folder, bool* ownWindow) {
+ComPtr<IFolderView2> WaitForView(IWebBrowser2* browser, const std::wstring& folder, int tenthsOfSecond) {
+    ComPtr<IFolderView2> view;
+    for (int i = 0; i < tenthsOfSecond && !view; i++) {
+        PumpFor(100);
+        view = ViewShowing(browser, folder);
+    }
+    return view;
+}
+
+// Opens `folder` in a new Explorer window that the user does not see. Returns the window and
+// its view, or nothing when Explorer does not support hidden windows (Windows 11).
+ComPtr<IWebBrowser2> OpenHiddenWindow(const std::wstring& folder, ComPtr<IFolderView2>* view) {
+    ComPtr<IWebBrowser2> browser;
+    HRESULT hr =
+        CoCreateInstance(CLSID_ShellBrowserWindow, nullptr, CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(browser.Put()));
+    if (FAILED(hr)) {
+        LogLine(L"hidden window: create failed 0x%08x", hr);
+        return ComPtr<IWebBrowser2>();
+    }
+    browser->put_Visible(VARIANT_FALSE);
+    ComPtr<IShellBrowser> sb;
+    if (ComPtr<IServiceProvider> sp = browser.As<IServiceProvider>())
+        sp->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(sb.Put()));
+    PIDLIST_ABSOLUTE pidl = nullptr;
+    if (sb && SUCCEEDED(SHParseDisplayName(folder.c_str(), nullptr, &pidl, 0, nullptr))) {
+        hr = sb->BrowseObject(pidl, SBSP_SAMEBROWSER | SBSP_ABSOLUTE);
+        CoTaskMemFree(pidl);
+        if (SUCCEEDED(hr)) *view = WaitForView(browser.Get(), folder, 30);
+    }
+    if (!*view) {
+        LogLine(L"hidden window: no view (browse 0x%08x)", hr);
+        browser->Quit();
+        return ComPtr<IWebBrowser2>();
+    }
+    return browser;
+}
+
+// Opens `folder` in a new minimized window that is not activated. `ownWindow` is false when
+// Explorer put it in a tab of a window the user already had.
+ComPtr<IWebBrowser2> OpenMinimizedWindow(const std::wstring& folder, ComPtr<IFolderView2>* view, bool* ownWindow) {
     *ownWindow = true;
     ComPtr<IWebBrowser2> browser;
-    if (SUCCEEDED(CoCreateInstance(CLSID_ShellBrowserWindow, nullptr, CLSCTX_LOCAL_SERVER,
-                                   IID_PPV_ARGS(browser.Put())))) {
-        browser->put_Visible(VARIANT_FALSE);
-        ComPtr<IShellBrowser> sb;
-        if (ComPtr<IServiceProvider> sp = browser.As<IServiceProvider>())
-            sp->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(sb.Put()));
-        PIDLIST_ABSOLUTE pidl = nullptr;
-        if (sb && SUCCEEDED(SHParseDisplayName(folder.c_str(), nullptr, &pidl, 0, nullptr))) {
-            sb->BrowseObject(pidl, SBSP_SAMEBROWSER | SBSP_ABSOLUTE);
-            CoTaskMemFree(pidl);
-            return browser;
-        }
-        browser->Quit();
-        browser.Reset();
-    }
-
     ComPtr<IShellWindows> windows;
     if (FAILED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_ALL, IID_PPV_ARGS(windows.Put()))))
         return browser;
@@ -835,48 +856,46 @@ ComPtr<IWebBrowser2> OpenFolderWindow(const std::wstring& folder, bool* ownWindo
             if (std::any_of(before.begin(), before.end(), [&](const ComPtr<IUnknown>& b) { return b.Get() == id.Get(); }))
                 continue;
             ComPtr<IWebBrowser2> candidate = id.As<IWebBrowser2>();
-            if (candidate && ViewShowing(candidate.Get(), folder)) {
+            if (!candidate) continue;
+            if (ComPtr<IFolderView2> v = ViewShowing(candidate.Get(), folder)) {
                 browser = candidate;
+                *view = v;
                 break;
             }
         }
     }
     if (browser) {
-        // Opened as a tab of a window the user already has: leave the tab open rather than
-        // closing the user's window.
         SHANDLE_PTR h = 0;
         browser->get_HWND(&h);
         *ownWindow = std::find(beforeHwnds.begin(), beforeHwnds.end(), (HWND)h) == beforeHwnds.end();
+    } else {
+        LogLine(L"minimized window: not found");
     }
     return browser;
 }
 
-// Restores the grouping of `folder` and closes the window again, which makes Explorer
-// save the restored view state.
+// Restores the grouping of `folder` in a window opened for it and closes the window again,
+// which makes Explorer save the restored view state.
 void RestoreFolderInWindow(const std::wstring& folder) {
+    ComPtr<IFolderView2> view;
     bool ownWindow = true;
-    ComPtr<IWebBrowser2> browser = OpenFolderWindow(folder, &ownWindow);
-    if (!browser) {
+    ComPtr<IWebBrowser2> browser = OpenHiddenWindow(folder, &view);
+    if (!browser) browser = OpenMinimizedWindow(folder, &view, &ownWindow);
+    if (!browser || !view) {
         LogLine(L"could not open %s to restore its grouping", folder.c_str());
         return;
     }
-    ComPtr<IFolderView2> view;
-    for (int i = 0; i < 50 && !view; i++) {
-        view = ViewShowing(browser.Get(), folder);
-        if (!view) PumpFor(100);
-    }
-    if (view) {
-        PROPERTYKEY current = {};
-        BOOL ascending = TRUE;
-        if (SUCCEEDED(view->GetGroupBy(&current, &ascending)) && KeyIndex(current) >= 0) {
-            PROPERTYKEY key;
-            TakePreviousGroupBy(folder, &key, &ascending);
-            view->SetGroupBy(key, ascending);
-            PumpFor(300);
-            LogLine(L"restored grouping of %s", folder.c_str());
-        } else {
-            RegDeleteValueIn(HKEY_CURRENT_USER, kRegPreviousGroupBy, folder.c_str());
-        }
+    PROPERTYKEY current = {};
+    BOOL ascending = TRUE;
+    if (SUCCEEDED(view->GetGroupBy(&current, &ascending)) && KeyIndex(current) >= 0) {
+        PROPERTYKEY key;
+        TakePreviousGroupBy(folder, &key, &ascending);
+        view->SetGroupBy(key, ascending);
+        PumpFor(300);
+        LogLine(L"restored grouping of %s", folder.c_str());
+    } else {
+        RegDeleteValueIn(HKEY_CURRENT_USER, kRegPreviousGroupBy, folder.c_str());
+        LogLine(L"%s is no longer grouped by pins", folder.c_str());
     }
     if (ownWindow) browser->Quit();
     PumpFor(300);
