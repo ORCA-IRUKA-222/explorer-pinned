@@ -89,6 +89,62 @@ int RunExe(const std::wstring& args, DWORD timeoutMs = 60000) {
     return (int)code;
 }
 
+// Runs the program and returns what it printed.
+std::wstring RunExeOutput(const std::wstring& args) {
+    SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
+    HANDLE readPipe = nullptr, writePipe = nullptr;
+    CreatePipe(&readPipe, &writePipe, &sa, 0);
+    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
+    std::wstring cmd = L"\"" + g_exe + L"\" " + args;
+    STARTUPINFOW si = {sizeof(si)};
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = writePipe;
+    si.hStdError = writePipe;
+    PROCESS_INFORMATION pi = {};
+    std::string out;
+    if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(writePipe);
+        writePipe = nullptr;
+        char buf[4096];
+        DWORD n;
+        while (ReadFile(readPipe, buf, sizeof(buf), &n, nullptr) && n) out.append(buf, n);
+        WaitForSingleObject(pi.hProcess, 30000);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    if (writePipe) CloseHandle(writePipe);
+    CloseHandle(readPipe);
+    int len = MultiByteToWideChar(CP_UTF8, 0, out.data(), (int)out.size(), nullptr, 0);
+    std::wstring w(len, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, out.data(), (int)out.size(), w.data(), len);
+    return w;
+}
+
+// Lists the property schema files registered with Windows that belong to this program.
+std::wstring RegisteredSchemas() {
+    std::wstring result;
+    HKEY root;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\PropertySystem\\PropertySchema",
+                      0, KEY_READ, &root) != ERROR_SUCCESS)
+        return L"(no key)";
+    wchar_t sub[256];
+    for (DWORD i = 0;; i++) {
+        DWORD len = 256;
+        if (RegEnumKeyExW(root, i, sub, &len, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+        HKEY k;
+        if (RegOpenKeyExW(root, sub, 0, KEY_READ, &k) != ERROR_SUCCESS) continue;
+        wchar_t name[256], data[1024];
+        for (DWORD j = 0;; j++) {
+            DWORD nl = 256, dl = sizeof(data), type = 0;
+            if (RegEnumValueW(k, j, name, &nl, nullptr, &type, (BYTE*)data, &dl) != ERROR_SUCCESS) break;
+            if (type == REG_SZ && wcsstr(data, L"ExplorerPinned")) result += std::wstring(sub) + L"\\" + name + L"=" + data + L"; ";
+        }
+        RegCloseKey(k);
+    }
+    RegCloseKey(root);
+    return result.empty() ? L"(none)" : result;
+}
+
 void TouchFile(const std::wstring& path, int year) {
     HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return;
@@ -577,21 +633,47 @@ int wmain(int argc, wchar_t** argv) {
     ExpectPinned(w, {L"charlie"}, L"pinned group returns when the item comes back");
     Check(RunExe(L"list") == 0, L"list command");
 
+    // --- the Downloads folder (grouped by date by default on client editions)
+    {
+        PWSTR dl = nullptr;
+        SHGetKnownFolderPath(FOLDERID_Downloads, 0, nullptr, &dl);
+        std::wstring downloads = dl ? dl : L"";
+        CoTaskMemFree(dl);
+        std::wstring file = downloads + L"\\ep_e2e_download.txt";
+        TouchFile(file, 2024);
+        w.Navigate(downloads);
+        PROPERTYKEY before = w.GroupBy();
+        wchar_t desc[96];
+        swprintf_s(desc, L"group-by before: pid %lu", before.pid);
+        Print(desc);
+        RunExe(L"pin \"" + file + L"\"");
+        ExpectPinned(w, {L"ep_e2e_download"}, L"Downloads: pinned group on top");
+        RunExe(L"unpin \"" + file + L"\"");
+        Check(WaitFor([&] { return IsEqualPropertyKey(w.GroupBy(), before); }, 15000),
+              L"Downloads: original grouping is restored after unpinning");
+        DeleteFileW(file.c_str());
+        w.Navigate(g_dir);
+    }
+
     // --- the schema can be re-registered in another language
-    Check(RunExe(L"register-schema --lang en") == 0 && SchemaLabel() == L"Pinned", L"English group label",
-          SchemaLabel());
+    Print(L"schemas before: " + RegisteredSchemas());
+    Check(RunExe(L"register-schema --lang en") == 0, L"register-schema in English");
+    Print(L"schemas after: " + RegisteredSchemas());
+    {
+        std::wstring status = RunExeOutput(L"status");
+        Check(status.find(L"registered (Pinned)") != std::wstring::npos, L"English group label", status);
+    }
 
     // --- exit restores the grouping; uninstall cleans up
     RunExe(L"exit");
     Check(WaitFor([] { return FindWindowW(kAgentWindowClass, nullptr) == nullptr; }, 10000), L"exit stops the agent");
     ExpectNoPinnedGroup(w, L"exit restores the original grouping");
     Check(RunExe(L"uninstall --quiet") == 0, L"uninstall exits with 0");
-    PSRefreshPropertySchema();
+    Print(L"schemas after uninstall: " + RegisteredSchemas());
     {
-        IPropertyDescription* desc = nullptr;
-        HRESULT hr = PSGetPropertyDescription(kPinStateKeys[0], IID_PPV_ARGS(&desc));
-        if (desc) desc->Release();
-        Check(FAILED(hr), L"uninstall unregisters the property");
+        std::wstring status = RunExeOutput(L"status");
+        Check(status.find(L"schema: not registered") != std::wstring::npos, L"uninstall unregisters the property",
+              status);
         HKEY k;
         Check(RegOpenKeyExW(HKEY_CURRENT_USER, kRegRoot, 0, KEY_READ, &k) != ERROR_SUCCESS, L"uninstall removes settings");
         auto file = MenuItems(g_dir + L"\\alpha.txt");

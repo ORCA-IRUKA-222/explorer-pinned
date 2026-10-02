@@ -76,6 +76,31 @@ int ListPins() {
     return kOk;
 }
 
+std::wstring SchemaLabel() {
+    std::wstring label;
+    IPropertyDescription* desc = nullptr;
+    if (SUCCEEDED(PSGetPropertyDescription(kPinStateKeys[0], IID_PPV_ARGS(&desc)))) {
+        PWSTR name = nullptr;
+        if (SUCCEEDED(desc->GetDisplayName(&name)) && name) {
+            label = name;
+            CoTaskMemFree(name);
+        }
+        desc->Release();
+    }
+    return label;
+}
+
+int Status() {
+    std::wstring s;
+    s += L"schema: " + std::wstring(IsSchemaRegistered() ? L"registered (" + SchemaLabel() + L")" : L"not registered") + L"\n";
+    s += L"menu: " + std::wstring(IsContextMenuRegistered() ? L"registered" : L"not registered") + L"\n";
+    s += L"startup: " + std::wstring(IsStartupEnabled() ? L"on" : L"off") + L"\n";
+    s += L"agent: " + std::wstring(FindAgentWindow() ? L"running" : L"not running") + L"\n";
+    s += L"pins: " + std::to_wstring(PinStore::LoadAll().size()) + L"\n";
+    ConsoleWrite(s);
+    return kOk;
+}
+
 int RegisterSchemaCommand() {
     HRESULT hr = RegisterSchema();
     if (FAILED(hr)) {
@@ -147,6 +172,7 @@ int Dispatch(const std::wstring& command, const std::vector<std::wstring>& rest,
     if (command.empty()) return DefaultStart();
     if (command == L"pin" || command == L"unpin" || command == L"toggle") return ChangePins(rest, command);
     if (command == L"list") return ListPins();
+    if (command == L"status") return Status();
     if (command == L"reapply") {
         NotifyAgent(kMsgReapply);
         return kOk;

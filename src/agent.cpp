@@ -44,6 +44,23 @@ struct LessI {
 };
 using NameSet = std::set<std::wstring, LessI>;
 
+// IFolderView2::SetViewProperty/GetViewProperty are marked deprecated in the Windows SDK
+// but are implemented by Explorer on Windows 10 and 11; they are the only way to give
+// items of an ordinary folder a value to group by without touching the files.
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+HRESULT SetViewValue(IFolderView2* view, PCUITEMID_CHILD child, const PROPERTYKEY& key, const PROPVARIANT& value) {
+    return view->SetViewProperty(child, key, value);
+}
+HRESULT GetViewValue(IFolderView2* view, PCUITEMID_CHILD child, const PROPERTYKEY& key, PROPVARIANT* value) {
+    return view->GetViewProperty(child, key, value);
+}
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+
 int KeyIndex(const PROPERTYKEY& key) {
     for (int i = 0; i < 2; i++)
         if (IsEqualPropertyKey(key, kPinStateKeys[i])) return i;
@@ -459,7 +476,7 @@ void Agent::WriteKey(TrackedWindow& w, int k, const NameSet& names) {
     for (const auto& name : w.applied[k]) {
         if (names.count(name)) continue;
         if (PITEMID_CHILD child = ParseChild(w, name)) {
-            w.view->SetViewProperty(child, key, empty);
+            SetViewValue(w.view.Get(), child, key, empty);
             CoTaskMemFree(child);
         }
     }
@@ -468,7 +485,7 @@ void Agent::WriteKey(TrackedWindow& w, int k, const NameSet& names) {
     InitPropVariantFromUInt32(kPinnedValue, &pinned);
     for (const auto& name : names) {
         if (PITEMID_CHILD child = ParseChild(w, name)) {
-            if (SUCCEEDED(w.view->SetViewProperty(child, key, pinned))) w.applied[k].insert(name);
+            if (SUCCEEDED(SetViewValue(w.view.Get(), child, key, pinned))) w.applied[k].insert(name);
             CoTaskMemFree(child);
         }
     }
@@ -484,7 +501,7 @@ bool Agent::KeyMatches(TrackedWindow& w, int k, const NameSet& names) {
         if (!child) continue;  // not present in this folder (yet)
         PROPVARIANT value;
         PropVariantInit(&value);
-        HRESULT hr = w.view->GetViewProperty(child, kPinStateKeys[k], &value);
+        HRESULT hr = GetViewValue(w.view.Get(), child, kPinStateKeys[k], &value);
         // Failure means the item is not in the view (e.g. hidden); nothing to show for it.
         bool ok = FAILED(hr) || (value.vt == VT_UI4 && value.ulVal == kPinnedValue);
         PropVariantClear(&value);

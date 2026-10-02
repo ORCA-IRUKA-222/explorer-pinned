@@ -116,6 +116,7 @@ ExplorerPinned.exe [コマンド] [パス...]
   unpin <パス>...     ピン止めを外す
   toggle <パス>...    ピン止め/解除を切り替え
   list                ピン止め中の項目を表示
+  status              登録・実行の状態を表示
   reapply             開いているウィンドウに再適用
   setup               右クリックメニュー・「ピン止め」の名前・自動起動を登録
                       (--no-startup: 自動起動を登録しない / --no-agent: 常駐を開始しない / --quiet)
