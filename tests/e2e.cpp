@@ -731,7 +731,7 @@ int wmain(int argc, wchar_t** argv) {
     w.Refresh();
     w.view->SetGroupBy(kPinStateKeys[0], TRUE);
     Pump(1000);
-    RegWriteString(HKEY_CURRENT_USER, kRegPreviousGroupBy, third, L"{00000000-0000-0000-0000-000000000000},0,1");
+    RegWriteString(HKEY_CURRENT_USER, kRegPreviousGroupBy, third.c_str(), L"{00000000-0000-0000-0000-000000000000},0,1");
     w.Navigate(g_dir);
     SetEnvironmentVariableW(L"EXPLORERPINNED_TEST_DELEGATE", L"1");
     Check(RunExe(L"uninstall --quiet") == 0, L"uninstall exits with 0");
