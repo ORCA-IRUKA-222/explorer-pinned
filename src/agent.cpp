@@ -799,6 +799,8 @@ void Agent::RestoreGrouping(TrackedWindow& w, bool forget) {
     BOOL ascending;
     ReadPreviousGroupBy(w.folderPath, &key, &ascending);
     if (forget) RegDeleteValueIn(HKEY_CURRENT_USER, kRegPreviousGroupBy, w.folderPath.c_str());
+    w.loading = true;  // Explorer reloads the view for this grouping too
+    w.loadStart = w.lastLoad = GetTickCount();
     w.view->SetGroupBy(key, ascending);
     ClearGrouped(w.folderPath);
     // The values stay in the view's cache; `applied` keeps tracking them so they are
