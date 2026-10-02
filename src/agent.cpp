@@ -744,43 +744,55 @@ std::vector<std::wstring> SavedGroupingFolders() {
     return folders;
 }
 
-// Opens `folder` in a new, hidden Explorer window and restores its grouping; closing the
-// window makes Explorer save the restored view state.
+ComPtr<IFolderView2> ViewShowing(IWebBrowser2* browser, const std::wstring& folder) {
+    ComPtr<IServiceProvider> sp;
+    browser->QueryInterface(IID_PPV_ARGS(sp.Put()));
+    ComPtr<IShellBrowser> sb;
+    ComPtr<IShellView> sv;
+    if (!sp || FAILED(sp->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(sb.Put()))) ||
+        FAILED(sb->QueryActiveShellView(sv.Put())))
+        return ComPtr<IFolderView2>();
+    ComPtr<IFolderView2> view = sv.As<IFolderView2>();
+    ComPtr<IPersistFolder2> pf;
+    PIDLIST_ABSOLUTE pidl = nullptr;
+    bool match = false;
+    if (view && SUCCEEDED(view->GetFolder(IID_PPV_ARGS(pf.Put()))) && SUCCEEDED(pf->GetCurFolder(&pidl))) {
+        PWSTR path = nullptr;
+        if (SUCCEEDED(SHGetNameFromIDList(pidl, SIGDN_FILESYSPATH, &path))) {
+            match = PathEqualsI(NormalizePath(path), folder);
+            CoTaskMemFree(path);
+        }
+        CoTaskMemFree(pidl);
+    }
+    return match ? view : ComPtr<IFolderView2>();
+}
+
+// Opens `folder` in a new Explorer window that is never shown and restores its grouping;
+// closing the window makes Explorer save the restored view state.
 void RestoreFolderInHiddenWindow(const std::wstring& folder) {
     ComPtr<IWebBrowser2> browser;
-    if (FAILED(CoCreateInstance(CLSID_ShellBrowserWindow, nullptr, CLSCTX_LOCAL_SERVER,
-                                IID_PPV_ARGS(browser.Put()))))
+    HRESULT hr = CoCreateInstance(CLSID_ShellBrowserWindow, nullptr, CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(browser.Put()));
+    if (FAILED(hr)) {
+        LogLine(L"ShellBrowserWindow failed 0x%08x", hr);
         return;
+    }
     browser->put_Visible(VARIANT_FALSE);
-    VARIANT target, empty;
-    VariantInit(&empty);
-    target.vt = VT_BSTR;
-    target.bstrVal = SysAllocString(folder.c_str());
-    browser->Navigate2(&target, &empty, &empty, &empty, &empty);
-    VariantClear(&target);
-
+    PIDLIST_ABSOLUTE pidl = nullptr;
+    ComPtr<IShellBrowser> sb;
+    if (ComPtr<IServiceProvider> sp = browser.As<IServiceProvider>())
+        sp->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(sb.Put()));
+    if (sb && SUCCEEDED(SHParseDisplayName(folder.c_str(), nullptr, &pidl, 0, nullptr))) {
+        hr = sb->BrowseObject(pidl, SBSP_SAMEBROWSER | SBSP_ABSOLUTE);
+        CoTaskMemFree(pidl);
+    } else {
+        hr = E_FAIL;
+    }
     ComPtr<IFolderView2> view;
     for (int i = 0; i < 50 && !view; i++) {
         PumpFor(100);
-        ComPtr<IServiceProvider> sp = browser.As<IServiceProvider>();
-        ComPtr<IShellBrowser> sb;
-        ComPtr<IShellView> sv;
-        if (sp && SUCCEEDED(sp->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(sb.Put()))) &&
-            SUCCEEDED(sb->QueryActiveShellView(sv.Put()))) {
-            ComPtr<IFolderView2> candidate = sv.As<IFolderView2>();
-            ComPtr<IPersistFolder2> pf;
-            PIDLIST_ABSOLUTE pidl = nullptr;
-            if (candidate && SUCCEEDED(candidate->GetFolder(IID_PPV_ARGS(pf.Put()))) &&
-                SUCCEEDED(pf->GetCurFolder(&pidl))) {
-                PWSTR path = nullptr;
-                if (SUCCEEDED(SHGetNameFromIDList(pidl, SIGDN_FILESYSPATH, &path))) {
-                    if (PathEqualsI(NormalizePath(path), folder)) view = candidate;
-                    CoTaskMemFree(path);
-                }
-                CoTaskMemFree(pidl);
-            }
-        }
+        view = ViewShowing(browser.Get(), folder);
     }
+    LogLine(L"hidden window for %s: browse 0x%08x, view %d", folder.c_str(), hr, view ? 1 : 0);
     if (view) {
         PROPERTYKEY current = {};
         BOOL ascending = TRUE;
@@ -795,13 +807,15 @@ void RestoreFolderInHiddenWindow(const std::wstring& folder) {
         }
     }
     browser->Quit();
-    PumpFor(200);
+    PumpFor(300);
 }
 
 }  // namespace
 
 void RestoreSavedGroupings() {
-    for (const auto& folder : SavedGroupingFolders()) {
+    auto folders = SavedGroupingFolders();
+    LogLine(L"restoring %zu saved grouping(s)", folders.size());
+    for (const auto& folder : folders) {
         if (PathExists(folder))
             RestoreFolderInHiddenWindow(folder);
         else
