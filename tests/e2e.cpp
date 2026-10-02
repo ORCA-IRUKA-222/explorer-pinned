@@ -482,6 +482,88 @@ bool IsPinnedInRegistry(const std::wstring& path) {
     return ok;
 }
 
+void WriteBytes(const std::wstring& path, const void* data, size_t size) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w;
+    WriteFile(h, data, (DWORD)size, &w, nullptr);
+    CloseHandle(h);
+}
+
+// A small 24-bit bitmap, so that Explorer has thumbnails to extract.
+void WriteBitmap(const std::wstring& path, int seed) {
+    const int width = 48, height = 32, stride = width * 3;
+    std::vector<BYTE> file(sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER) + stride * height);
+    auto* fh = reinterpret_cast<BITMAPFILEHEADER*>(file.data());
+    auto* ih = reinterpret_cast<BITMAPINFOHEADER*>(file.data() + sizeof(BITMAPFILEHEADER));
+    fh->bfType = 0x4D42;
+    fh->bfSize = (DWORD)file.size();
+    fh->bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+    ih->biSize = sizeof(BITMAPINFOHEADER);
+    ih->biWidth = width;
+    ih->biHeight = height;
+    ih->biPlanes = 1;
+    ih->biBitCount = 24;
+    BYTE* px = file.data() + fh->bfOffBits;
+    for (int i = 0; i < stride * height; i++) px[i] = (BYTE)(seed * 31 + i * 7);
+    WriteBytes(path, file.data(), file.size());
+}
+
+// A folder like a well-used Downloads folder: about 700 items of many kinds.
+void PopulateLargeFolder(const std::wstring& dir) {
+    SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
+    static const BYTE kEmptyZip[22] = {'P', 'K', 5, 6};
+    const char pdf[] = "%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj 2 0 obj<</Type/Pages/Kids[]/Count 0>>endobj\n"
+                       "trailer<</Root 1 0 R>>\n%%EOF\n";
+    wchar_t name[64];
+    for (int i = 0; i < 40; i++) {
+        swprintf_s(name, L"\\folder_%03d", i);
+        CreateDirectoryW((dir + name).c_str(), nullptr);
+        if (i % 2 == 0) WriteBitmap(dir + name + L"\\inside.bmp", i);
+    }
+    for (int i = 0; i < 100; i++) {
+        swprintf_s(name, L"\\setup_%03d.exe", i);
+        CopyFileW(g_exe.c_str(), (dir + name).c_str(), FALSE);
+    }
+    for (int i = 0; i < 200; i++) {
+        swprintf_s(name, L"\\photo_%03d.bmp", i);
+        WriteBitmap(dir + name, i);
+    }
+    for (int i = 0; i < 60; i++) {
+        swprintf_s(name, L"\\archive_%03d.zip", i);
+        WriteBytes(dir + name, kEmptyZip, sizeof(kEmptyZip));
+    }
+    for (int i = 0; i < 60; i++) {
+        swprintf_s(name, L"\\doc_%03d.pdf", i);
+        WriteBytes(dir + name, pdf, sizeof(pdf) - 1);
+    }
+    for (int i = 0; i < 240; i++) {
+        swprintf_s(name, L"\\note_%03d.txt", i);
+        TouchFile(dir + name, 2000 + i % 26);
+    }
+}
+
+// Number of lines in the agent's log that contain `text`.
+int CountLogLines(const wchar_t* text) {
+    std::wstring path = LogDirectory() + L"\\agent.log";
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    std::string data;
+    char buf[65536];
+    DWORD n;
+    while (ReadFile(h, buf, sizeof(buf), &n, nullptr) && n) data.append(buf, n);
+    CloseHandle(h);
+    char needle[256];
+    WideCharToMultiByte(CP_UTF8, 0, text, -1, needle, sizeof(needle), nullptr, nullptr);
+    int count = 0;
+    for (size_t pos = data.find(needle); pos != std::string::npos; pos = data.find(needle, pos + 1)) count++;
+    return count;
+}
+
+// Number of times the agent has changed a view's grouping to the pinned grouping.
+int Groupings() { return CountLogLines(L"] group ") + CountLogLines(L"] regroup "); }
+
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -701,6 +783,105 @@ int wmain(int argc, wchar_t** argv) {
         w.Navigate(g_dir);
     }
 
+    // --- a large folder (like a well-used Downloads folder) in large-icon view
+    {
+        std::wstring large = g_dir + L"\\large";
+        PopulateLargeFolder(large);
+        RunExe(L"pin \"" + large + L"\\photo_050.bmp\" \"" + large + L"\\folder_007\"");
+        w.Navigate(large);
+        w.Refresh();
+        w.view->SetViewModeAndIconSize(FVM_ICON, 96);
+        ExpectPinned(w, {L"photo_050", L"folder_007"}, L"large folder: pinned group on top in large-icon view");
+
+        // Signing in again: Explorer opens the folder with the pinned grouping it saved (the
+        // agent was not running to put the original grouping back) and the agent starts later.
+        TerminateProcess(agent.hProcess, 0);
+        WaitForSingleObject(agent.hProcess, 10000);
+        CloseHandle(agent.hProcess);
+        CloseHandle(agent.hThread);
+        agent = {};
+        w.Navigate(L"C:\\Windows");
+        w.Navigate(large);
+        Check(KeyIndexOf(w.GroupBy()) >= 0, L"large folder: Explorer reopens it with the saved pinned grouping");
+        int before = Groupings();
+        CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &agent);
+        Check(WaitFor([] { return FindWindowW(kAgentWindowClass, nullptr) != nullptr; }, 10000), L"agent starts again");
+        ExpectPinned(w, {L"photo_050", L"folder_007"}, L"large folder: pinned group when the agent starts later");
+        Pump(10000);
+        int groupings = Groupings() - before;
+        Check(groupings >= 1 && groupings <= 2, L"large folder: the agent does not regroup over and over",
+              std::to_wstring(groupings) + L" grouping(s)");
+        ExpectPinned(w, {L"photo_050", L"folder_007"}, L"large folder: pinned group stays");
+        RunExe(L"unpin \"" + large + L"\\photo_050.bmp\" \"" + large + L"\\folder_007\"");
+        ExpectNoPinnedGroup(w, L"large folder: grouping is removed after unpinning");
+        w.Navigate(g_dir);
+
+        // The same folder through a network path: Explorer loads it in the background and
+        // reloads it for a while after every grouping change. (Version 1.0.0 regrouped this
+        // folder every second, showing "Working on it..." and only the "Unspecified" group.)
+        std::wstring unc = L"\\\\localhost\\" + large.substr(0, 1) + L"$" + large.substr(2);
+        if (!PathExists(unc)) {
+            Print(L"skipped the network folder checks: " + unc + L" is not reachable");
+        } else {
+            RunExe(L"pin \"" + unc + L"\\photo_050.bmp\" \"" + unc + L"\\folder_007\"");
+            before = Groupings();
+            w.Navigate(unc);
+            w.Refresh();
+            w.view->SetViewModeAndIconSize(FVM_ICON, 96);
+            ExpectPinned(w, {L"photo_050", L"folder_007"}, L"network folder: pinned group on top");
+            Pump(8000);
+            groupings = Groupings() - before;
+            Check(groupings >= 1 && groupings <= 3, L"network folder: the agent does not regroup over and over",
+                  std::to_wstring(groupings) + L" grouping(s)");
+            ExpectPinned(w, {L"photo_050", L"folder_007"}, L"network folder: pinned group stays");
+
+            // Opened again with the pinned grouping Explorer saved when the window left it.
+            w.Navigate(L"C:\\Windows");
+            before = Groupings();
+            w.Navigate(unc);
+            ExpectPinned(w, {L"photo_050", L"folder_007"}, L"network folder: pinned group when opened again");
+            Pump(8000);
+            groupings = Groupings() - before;
+            Check(groupings >= 1 && groupings <= 3, L"network folder opened again: no regroup loop",
+                  std::to_wstring(groupings) + L" grouping(s)");
+            ExpectPinned(w, {L"photo_050", L"folder_007"}, L"network folder: pinned group stays after opening again");
+
+            // Signing in again: the agent starts while Explorer is still loading the folder.
+            TerminateProcess(agent.hProcess, 0);
+            WaitForSingleObject(agent.hProcess, 10000);
+            CloseHandle(agent.hProcess);
+            CloseHandle(agent.hThread);
+            agent = {};
+            w.Navigate(L"C:\\Windows");
+            before = Groupings();
+            {
+                PIDLIST_ABSOLUTE pidl = nullptr;
+                SHParseDisplayName(unc.c_str(), nullptr, &pidl, 0, nullptr);
+                IServiceProvider* sp = nullptr;
+                IShellBrowser* sb = nullptr;
+                w.browser->QueryInterface(IID_PPV_ARGS(&sp));
+                if (sp) sp->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(&sb));
+                if (sb) sb->BrowseObject(pidl, SBSP_SAMEBROWSER | SBSP_ABSOLUTE);
+                if (sb) sb->Release();
+                if (sp) sp->Release();
+                CoTaskMemFree(pidl);
+            }
+            CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &agent);
+            WaitFor([&] { return w.Refresh() && _wcsicmp(w.Path().c_str(), unc.c_str()) == 0; }, 10000);
+            ExpectPinned(w, {L"photo_050", L"folder_007"}, L"network folder: pinned group when the agent starts during the load");
+            Pump(8000);
+            groupings = Groupings() - before;
+            Check(groupings >= 1 && groupings <= 3, L"network folder at sign-in: no regroup loop",
+                  std::to_wstring(groupings) + L" grouping(s)");
+            ExpectPinned(w, {L"photo_050", L"folder_007"}, L"network folder: pinned group stays after sign-in");
+
+            RunExe(L"unpin \"" + unc + L"\\photo_050.bmp\" \"" + unc + L"\\folder_007\"");
+            ExpectNoPinnedGroup(w, L"network folder: grouping is removed after unpinning");
+            w.Navigate(g_dir);
+        }
+        Check(CountLogLines(L"giving up") == 0, L"large folders: the agent never gave up");
+    }
+
     // --- the schema can be re-registered in another language
     Print(L"schemas before: " + RegisteredSchemas());
     Check(RunExe(L"register-schema --lang en") == 0, L"register-schema in English");
@@ -785,6 +966,8 @@ int wmain(int argc, wchar_t** argv) {
         if (pf) pf->Release();
     }
     w.Navigate(g_dir);
+    // uninstall deletes the agent's log; keep a copy for the test output
+    CopyFileW((LogDirectory() + L"\\agent.log").c_str(), (std::wstring(tmp) + L"ep_agent.log").c_str(), FALSE);
     SetEnvironmentVariableW(L"EXPLORERPINNED_TEST_DELEGATE", L"1");
     Check(RunExe(L"uninstall --quiet") == 0, L"uninstall exits with 0");
     SetEnvironmentVariableW(L"EXPLORERPINNED_TEST_DELEGATE", nullptr);
@@ -802,6 +985,7 @@ int wmain(int argc, wchar_t** argv) {
               status);
         HKEY k;
         Check(RegOpenKeyExW(HKEY_CURRENT_USER, kRegRoot, 0, KEY_READ, &k) != ERROR_SUCCESS, L"uninstall removes settings");
+        Check(!PathExists(LogDirectory()), L"uninstall removes the log", LogDirectory());
         auto file = MenuItems(g_dir + L"\\alpha.txt");
         Check(!Contains(file, pinLabel), L"uninstall removes the menu", Join(file));
     }

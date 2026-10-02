@@ -2,7 +2,7 @@ name: Build
 
 on:
   push:
-    branches: [main, "feature/**"]
+    branches: [main, "feature/**", "fix/**"]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
@@ -33,7 +33,7 @@ jobs:
     name: End-to-end test (${{ matrix.os }})
     needs: build
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -52,10 +52,12 @@ jobs:
           $p = Start-Process -FilePath bin\ExplorerPinnedE2E.exe -ArgumentList "bin\ExplorerPinned.exe", "$PWD\screenshots" `
             -NoNewWindow -PassThru -RedirectStandardOutput e2e.txt
           $null = $p.Handle
-          $finished = $p.WaitForExit(600000)
+          $finished = $p.WaitForExit(1080000)
           if (-not $finished) { $p.Kill() }
           Get-Content e2e.txt -Encoding utf8
           Write-Host "---- agent.log"
+          Get-Content "$env:TEMP\ep_agent.log" -Encoding utf8 -ErrorAction SilentlyContinue
+          Write-Host "---- agent.log after uninstall"
           Get-Content "$env:LOCALAPPDATA\ExplorerPinned\agent.log" -Encoding utf8 -ErrorAction SilentlyContinue
           if (-not $finished) { Write-Error "E2E timed out"; exit 1 }
           exit $p.ExitCode
@@ -167,6 +169,7 @@ jobs:
           if (Test-Path $exe) { throw "files left behind" }
           if (Test-Path -LiteralPath "HKCU:\Software\Classes\*\shell\ExplorerPinned.Pin") { throw "menu left behind" }
           if (Test-Path "HKCU:\Software\ExplorerPinned") { throw "settings left behind" }
+          if (Test-Path "$env:LOCALAPPDATA\ExplorerPinned") { throw "log left behind" }
           if ((Get-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run).ExplorerPinned) { throw "startup entry left behind" }
           $schemas = Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\PropertySystem\PropertySchema" -ErrorAction SilentlyContinue |
             ForEach-Object { (Get-ItemProperty $_.PSPath).PSObject.Properties.Value } | Where-Object { "$_" -like "*ExplorerPinned*" }

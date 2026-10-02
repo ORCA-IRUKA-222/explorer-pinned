@@ -154,6 +154,7 @@ int Uninstall(bool keepSchema, bool quiet) {
         else
             RunElevated(L"unregister-schema");
     }
+    DeleteLogs();
     if (!quiet) ShowInfo(LoadStr(IDS_MSG_UNINSTALLED));
     return kOk;
 }
