@@ -1,0 +1,92 @@
+#pragma code_page(65001)
+#include <winres.h>
+#include "resource.h"
+#include "version.h"
+
+LANGUAGE LANG_NEUTRAL, SUBLANG_NEUTRAL
+
+IDI_APP ICON "app.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION EP_VERSION_MAJOR, EP_VERSION_MINOR, EP_VERSION_PATCH, 0
+ PRODUCTVERSION EP_VERSION_MAJOR, EP_VERSION_MINOR, EP_VERSION_PATCH, 0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "000004b0"
+        BEGIN
+            VALUE "CompanyName", "ORCA"
+            VALUE "FileDescription", "Explorer Pinned"
+            VALUE "FileVersion", EP_VERSION_STRING
+            VALUE "InternalName", "ExplorerPinned"
+            VALUE "LegalCopyright", "Copyright (c) 2026 ORCA. MIT License."
+            VALUE "OriginalFilename", "ExplorerPinned.exe"
+            VALUE "ProductName", "Explorer Pinned"
+            VALUE "ProductVersion", EP_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0000, 1200
+    END
+END
+
+// English (used for every UI language other than Japanese)
+STRINGTABLE
+BEGIN
+    IDS_APP_NAME            "Explorer Pinned"
+    IDS_PROP_LABEL          "Pinned"
+    IDS_PROP_PINNED         "Pinned"
+    IDS_MENU_PIN_FILE       "Pin this file to the top"
+    IDS_MENU_PIN_FOLDER     "Pin this folder to the top"
+    IDS_MENU_UNPIN          "Unpin from the top"
+    IDS_TRAY_PINNED_ITEMS   "Pinned items"
+    IDS_TRAY_NONE           "(none)"
+    IDS_TRAY_REAPPLY        "Re-apply to open windows"
+    IDS_TRAY_CLEANUP        "Remove pins of missing items"
+    IDS_TRAY_STARTUP        "Start with Windows"
+    IDS_TRAY_WEBSITE        "Open project website"
+    IDS_TRAY_EXIT           "Exit"
+    IDS_TRAY_UNPIN_ITEM     "Unpin"
+    IDS_TRAY_OPEN_ITEM      "Show in Explorer"
+    IDS_MSG_SETUP_PROMPT    "Explorer Pinned is not set up yet.\n\nSet it up now? This adds the right-click menu items and registers the ""Pinned"" group with Windows (administrator permission is required once)."
+    IDS_MSG_SCHEMA_FAILED   "Could not register the ""Pinned"" group with Windows. Run Explorer Pinned again and allow the administrator prompt."
+    IDS_MSG_CLEANUP_DONE    "Removed %s pin(s) of items that no longer exist."
+    IDS_MSG_ALREADY_RUNNING "Explorer Pinned is already running. Use the notification area icon to change settings."
+    IDS_MSG_USAGE           "Usage: ExplorerPinned.exe [command] [paths...]\n\n  (no command)        Set up if needed and start in the background\n  pin <path>...       Pin files or folders to the top\n  unpin <path>...     Unpin files or folders\n  toggle <path>...    Pin or unpin\n  list                List pinned items\n  reapply             Re-apply pins to open Explorer windows\n  setup               Register menus, the property and start-up entry\n  uninstall           Remove everything this program registered\n  exit                Stop the background process"
+    IDS_MSG_UNINSTALLED     "Explorer Pinned has been removed from this user account."
+    IDS_MSG_SETUP_DONE      "Explorer Pinned is ready. Right-click a file or folder and choose ""Pin this file to the top"". On Windows 11 the item is under ""Show more options""."
+END
+
+LANGUAGE LANG_JAPANESE, SUBLANG_DEFAULT
+
+STRINGTABLE
+BEGIN
+    IDS_APP_NAME            "Explorer Pinned"
+    IDS_PROP_LABEL          "ピン止め"
+    IDS_PROP_PINNED         "ピン止め"
+    IDS_MENU_PIN_FILE       "このファイルをピン止めする"
+    IDS_MENU_PIN_FOLDER     "このフォルダーをピン止めする"
+    IDS_MENU_UNPIN          "ピン止めを外す"
+    IDS_TRAY_PINNED_ITEMS   "ピン止め中の項目"
+    IDS_TRAY_NONE           "(なし)"
+    IDS_TRAY_REAPPLY        "開いているウィンドウに再適用"
+    IDS_TRAY_CLEANUP        "存在しない項目のピン止めを整理"
+    IDS_TRAY_STARTUP        "Windows の起動時に開始"
+    IDS_TRAY_WEBSITE        "プロジェクトの Web サイトを開く"
+    IDS_TRAY_EXIT           "終了"
+    IDS_TRAY_UNPIN_ITEM     "ピン止めを外す"
+    IDS_TRAY_OPEN_ITEM      "エクスプローラーで表示"
+    IDS_MSG_SETUP_PROMPT    "Explorer Pinned はまだセットアップされていません。\n\n今すぐセットアップしますか？ 右クリックメニューに項目を追加し、「ピン止め」グループを Windows に登録します (初回のみ管理者の許可が必要です)。"
+    IDS_MSG_SCHEMA_FAILED   "「ピン止め」グループを Windows に登録できませんでした。もう一度 Explorer Pinned を起動し、管理者の確認画面で許可してください。"
+    IDS_MSG_CLEANUP_DONE    "存在しない項目のピン止めを %s 件整理しました。"
+    IDS_MSG_ALREADY_RUNNING "Explorer Pinned はすでに実行中です。設定は通知領域のアイコンから変更できます。"
+    IDS_MSG_USAGE           "使い方: ExplorerPinned.exe [コマンド] [パス...]\n\n  (コマンドなし)      必要ならセットアップしてバックグラウンドで開始\n  pin <パス>...       ファイル/フォルダーをピン止め\n  unpin <パス>...     ピン止めを外す\n  toggle <パス>...    ピン止め/解除を切り替え\n  list                ピン止め中の項目を表示\n  reapply             開いているウィンドウに再適用\n  setup               メニュー・プロパティ・自動起動を登録\n  uninstall           このプログラムが登録したものをすべて削除\n  exit                バックグラウンドの処理を終了"
+    IDS_MSG_UNINSTALLED     "Explorer Pinned をこのユーザーから削除しました。"
+    IDS_MSG_SETUP_DONE      "Explorer Pinned の準備ができました。ファイルやフォルダーを右クリックして「このファイルをピン止めする」を選んでください。Windows 11 では「その他のオプションを確認」の中にあります。"
+END

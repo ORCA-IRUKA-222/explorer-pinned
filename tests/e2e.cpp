@@ -1,0 +1,595 @@
+// End-to-end test: drives ExplorerPinned.exe against a real Explorer window and
+// checks the resulting groups through UI Automation.
+//
+// Usage: ExplorerPinnedE2E.exe <path to ExplorerPinned.exe>
+// Needs an interactive desktop with Explorer running and administrator rights
+// (to register the property schema). Exit code = number of failed checks.
+
+#include "common.h"
+
+#include <exdisp.h>
+#include <exdispid.h>
+#include <propkey.h>
+#include <propvarutil.h>
+#include <shellapi.h>
+#include <shlobj.h>
+#include <shlwapi.h>
+#include <shobjidl.h>
+#include <uiautomation.h>
+
+#include <stdio.h>
+
+#include <algorithm>
+#include <functional>
+#include <map>
+#include <set>
+
+#include "../src/resource.h"
+
+using namespace ep;
+
+namespace {
+
+const PROPERTYKEY kItemNameDisplay = {{0xB725F130, 0x47EF, 0x101A, {0xA5, 0xF1, 0x02, 0x60, 0x8C, 0x9E, 0xEB, 0xAC}}, 10};
+const PROPERTYKEY kItemTypeText = {{0xB725F130, 0x47EF, 0x101A, {0xA5, 0xF1, 0x02, 0x60, 0x8C, 0x9E, 0xEB, 0xAC}}, 4};
+const PROPERTYKEY kDateModified = {{0xB725F130, 0x47EF, 0x101A, {0xA5, 0xF1, 0x02, 0x60, 0x8C, 0x9E, 0xEB, 0xAC}}, 14};
+
+int g_failures = 0;
+std::wstring g_exe;
+std::wstring g_dir;
+std::wstring g_pinnedLabel;
+
+void Print(const std::wstring& s) {
+    int n = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0, nullptr, nullptr);
+    std::string out(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), out.data(), n, nullptr, nullptr);
+    fputs(out.c_str(), stdout);
+    fputs("\n", stdout);
+    fflush(stdout);
+}
+
+void Check(bool ok, const std::wstring& what, const std::wstring& detail = L"") {
+    Print(std::wstring(ok ? L"PASS " : L"FAIL ") + what + (detail.empty() ? L"" : L"  [" + detail + L"]"));
+    if (!ok) g_failures++;
+}
+
+void Pump(DWORD ms) {
+    DWORD end = GetTickCount() + ms;
+    do {
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        MsgWaitForMultipleObjects(0, nullptr, FALSE, 20, QS_ALLINPUT);
+    } while ((int)(end - GetTickCount()) > 0);
+}
+
+bool WaitFor(const std::function<bool()>& cond, DWORD timeoutMs) {
+    DWORD start = GetTickCount();
+    for (;;) {
+        if (cond()) return true;
+        if (GetTickCount() - start > timeoutMs) return false;
+        Pump(300);
+    }
+}
+
+int RunExe(const std::wstring& args, DWORD timeoutMs = 60000) {
+    std::wstring cmd = L"\"" + g_exe + L"\" " + args;
+    STARTUPINFOW si = {sizeof(si)};
+    PROCESS_INFORMATION pi = {};
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) return -1;
+    DWORD start = GetTickCount();
+    while (WaitForSingleObject(pi.hProcess, 0) == WAIT_TIMEOUT && GetTickCount() - start < timeoutMs) Pump(50);
+    DWORD code = (DWORD)-1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return (int)code;
+}
+
+void TouchFile(const std::wstring& path, int year) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w;
+    WriteFile(h, "test", 4, &w, nullptr);
+    SYSTEMTIME st = {};
+    st.wYear = (WORD)year;
+    st.wMonth = 6;
+    st.wDay = 1;
+    st.wHour = 12;
+    FILETIME ft;
+    SystemTimeToFileTime(&st, &ft);
+    SetFileTime(h, &ft, &ft, &ft);
+    CloseHandle(h);
+}
+
+std::wstring Join(const std::vector<std::wstring>& v) {
+    std::wstring s;
+    for (auto& x : v) s += (s.empty() ? L"" : L", ") + x;
+    return s;
+}
+
+// ---------------------------------------------------------------- UI Automation
+struct Groups {
+    std::vector<std::wstring> order;                         // group names, top to bottom
+    std::map<std::wstring, std::set<std::wstring>> members;  // group -> item names
+    std::wstring Describe() const {
+        std::wstring s;
+        for (auto& g : order) {
+            std::vector<std::wstring> items(members.at(g).begin(), members.at(g).end());
+            s += L"{" + g + L": " + Join(items) + L"} ";
+        }
+        return s;
+    }
+    std::set<std::wstring> First() const { return order.empty() ? std::set<std::wstring>() : members.at(order[0]); }
+};
+
+HWND g_uiaHwnd;
+Groups g_uiaResult;
+
+DWORD WINAPI UiaThread(LPVOID) {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    Groups result;
+    IUIAutomation* uia = nullptr;
+    CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&uia));
+    IUIAutomationElement* root = nullptr;
+    if (uia) uia->ElementFromHandle(g_uiaHwnd, &root);
+    if (root) {
+        VARIANT v;
+        v.vt = VT_I4;
+        v.lVal = UIA_ListItemControlTypeId;
+        IUIAutomationCondition* cond = nullptr;
+        uia->CreatePropertyCondition(UIA_ControlTypePropertyId, v, &cond);
+        IUIAutomationElementArray* arr = nullptr;
+        root->FindAll(TreeScope_Descendants, cond, &arr);
+        IUIAutomationTreeWalker* walker = nullptr;
+        uia->get_ControlViewWalker(&walker);
+        int len = 0;
+        if (arr) arr->get_Length(&len);
+        std::map<std::wstring, int> top;
+        for (int i = 0; i < len; i++) {
+            IUIAutomationElement* el = nullptr;
+            arr->GetElement(i, &el);
+            BSTR name = nullptr, groupName = nullptr;
+            el->get_CurrentName(&name);
+            IUIAutomationElement* parent = nullptr;
+            walker->GetParentElement(el, &parent);
+            CONTROLTYPEID type = 0;
+            if (parent) {
+                parent->get_CurrentControlType(&type);
+                if (type == UIA_GroupControlTypeId) parent->get_CurrentName(&groupName);
+            }
+            RECT r = {};
+            el->get_CurrentBoundingRectangle(&r);
+            std::wstring g = groupName ? groupName : L"(none)";
+            if (!top.count(g) || r.top < top[g]) top[g] = r.top;
+            result.members[g].insert(name ? name : L"");
+            SysFreeString(name);
+            SysFreeString(groupName);
+            if (parent) parent->Release();
+            el->Release();
+        }
+        std::vector<std::pair<int, std::wstring>> order;
+        for (auto& t : top) order.push_back({t.second, t.first});
+        std::sort(order.begin(), order.end());
+        for (auto& o : order) result.order.push_back(o.second);
+        if (arr) arr->Release();
+        if (walker) walker->Release();
+        cond->Release();
+        root->Release();
+    }
+    if (uia) uia->Release();
+    g_uiaResult = result;
+    CoUninitialize();
+    return 0;
+}
+
+// UIA calls into Explorer are made from a worker thread while this thread keeps pumping.
+Groups ReadGroups(HWND hwnd) {
+    g_uiaHwnd = hwnd;
+    HANDLE t = CreateThread(nullptr, 0, UiaThread, nullptr, 0, nullptr);
+    DWORD start = GetTickCount();
+    while (WaitForSingleObject(t, 0) == WAIT_TIMEOUT && GetTickCount() - start < 30000) Pump(20);
+    CloseHandle(t);
+    return g_uiaResult;
+}
+
+// ---------------------------------------------------------------- Explorer window
+struct Window {
+    IWebBrowser2* browser = nullptr;
+    HWND hwnd = nullptr;
+    IFolderView2* view = nullptr;
+
+    bool Refresh() {
+        if (view) view->Release();
+        view = nullptr;
+        IServiceProvider* sp = nullptr;
+        IShellBrowser* sb = nullptr;
+        IShellView* sv = nullptr;
+        browser->QueryInterface(IID_PPV_ARGS(&sp));
+        if (sp) sp->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(&sb));
+        if (sb) sb->QueryActiveShellView(&sv);
+        if (sv) sv->QueryInterface(IID_PPV_ARGS(&view));
+        if (sv) sv->Release();
+        if (sb) sb->Release();
+        if (sp) sp->Release();
+        return view != nullptr;
+    }
+    std::wstring Path() {
+        std::wstring result;
+        IPersistFolder2* pf = nullptr;
+        if (view && SUCCEEDED(view->GetFolder(IID_PPV_ARGS(&pf)))) {
+            PIDLIST_ABSOLUTE pidl = nullptr;
+            if (SUCCEEDED(pf->GetCurFolder(&pidl))) {
+                PWSTR p = nullptr;
+                if (SUCCEEDED(SHGetNameFromIDList(pidl, SIGDN_FILESYSPATH, &p))) {
+                    result = p;
+                    CoTaskMemFree(p);
+                }
+                CoTaskMemFree(pidl);
+            }
+            pf->Release();
+        }
+        return result;
+    }
+    PROPERTYKEY GroupBy() {
+        PROPERTYKEY k = {};
+        BOOL asc = TRUE;
+        if (Refresh()) view->GetGroupBy(&k, &asc);
+        return k;
+    }
+    void Navigate(const std::wstring& path) {
+        PIDLIST_ABSOLUTE pidl = nullptr;
+        SHParseDisplayName(path.c_str(), nullptr, &pidl, 0, nullptr);
+        IServiceProvider* sp = nullptr;
+        IShellBrowser* sb = nullptr;
+        browser->QueryInterface(IID_PPV_ARGS(&sp));
+        if (sp) sp->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(&sb));
+        if (sb) sb->BrowseObject(pidl, SBSP_SAMEBROWSER | SBSP_ABSOLUTE);
+        if (sb) sb->Release();
+        if (sp) sp->Release();
+        CoTaskMemFree(pidl);
+        WaitFor([&] { return Refresh() && _wcsicmp(Path().c_str(), path.c_str()) == 0; }, 10000);
+        Pump(1000);
+    }
+};
+
+bool OpenWindow(Window* w) {
+    ShellExecuteW(nullptr, L"open", L"explorer.exe", g_dir.c_str(), nullptr, SW_SHOWNORMAL);
+    return WaitFor(
+        [&] {
+            IShellWindows* sw = nullptr;
+            if (FAILED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&sw)))) return false;
+            long count = 0;
+            sw->get_Count(&count);
+            bool found = false;
+            for (long i = 0; i < count && !found; i++) {
+                VARIANT index;
+                index.vt = VT_I4;
+                index.lVal = i;
+                IDispatch* disp = nullptr;
+                if (FAILED(sw->Item(index, &disp)) || !disp) continue;
+                IWebBrowser2* browser = nullptr;
+                disp->QueryInterface(IID_PPV_ARGS(&browser));
+                disp->Release();
+                if (!browser) continue;
+                w->browser = browser;
+                if (w->Refresh() && _wcsicmp(w->Path().c_str(), g_dir.c_str()) == 0) {
+                    SHANDLE_PTR h = 0;
+                    browser->get_HWND(&h);
+                    w->hwnd = (HWND)h;
+                    found = true;
+                } else {
+                    browser->Release();
+                    w->browser = nullptr;
+                }
+            }
+            sw->Release();
+            return found;
+        },
+        15000);
+}
+
+// Waits until the topmost group is the pinned group with exactly `expected` items.
+bool ExpectPinned(Window& w, const std::set<std::wstring>& expected, const std::wstring& what) {
+    Groups last;
+    bool ok = WaitFor(
+        [&] {
+            last = ReadGroups(w.hwnd);
+            return !last.order.empty() && last.order[0] == g_pinnedLabel && last.First() == expected;
+        },
+        15000);
+    std::vector<std::wstring> exp(expected.begin(), expected.end());
+    Check(ok, what, L"expected pinned {" + Join(exp) + L"}, got " + last.Describe());
+    return ok;
+}
+
+bool ExpectNoPinnedGroup(Window& w, const std::wstring& what) {
+    Groups last;
+    bool ok = WaitFor(
+        [&] {
+            last = ReadGroups(w.hwnd);
+            return std::find(last.order.begin(), last.order.end(), g_pinnedLabel) == last.order.end() &&
+                   !IsEqualPropertyKey(w.GroupBy(), kPinStateKeys[0]) && !IsEqualPropertyKey(w.GroupBy(), kPinStateKeys[1]);
+        },
+        15000);
+    Check(ok, what, last.Describe());
+    return ok;
+}
+
+// ---------------------------------------------------------------- context menu
+std::vector<std::wstring> MenuItems(const std::wstring& path) {
+    std::vector<std::wstring> items;
+    IShellItem* si = nullptr;
+    if (FAILED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&si)))) return items;
+    IContextMenu* cm = nullptr;
+    if (SUCCEEDED(si->BindToHandler(nullptr, BHID_SFUIObject, IID_PPV_ARGS(&cm)))) {
+        HMENU m = CreatePopupMenu();
+        cm->QueryContextMenu(m, 0, 1, 0x7FFF, CMF_NORMAL);
+        for (int i = 0; i < GetMenuItemCount(m); i++) {
+            wchar_t t[512] = L"";
+            GetMenuStringW(m, i, t, 512, MF_BYPOSITION);
+            if (t[0]) items.push_back(t);
+        }
+        DestroyMenu(m);
+        cm->Release();
+    }
+    si->Release();
+    return items;
+}
+
+bool Contains(const std::vector<std::wstring>& v, const std::wstring& s) {
+    return std::find(v.begin(), v.end(), s) != v.end();
+}
+
+std::wstring ExeString(UINT id, const wchar_t* language) {
+    ULONG n = 0;
+    std::wstring langs = std::wstring(language) + L'\0';
+    SetThreadPreferredUILanguages(MUI_LANGUAGE_NAME, langs.c_str(), &n);
+    HMODULE m = LoadLibraryExW(g_exe.c_str(), nullptr, LOAD_LIBRARY_AS_IMAGE_RESOURCE | LOAD_LIBRARY_AS_DATAFILE);
+    std::wstring s;
+    const wchar_t* p = nullptr;
+    int len = m ? LoadStringW(m, id, reinterpret_cast<LPWSTR>(&p), 0) : 0;
+    if (len > 0) s.assign(p, len);
+    if (m) FreeLibrary(m);
+    SetThreadPreferredUILanguages(0, nullptr, &n);
+    return s;
+}
+
+// Saves the window as a 24-bit BMP (used for the README screenshot).
+void SaveScreenshot(HWND hwnd, const std::wstring& path) {
+    RECT r;
+    GetWindowRect(hwnd, &r);
+    int width = r.right - r.left, height = r.bottom - r.top;
+    HDC screen = GetDC(nullptr);
+    HDC mem = CreateCompatibleDC(screen);
+    HBITMAP bmp = CreateCompatibleBitmap(screen, width, height);
+    HGDIOBJ old = SelectObject(mem, bmp);
+    if (!PrintWindow(hwnd, mem, PW_RENDERFULLCONTENT)) BitBlt(mem, 0, 0, width, height, screen, r.left, r.top, SRCCOPY);
+    SelectObject(mem, old);
+    BITMAPINFOHEADER bi = {sizeof(bi)};
+    bi.biWidth = width;
+    bi.biHeight = height;
+    bi.biPlanes = 1;
+    bi.biBitCount = 24;
+    bi.biCompression = BI_RGB;
+    DWORD stride = ((width * 3 + 3) & ~3);
+    std::vector<BYTE> pixels(stride * height);
+    GetDIBits(mem, bmp, 0, height, pixels.data(), reinterpret_cast<BITMAPINFO*>(&bi), DIB_RGB_COLORS);
+    BITMAPFILEHEADER bf = {};
+    bf.bfType = 0x4D42;
+    bf.bfOffBits = sizeof(bf) + sizeof(bi);
+    bf.bfSize = bf.bfOffBits + (DWORD)pixels.size();
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        DWORD written;
+        WriteFile(f, &bf, sizeof(bf), &written, nullptr);
+        WriteFile(f, &bi, sizeof(bi), &written, nullptr);
+        WriteFile(f, pixels.data(), (DWORD)pixels.size(), &written, nullptr);
+        CloseHandle(f);
+    }
+    DeleteObject(bmp);
+    DeleteDC(mem);
+    ReleaseDC(nullptr, screen);
+}
+
+bool IsPinnedInRegistry(const std::wstring& path) {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegPins, 0, KEY_QUERY_VALUE, &k) != ERROR_SUCCESS) return false;
+    bool ok = RegQueryValueExW(k, path.c_str(), nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
+    RegCloseKey(k);
+    return ok;
+}
+
+}  // namespace
+
+int wmain(int argc, wchar_t** argv) {
+    SetConsoleOutputCP(CP_UTF8);
+    if (argc < 2) {
+        Print(L"usage: ExplorerPinnedE2E <ExplorerPinned.exe> [screenshot directory]");
+        return 100;
+    }
+    std::wstring shots = argc > 2 ? argv[2] : L"";
+    wchar_t full[MAX_PATH];
+    GetFullPathNameW(argv[1], MAX_PATH, full, nullptr);
+    g_exe = full;
+    OleInitialize(nullptr);
+
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    GetLongPathNameW(tmp, tmp, MAX_PATH);
+    g_dir = std::wstring(tmp) + L"ep_e2e";
+    SHCreateDirectoryExW(nullptr, g_dir.c_str(), nullptr);
+    const std::wstring special = L"テスト (1) & x.txt";
+    TouchFile(g_dir + L"\\alpha.txt", 2019);
+    TouchFile(g_dir + L"\\bravo.txt", 2021);
+    TouchFile(g_dir + L"\\charlie.txt", 2023);
+    TouchFile(g_dir + L"\\zulu.exe", 2020);
+    TouchFile(g_dir + L"\\" + special, 2022);
+    CreateDirectoryW((g_dir + L"\\delta").c_str(), nullptr);
+    DeleteFileW((g_dir + L"\\echo.txt").c_str());
+
+    // --- resources
+    Check(ExeString(IDS_MENU_PIN_FILE, L"ja-JP") == L"このファイルをピン止めする", L"Japanese menu text",
+          ExeString(IDS_MENU_PIN_FILE, L"ja-JP"));
+    Check(ExeString(IDS_MENU_PIN_FILE, L"en-US") == L"Pin this file to the top", L"English menu text");
+    Check(ExeString(IDS_MENU_PIN_FILE, L"fr-FR") == L"Pin this file to the top", L"Fallback menu text is English");
+
+    // --- setup
+    Check(RunExe(L"setup --no-startup --no-agent --quiet") == 0, L"setup exits with 0");
+    PSRefreshPropertySchema();
+    for (int i = 0; i < 2; i++) {
+        IPropertyDescription* desc = nullptr;
+        HRESULT hr = PSGetPropertyDescription(kPinStateKeys[i], IID_PPV_ARGS(&desc));
+        PWSTR name = nullptr;
+        if (desc) desc->GetDisplayName(&name);
+        if (i == 0 && name) g_pinnedLabel = name;
+        Check(SUCCEEDED(hr) && name && name[0], L"property " + std::to_wstring(i) + L" registered",
+              name ? name : L"");
+        CoTaskMemFree(name);
+        if (desc) desc->Release();
+    }
+    std::wstring pinLabel = ExeString(IDS_MENU_PIN_FILE, L"en-US");
+    std::wstring pinFolderLabel = ExeString(IDS_MENU_PIN_FOLDER, L"en-US");
+    std::wstring unpinLabel = ExeString(IDS_MENU_UNPIN, L"en-US");
+    {
+        auto items = MenuItems(g_dir + L"\\alpha.txt");
+        Check(Contains(items, pinLabel) && !Contains(items, unpinLabel), L"menu on a file before pinning", Join(items));
+    }
+
+    // --- agent
+    STARTUPINFOW si = {sizeof(si)};
+    PROCESS_INFORMATION agent = {};
+    std::wstring cmd = L"\"" + g_exe + L"\" agent";
+    CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &agent);
+    Check(WaitFor([] { return FindWindowW(kAgentWindowClass, nullptr) != nullptr; }, 10000), L"agent starts");
+    Check(RunExe(L"agent") == 0 && FindWindowW(kAgentWindowClass, nullptr), L"second agent exits immediately");
+
+    // --- pin before the folder is opened
+    Check(RunExe(L"pin \"" + g_dir + L"\\bravo.txt\" \"" + g_dir + L"\\delta\"") == 0, L"pin command");
+    Check(IsPinnedInRegistry(g_dir + L"\\bravo.txt") && IsPinnedInRegistry(g_dir + L"\\delta"), L"pins stored");
+
+    Window w;
+    if (!OpenWindow(&w)) {
+        Check(false, L"open Explorer window");
+        return 1;
+    }
+    w.view->SetCurrentViewMode(FVM_DETAILS);
+    SORTCOLUMN byName = {kItemNameDisplay, SORT_ASCENDING};
+    w.view->SetSortColumns(&byName, 1);
+    ExpectPinned(w, {L"bravo", L"delta"}, L"pinned group on top when the folder opens (sorted by name)");
+
+    SORTCOLUMN byDate = {kDateModified, SORT_DESCENDING};
+    w.Refresh();
+    w.view->SetSortColumns(&byDate, 1);
+    Pump(1500);
+    ExpectPinned(w, {L"bravo", L"delta"}, L"pinned group stays on top when sorted by date (newest first)");
+    if (!shots.empty()) {
+        SetForegroundWindow(w.hwnd);
+        Pump(800);
+        SaveScreenshot(w.hwnd, shots + L"\\sorted-by-date.bmp");
+    }
+    SORTCOLUMN byNameDesc = {kItemNameDisplay, SORT_DESCENDING};
+    w.Refresh();
+    w.view->SetSortColumns(&byNameDesc, 1);
+    Pump(1500);
+    ExpectPinned(w, {L"bravo", L"delta"}, L"pinned group stays on top when sorted by name descending");
+
+    // --- changes while the folder is open
+    RunExe(L"unpin \"" + g_dir + L"\\bravo.txt\"");
+    ExpectPinned(w, {L"delta"}, L"unpin moves the item out of the pinned group");
+    RunExe(L"pin \"" + g_dir + L"\\" + special + L"\"");
+    ExpectPinned(w, {L"delta", L"テスト (1) & x"}, L"pin with special characters");
+
+    TouchFile(g_dir + L"\\echo.txt", 2025);
+    Pump(2500);
+    {
+        Groups g = ReadGroups(w.hwnd);
+        Check(!g.First().count(L"echo") && !g.order.empty() && g.order[0] == g_pinnedLabel,
+              L"new file is not pinned", g.Describe());
+    }
+    RunExe(L"toggle \"" + g_dir + L"\\echo.txt\"");
+    ExpectPinned(w, {L"delta", L"テスト (1) & x", L"echo"}, L"toggle pins a new file");
+
+    {
+        IShellView* sv = nullptr;
+        w.Refresh();
+        if (SUCCEEDED(w.view->QueryInterface(IID_PPV_ARGS(&sv)))) {
+            sv->Refresh();
+            sv->Release();
+        }
+        Pump(1000);
+        ExpectPinned(w, {L"delta", L"テスト (1) & x", L"echo"}, L"pinned group comes back after F5 (refresh)");
+    }
+
+    // --- context menu
+    {
+        auto file = MenuItems(g_dir + L"\\alpha.txt");
+        Check(Contains(file, pinLabel) && !Contains(file, unpinLabel), L"menu on an unpinned file", Join(file));
+        auto pinned = MenuItems(g_dir + L"\\echo.txt");
+        Check(Contains(pinned, unpinLabel) && !Contains(pinned, pinLabel), L"menu on a pinned file", Join(pinned));
+        auto folder = MenuItems(g_dir + L"\\delta");
+        Check(Contains(folder, unpinLabel) && !Contains(folder, pinFolderLabel), L"menu on a pinned folder",
+              Join(folder));
+        auto special2 = MenuItems(g_dir + L"\\" + special);
+        Check(Contains(special2, unpinLabel), L"menu on a pinned file with special characters", Join(special2));
+    }
+
+    // --- navigation
+    w.Navigate(L"C:\\Windows");
+    w.Navigate(g_dir);
+    ExpectPinned(w, {L"delta", L"テスト (1) & x", L"echo"}, L"pinned group after navigating away and back");
+
+    // --- the user picks another grouping: respected until the folder is opened again
+    w.Refresh();
+    w.view->SetGroupBy(kItemTypeText, TRUE);
+    Pump(5000);
+    Check(IsEqualPropertyKey(w.GroupBy(), kItemTypeText), L"user-selected grouping is kept in the open view");
+    w.Navigate(L"C:\\Windows");
+    w.Navigate(g_dir);
+    ExpectPinned(w, {L"delta", L"テスト (1) & x", L"echo"}, L"pinned group is applied again on the next visit");
+
+    // --- removing all pins restores the original grouping
+    RunExe(L"unpin \"" + g_dir + L"\\delta\" \"" + g_dir + L"\\" + special + L"\" \"" + g_dir + L"\\echo.txt\"");
+    ExpectNoPinnedGroup(w, L"grouping is removed when the folder has no pins");
+    {
+        auto file = MenuItems(g_dir + L"\\echo.txt");
+        Check(Contains(file, pinLabel) && !Contains(file, unpinLabel), L"menu after unpinning everything", Join(file));
+    }
+
+    // --- a pin whose item is gone does not keep the folder grouped
+    RunExe(L"pin \"" + g_dir + L"\\charlie.txt\"");
+    ExpectPinned(w, {L"charlie"}, L"pin again");
+    DeleteFileW((g_dir + L"\\charlie.txt").c_str());
+    ExpectNoPinnedGroup(w, L"grouping is removed when the pinned item is deleted");
+    TouchFile(g_dir + L"\\charlie.txt", 2023);
+    ExpectPinned(w, {L"charlie"}, L"pinned group returns when the item comes back");
+    Check(RunExe(L"list") == 0, L"list command");
+
+    // --- exit restores the grouping; uninstall cleans up
+    RunExe(L"exit");
+    Check(WaitFor([] { return FindWindowW(kAgentWindowClass, nullptr) == nullptr; }, 10000), L"exit stops the agent");
+    ExpectNoPinnedGroup(w, L"exit restores the original grouping");
+    Check(RunExe(L"uninstall --quiet") == 0, L"uninstall exits with 0");
+    PSRefreshPropertySchema();
+    {
+        IPropertyDescription* desc = nullptr;
+        HRESULT hr = PSGetPropertyDescription(kPinStateKeys[0], IID_PPV_ARGS(&desc));
+        if (desc) desc->Release();
+        Check(FAILED(hr), L"uninstall unregisters the property");
+        HKEY k;
+        Check(RegOpenKeyExW(HKEY_CURRENT_USER, kRegRoot, 0, KEY_READ, &k) != ERROR_SUCCESS, L"uninstall removes settings");
+        auto file = MenuItems(g_dir + L"\\alpha.txt");
+        Check(!Contains(file, pinLabel), L"uninstall removes the menu", Join(file));
+    }
+
+    w.browser->Quit();
+    if (agent.hProcess) {
+        CloseHandle(agent.hProcess);
+        CloseHandle(agent.hThread);
+    }
+    Print(g_failures ? L"E2E FAILED: " + std::to_wstring(g_failures) + L" check(s)" : L"E2E PASSED");
+    OleUninitialize();
+    return g_failures;
+}
