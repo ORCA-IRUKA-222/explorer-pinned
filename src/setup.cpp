@@ -145,19 +145,27 @@ bool IsSchemaRegistered() {
     return true;
 }
 
+// Registering a file that is already registered adds a second entry, and the first one
+// keeps winning, so remove every entry for the path before registering again.
+static void UnregisterAll(const std::wstring& path) {
+    for (int i = 0; i < 8 && SUCCEEDED(PSUnregisterPropertySchema(path.c_str())); i++) {
+    }
+}
+
 HRESULT RegisterSchema() {
     std::wstring path = SchemaPath();
+    UnregisterAll(path);
     if (!WriteUtf16File(path, SchemaXml())) return HRESULT_FROM_WIN32(GetLastError());
     HRESULT hr = PSRegisterPropertySchema(path.c_str());
-    if (SUCCEEDED(hr)) PSRefreshPropertySchema();
+    PSRefreshPropertySchema();
     LogLine(L"RegisterSchema(%s) hr=0x%08x", path.c_str(), hr);
     return hr;
 }
 
 HRESULT UnregisterSchema() {
     std::wstring path = SchemaPath();
-    HRESULT hr = PSUnregisterPropertySchema(path.c_str());
-    if (SUCCEEDED(hr)) PSRefreshPropertySchema();
+    UnregisterAll(path);
+    HRESULT hr = PSRefreshPropertySchema();
     DeleteFileW(path.c_str());
     return hr;
 }

@@ -46,9 +46,11 @@ bool EventConnection::Connect(IUnknown* source, REFIID eventsIid, std::function<
 }
 
 void EventConnection::Reset() {
+    // Disconnect first: Unadvise is a cross-process call, and events may still be
+    // delivered while it waits.
+    if (sink_) sink_->Disconnect();
     if (point_ && cookie_) point_->Unadvise(cookie_);  // fails harmlessly if the source is gone
     if (sink_) {
-        sink_->Disconnect();
         sink_->Release();
         sink_ = nullptr;
     }
