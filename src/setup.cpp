@@ -33,7 +33,7 @@ void WriteVerb(const wchar_t* cls, const wchar_t* verb, UINT labelId, const std:
                const std::wstring& appliesTo) {
     std::wstring key = VerbKey(cls, verb);
     std::wstring exe = ExePath();
-    RegWriteString(HKEY_CURRENT_USER, key, L"MUIVerb", IndirectStr(labelId));
+    RegWriteString(HKEY_CURRENT_USER, key, L"MUIVerb", LoadStr(labelId));
     RegWriteString(HKEY_CURRENT_USER, key, L"Icon", L"\"" + exe + L"\",0");
     if (appliesTo.empty())
         RegDeleteValueIn(HKEY_CURRENT_USER, key, L"AppliesTo");
@@ -44,9 +44,25 @@ void WriteVerb(const wchar_t* cls, const wchar_t* verb, UINT labelId, const std:
 
 std::wstring SchemaPath() { return ExeDirectory() + L"\\ExplorerPinned.propdesc"; }
 
+std::wstring XmlEscape(const std::wstring& s) {
+    std::wstring r;
+    for (wchar_t c : s) {
+        switch (c) {
+            case L'&': r += L"&amp;"; break;
+            case L'<': r += L"&lt;"; break;
+            case L'>': r += L"&gt;"; break;
+            case L'"': r += L"&quot;"; break;
+            default: r += c;
+        }
+    }
+    return r;
+}
+
+// The labels are written as text in the current UI language: the schema is machine-wide
+// and Explorer shows these strings as the group name.
 std::wstring SchemaXml() {
-    std::wstring label = IndirectStr(IDS_PROP_LABEL);
-    std::wstring pinned = IndirectStr(IDS_PROP_PINNED);
+    std::wstring label = XmlEscape(LoadStr(IDS_PROP_LABEL));
+    std::wstring pinned = XmlEscape(LoadStr(IDS_PROP_PINNED));
     std::wstring xml =
         L"<?xml version=\"1.0\" encoding=\"utf-16\"?>\r\n"
         L"<schema xmlns=\"http://schemas.microsoft.com/windows/2006/propertydescription\" schemaVersion=\"1.0\">\r\n"

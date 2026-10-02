@@ -14,10 +14,14 @@ bool PathExists(const std::wstring& path);
 std::wstring ExePath();
 std::wstring ExeDirectory();
 
+// UI strings come from the string tables in ExplorerPinned.rc (English and Japanese).
+// The language follows the user's display language unless HKCU\Software\ExplorerPinned
+// has Language = "ja" or "en".
+LANGID UiLanguage();
+void SetUiLanguage(const std::wstring& code);  // "ja"/"japanese" or anything else for English
+std::wstring LoadStrLang(HMODULE module, UINT id, LANGID language);
 std::wstring LoadStr(UINT id);
 std::wstring FormatStr(UINT id, const std::wstring& arg);
-// "@C:\...\ExplorerPinned.exe,-123" style indirect string for shell registrations.
-std::wstring IndirectStr(UINT id);
 
 bool RegWriteString(HKEY root, const std::wstring& key, const wchar_t* name, const std::wstring& value);
 bool RegReadString(HKEY root, const std::wstring& key, const wchar_t* name, std::wstring* value);

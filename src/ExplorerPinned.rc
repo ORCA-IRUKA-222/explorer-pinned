@@ -37,6 +37,8 @@ BEGIN
 END
 
 // English (used for every UI language other than Japanese)
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+
 STRINGTABLE
 BEGIN
     IDS_APP_NAME            "Explorer Pinned"
@@ -63,7 +65,7 @@ BEGIN
     IDS_MSG_SETUP_DONE      "Explorer Pinned is ready. Right-click a file or folder and choose ""Pin this file to the top"". On Windows 11 the item is under ""Show more options""."
 END
 
-LANGUAGE LANG_JAPANESE, SUBLANG_DEFAULT
+LANGUAGE LANG_JAPANESE, SUBLANG_JAPANESE_JAPAN
 
 STRINGTABLE
 BEGIN

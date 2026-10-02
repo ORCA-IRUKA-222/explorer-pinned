@@ -67,10 +67,41 @@ std::wstring ExePath() {
 
 std::wstring ExeDirectory() { return ParentPath(ExePath()); }
 
+namespace {
+constexpr LANGID kEnglish = MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US);
+constexpr LANGID kJapanese = MAKELANGID(LANG_JAPANESE, SUBLANG_JAPANESE_JAPAN);
+LANGID g_language = 0;
+
+LANGID LanguageFromCode(const std::wstring& code) {
+    return (code == L"ja" || code == L"ja-JP" || code == L"japanese") ? kJapanese : kEnglish;
+}
+}  // namespace
+
+LANGID UiLanguage() {
+    if (g_language) return g_language;
+    std::wstring code;
+    if (RegReadString(HKEY_CURRENT_USER, kRegRoot, L"Language", &code) && !code.empty())
+        g_language = LanguageFromCode(code);
+    else
+        g_language = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_JAPANESE ? kJapanese : kEnglish;
+    return g_language;
+}
+
+void SetUiLanguage(const std::wstring& code) { g_language = LanguageFromCode(code); }
+
+// String tables are stored in blocks of 16 length-prefixed strings.
+std::wstring LoadStrLang(HMODULE module, UINT id, LANGID language) {
+    HRSRC res = FindResourceExW(module, RT_STRING, MAKEINTRESOURCEW(id / 16 + 1), language);
+    if (!res) return std::wstring();
+    const WCHAR* p = static_cast<const WCHAR*>(LockResource(LoadResource(module, res)));
+    if (!p) return std::wstring();
+    for (UINT i = 0; i < (id & 15); i++) p += 1 + *p;
+    return std::wstring(p + 1, *p);
+}
+
 std::wstring LoadStr(UINT id) {
-    const wchar_t* p = nullptr;
-    int n = LoadStringW(GetModuleHandleW(nullptr), id, reinterpret_cast<LPWSTR>(&p), 0);
-    return n > 0 ? std::wstring(p, n) : std::wstring();
+    std::wstring s = LoadStrLang(GetModuleHandleW(nullptr), id, UiLanguage());
+    return s.empty() ? LoadStrLang(GetModuleHandleW(nullptr), id, kEnglish) : s;
 }
 
 std::wstring FormatStr(UINT id, const std::wstring& arg) {
@@ -79,8 +110,6 @@ std::wstring FormatStr(UINT id, const std::wstring& arg) {
     if (pos != std::wstring::npos) fmt.replace(pos, 2, arg);
     return fmt;
 }
-
-std::wstring IndirectStr(UINT id) { return L"@" + ExePath() + L",-" + std::to_wstring(id); }
 
 bool RegWriteString(HKEY root, const std::wstring& key, const wchar_t* name, const std::wstring& value) {
     HKEY k;

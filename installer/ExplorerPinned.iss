@@ -62,7 +62,7 @@ Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; Parameters: "age
 
 [Run]
 ; Machine-wide part (needs administrator rights): the property behind the "Pinned" group.
-Filename: "{app}\{#AppExe}"; Parameters: "register-schema"; StatusMsg: "{cm:Registering}"; Flags: runhidden waituntilterminated
+Filename: "{app}\{#AppExe}"; Parameters: "register-schema --lang {language}"; StatusMsg: "{cm:Registering}"; Flags: runhidden waituntilterminated
 ; Per-user part: right-click menu entries and the start-up entry.
 Filename: "{app}\{#AppExe}"; Parameters: "setup --quiet --no-agent"; Flags: runasoriginaluser runhidden waituntilterminated
 Filename: "{app}\{#AppExe}"; Parameters: "agent"; Description: "{cm:StartNow}"; Flags: runasoriginaluser nowait postinstall

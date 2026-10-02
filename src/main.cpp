@@ -4,6 +4,7 @@
 #include <shlobj.h>
 
 #include <algorithm>
+#include <functional>
 
 #include "agent.h"
 #include "console.h"
@@ -94,7 +95,11 @@ int UnregisterSchemaCommand() {
 bool EnsureSchema() {
     if (IsSchemaRegistered()) return true;
     if (IsElevated()) return SUCCEEDED(RegisterSchema());
-    return RunElevated(L"register-schema") == 0 && (PSRefreshPropertySchema(), IsSchemaRegistered());
+    // The elevated process may run as another account; pass on this user's language.
+    std::wstring lang = PRIMARYLANGID(UiLanguage()) == LANG_JAPANESE ? L"ja" : L"en";
+    if (RunElevated(L"register-schema --lang " + lang) != 0) return false;
+    PSRefreshPropertySchema();
+    return IsSchemaRegistered();
 }
 
 int Setup(bool startup, bool startAgent, bool quiet) {
@@ -137,28 +142,10 @@ int DefaultStart() {
     return RunAgent();
 }
 
-}  // namespace
-
-int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
-    int argc = 0;
-    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    std::vector<std::wstring> args(argv + 1, argv + argc);
-    LocalFree(argv);
-
-    std::wstring command = args.empty() ? L"" : Lower(args[0]);
-    std::vector<std::wstring> rest = args.empty() ? args : std::vector<std::wstring>(args.begin() + 1, args.end());
-    auto hasFlag = [&](const wchar_t* flag) {
-        return std::any_of(rest.begin(), rest.end(), [&](const std::wstring& a) { return Lower(a) == flag; });
-    };
-
+int Dispatch(const std::wstring& command, const std::vector<std::wstring>& rest,
+             const std::function<bool(const wchar_t*)>& hasFlag) {
     if (command.empty()) return DefaultStart();
-    if (command == L"agent") return RunAgent();
-    if (command == L"pin" || command == L"unpin" || command == L"toggle") {
-        HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-        int code = ChangePins(rest, command);
-        if (SUCCEEDED(hr)) CoUninitialize();
-        return code;
-    }
+    if (command == L"pin" || command == L"unpin" || command == L"toggle") return ChangePins(rest, command);
     if (command == L"list") return ListPins();
     if (command == L"reapply") {
         NotifyAgent(kMsgReapply);
@@ -176,4 +163,29 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 
     ShowInfo(LoadStr(IDS_MSG_USAGE));
     return (command == L"help" || command == L"--help" || command == L"/?" || command == L"-h") ? kOk : kUsage;
+}
+
+}  // namespace
+
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    std::vector<std::wstring> args(argv + 1, argv + argc);
+    LocalFree(argv);
+
+    std::wstring command = args.empty() ? L"" : Lower(args[0]);
+    std::vector<std::wstring> rest = args.empty() ? args : std::vector<std::wstring>(args.begin() + 1, args.end());
+    auto hasFlag = [&](const wchar_t* flag) {
+        return std::any_of(rest.begin(), rest.end(), [&](const std::wstring& a) { return Lower(a) == flag; });
+    };
+    for (size_t i = 0; i + 1 < rest.size(); i++)
+        if (Lower(rest[i]) == L"--lang") SetUiLanguage(Lower(rest[i + 1]));
+
+    if (command == L"agent") return RunAgent();  // initializes OLE itself
+
+    // The property system and shell APIs used below need COM.
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    int code = Dispatch(command, rest, hasFlag);
+    if (SUCCEEDED(hr)) CoUninitialize();
+    return code;
 }

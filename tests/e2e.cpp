@@ -25,6 +25,7 @@
 #include <set>
 
 #include "../src/resource.h"
+#include "util.h"
 
 using namespace ep;
 
@@ -343,18 +344,29 @@ bool Contains(const std::vector<std::wstring>& v, const std::wstring& s) {
     return std::find(v.begin(), v.end(), s) != v.end();
 }
 
-std::wstring ExeString(UINT id, const wchar_t* language) {
-    ULONG n = 0;
-    std::wstring langs = std::wstring(language) + L'\0';
-    SetThreadPreferredUILanguages(MUI_LANGUAGE_NAME, langs.c_str(), &n);
+constexpr LANGID kJapanese = MAKELANGID(LANG_JAPANESE, SUBLANG_JAPANESE_JAPAN);
+constexpr LANGID kEnglish = MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US);
+
+std::wstring ExeString(UINT id, LANGID language) {
     HMODULE m = LoadLibraryExW(g_exe.c_str(), nullptr, LOAD_LIBRARY_AS_IMAGE_RESOURCE | LOAD_LIBRARY_AS_DATAFILE);
-    std::wstring s;
-    const wchar_t* p = nullptr;
-    int len = m ? LoadStringW(m, id, reinterpret_cast<LPWSTR>(&p), 0) : 0;
-    if (len > 0) s.assign(p, len);
+    std::wstring s = m ? LoadStrLang(m, id, language) : std::wstring();
     if (m) FreeLibrary(m);
-    SetThreadPreferredUILanguages(0, nullptr, &n);
     return s;
+}
+
+std::wstring SchemaLabel() {
+    PSRefreshPropertySchema();
+    IPropertyDescription* desc = nullptr;
+    std::wstring label;
+    if (SUCCEEDED(PSGetPropertyDescription(kPinStateKeys[0], IID_PPV_ARGS(&desc)))) {
+        PWSTR name = nullptr;
+        if (SUCCEEDED(desc->GetDisplayName(&name)) && name) {
+            label = name;
+            CoTaskMemFree(name);
+        }
+        desc->Release();
+    }
+    return label;
 }
 
 // Saves the window as a 24-bit BMP (used for the README screenshot).
@@ -431,31 +443,29 @@ int wmain(int argc, wchar_t** argv) {
     DeleteFileW((g_dir + L"\\echo.txt").c_str());
 
     // --- resources
-    Check(ExeString(IDS_MENU_PIN_FILE, L"ja-JP") == L"このファイルをピン止めする", L"Japanese menu text",
-          ExeString(IDS_MENU_PIN_FILE, L"ja-JP"));
-    Check(ExeString(IDS_MENU_PIN_FILE, L"en-US") == L"Pin this file to the top", L"English menu text");
-    Check(ExeString(IDS_MENU_PIN_FILE, L"fr-FR") == L"Pin this file to the top", L"Fallback menu text is English");
+    Check(ExeString(IDS_MENU_PIN_FILE, kJapanese) == L"このファイルをピン止めする", L"Japanese string table");
+    Check(ExeString(IDS_MENU_PIN_FILE, kEnglish) == L"Pin this file to the top", L"English string table");
 
-    // --- setup
+    // --- setup (in Japanese, like the user's machine)
+    RegWriteString(HKEY_CURRENT_USER, kRegRoot, L"Language", L"ja");
     Check(RunExe(L"setup --no-startup --no-agent --quiet") == 0, L"setup exits with 0");
     PSRefreshPropertySchema();
     for (int i = 0; i < 2; i++) {
         IPropertyDescription* desc = nullptr;
         HRESULT hr = PSGetPropertyDescription(kPinStateKeys[i], IID_PPV_ARGS(&desc));
-        PWSTR name = nullptr;
-        if (desc) desc->GetDisplayName(&name);
-        if (i == 0 && name) g_pinnedLabel = name;
-        Check(SUCCEEDED(hr) && name && name[0], L"property " + std::to_wstring(i) + L" registered",
-              name ? name : L"");
-        CoTaskMemFree(name);
         if (desc) desc->Release();
+        Check(SUCCEEDED(hr), L"property " + std::to_wstring(i) + L" registered");
     }
-    std::wstring pinLabel = ExeString(IDS_MENU_PIN_FILE, L"en-US");
-    std::wstring pinFolderLabel = ExeString(IDS_MENU_PIN_FOLDER, L"en-US");
-    std::wstring unpinLabel = ExeString(IDS_MENU_UNPIN, L"en-US");
+    g_pinnedLabel = SchemaLabel();
+    Check(g_pinnedLabel == L"ピン止め", L"group label is Japanese", g_pinnedLabel);
+    std::wstring pinLabel = ExeString(IDS_MENU_PIN_FILE, kJapanese);
+    std::wstring pinFolderLabel = ExeString(IDS_MENU_PIN_FOLDER, kJapanese);
+    std::wstring unpinLabel = ExeString(IDS_MENU_UNPIN, kJapanese);
     {
         auto items = MenuItems(g_dir + L"\\alpha.txt");
         Check(Contains(items, pinLabel) && !Contains(items, unpinLabel), L"menu on a file before pinning", Join(items));
+        auto folder = MenuItems(g_dir + L"\\delta");
+        Check(Contains(folder, pinFolderLabel), L"menu on a folder before pinning", Join(folder));
     }
 
     // --- agent
@@ -566,6 +576,10 @@ int wmain(int argc, wchar_t** argv) {
     TouchFile(g_dir + L"\\charlie.txt", 2023);
     ExpectPinned(w, {L"charlie"}, L"pinned group returns when the item comes back");
     Check(RunExe(L"list") == 0, L"list command");
+
+    // --- the schema can be re-registered in another language
+    Check(RunExe(L"register-schema --lang en") == 0 && SchemaLabel() == L"Pinned", L"English group label",
+          SchemaLabel());
 
     // --- exit restores the grouping; uninstall cleans up
     RunExe(L"exit");

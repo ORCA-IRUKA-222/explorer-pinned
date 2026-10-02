@@ -554,8 +554,8 @@ void Agent::RestoreGrouping(TrackedWindow& w) {
     BOOL ascending;
     TakePreviousGroupBy(w.folderPath, &key, &ascending);
     w.view->SetGroupBy(key, ascending);
-    w.applied[0].clear();
-    w.applied[1].clear();
+    // The values stay in the view's cache; `applied` keeps tracking them so they are
+    // cleared when the folder is grouped again.
     LogLine(L"restore grouping %s", w.folderPath.c_str());
 }
 
