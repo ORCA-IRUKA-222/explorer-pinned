@@ -787,8 +787,8 @@ void Agent::ProcessWindow(TrackedWindow& w) {
         }
         return;
     }
-    // Respect a grouping the user picked in this view after the pinned group was shown;
-    // take over again on a new view or a pin change.
+    // Respect a grouping the user picked in this view; take over again on a new view or a
+    // pin change.
     if ((current < 0 && w.initialized && !w.enforce) || w.gaveUp) return;
 
     if (w.attempts > 0 && !w.dropped) {
@@ -840,6 +840,7 @@ void Agent::ProcessWindow(TrackedWindow& w) {
     w.lastRegroup = now;
     w.attempts++;
     w.dropped = false;
+    w.initialized = true;
     w.enforce = false;
     if (current < 0 && !w.folderIdList.empty())
         MarkGrouped(w.folderPath, reinterpret_cast<PCIDLIST_ABSOLUTE>(w.folderIdList.data()));
