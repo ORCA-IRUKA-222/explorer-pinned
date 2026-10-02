@@ -6,6 +6,15 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      release:
+        description: "Publish a release tagged v<version in src/version.h>"
+        type: boolean
+        default: false
+      target:
+        description: "Commit for the release tag (default: the commit being built)"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -179,12 +188,13 @@ jobs:
 
   release:
     name: Release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release)
     needs: [e2e, package, installer-test]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: packages
@@ -192,6 +202,12 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ inputs.target }}
         run: |
-          gh release create "$GITHUB_REF_NAME" packages/* \
-            --repo "$GITHUB_REPOSITORY" --title "Explorer Pinned ${GITHUB_REF_NAME#v}" --generate-notes
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="v$(sed -n 's/.*EP_VERSION_STRING "\(.*\)"/\1/p' src/version.h)"
+          fi
+          gh release create "$tag" packages/* --repo "$GITHUB_REPOSITORY" --target "${TARGET:-$GITHUB_SHA}" \
+            --title "Explorer Pinned ${tag#v}" --notes-file .github/release-notes.md --generate-notes
