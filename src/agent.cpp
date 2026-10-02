@@ -208,6 +208,7 @@ struct TrackedWindow {
     DWORD waitSince = 0;     // first time processing was put off for a load
     int attempts = 0;        // groupings applied in this view since the grouping last held
     int churn = 0;           // regroups in a row that came soon after the previous one
+    int writeFailures = 0;   // tries in a row in which the view took no pinned value
     bool dropped = false;    // Explorer dropped the values of the grouping applied last
     bool gaveUp = false;     // the grouping did not hold; left alone until the pins change
     bool displayLogged = false;  // what Explorer shows was written to the log
@@ -591,6 +592,7 @@ bool Agent::AcquireView(TrackedWindow& w, bool* newSession) {
     w.waitSince = 0;
     w.attempts = 0;
     w.churn = 0;
+    w.writeFailures = 0;
     w.dropped = false;
     w.gaveUp = false;
     w.displayLogged = false;
@@ -824,17 +826,21 @@ void Agent::ProcessWindow(TrackedWindow& w) {
     if (current < 0) SavePreviousGroupBy(w.folderPath, groupKey, ascending);
     HRESULT failure = S_OK;
     size_t written = WriteKey(w, key, names, &failure);
+    if (!written) {
+        // The view does not have the items yet (Explorer is still filling it) or does not
+        // show them (hidden items). Grouping now would only show "Unspecified": try again
+        // later, less and less often, without counting it as a failed grouping.
+        if (++w.writeFailures == 1 || w.writeFailures % 10 == 0)
+            LogLine(L"cannot set the pinned value in %s yet (0x%08lX, try %d)", w.folderPath.c_str(),
+                    (unsigned long)failure, w.writeFailures);
+        Schedule(&w, std::min<DWORD>(30000, 500u << std::min(w.writeFailures, 6)), false);
+        return;
+    }
+    w.writeFailures = 0;
     w.lastRegroup = now;
     w.attempts++;
     w.dropped = false;
     w.enforce = false;
-    if (!written) {
-        // Grouping now would only show "Unspecified"; try again shortly.
-        LogLine(L"cannot set the pinned value in %s (0x%08lX), attempt %d", w.folderPath.c_str(), (unsigned long)failure,
-                w.attempts);
-        Schedule(&w, 1000, false);
-        return;
-    }
     if (current < 0 && !w.folderIdList.empty())
         MarkGrouped(w.folderPath, reinterpret_cast<PCIDLIST_ABSOLUTE>(w.folderIdList.data()));
     // Explorer reloads the view for the new grouping; check the result once that is done.

@@ -197,8 +197,15 @@ void RemoveRegistration(const SchemaRegistration& r) {
         createdFile = WriteUtf16File(r.path, r.legacy ? SchemaXml(kLegacyPinStateFormatId, kLegacyPinStateKeys, kLegacyPinStateNames)
                                                       : SchemaXml(kPinStateFormatId, kPinStateKeys, kPinStateNames));
     }
+    // Windows also reports success when the file is not registered; stop once it is gone,
+    // since every call makes running programs reload their property descriptions.
+    auto registered = [&] {
+        for (const auto& other : SchemaRegistrations())
+            if (PathEqualsI(other.path, r.path)) return true;
+        return false;
+    };
     int removed = 0;
-    while (removed < 8 && SUCCEEDED(PSUnregisterPropertySchema(r.path.c_str()))) removed++;
+    while (removed < 8 && registered() && SUCCEEDED(PSUnregisterPropertySchema(r.path.c_str()))) removed++;
     if (createdFile) DeleteFileW(r.path.c_str());
     for (const auto& dir : createdDirs) RemoveDirectoryW(dir.c_str());
     LogLine(L"unregister schema %s (%s, %s): %d", r.path.c_str(), r.legacy ? L"old" : L"current",

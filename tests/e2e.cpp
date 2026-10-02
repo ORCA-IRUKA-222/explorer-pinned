@@ -627,9 +627,7 @@ int wmain(int argc, wchar_t** argv) {
     // --- a machine where version 1.0.x registered ExplorerPinned.propdesc from two folders
     // and one of the files was deleted afterwards (registration then fails partly and
     // Explorer can show every item as "Unspecified"); setup must clean that up
-    wchar_t seedOption[16] = L"1";
-    GetEnvironmentVariableW(L"EP_E2E_SEED", seedOption, 16);
-    if (seedOption[0] != L'0') {
+    {
         std::wstring first = std::wstring(tmp) + L"ep_old_portable\\ExplorerPinned.propdesc";
         std::wstring second = std::wstring(tmp) + L"ep_old_installed\\ExplorerPinned.propdesc";
         WriteLegacySchema(first);
@@ -643,9 +641,10 @@ int wmain(int argc, wchar_t** argv) {
         swprintf_s(text, L"old registrations: 0x%08lx, 0x%08lx", (unsigned long)a, (unsigned long)b);
         Print(text);
         Print(L"schemas before setup: " + RegisteredSchemas());
-        wchar_t wait[16] = L"0";
-        GetEnvironmentVariableW(L"EP_E2E_SEED_WAIT", wait, 16);
-        Pump((DWORD)_wtoi(wait));
+        // On a real machine the old registration is days old. Explorer applies schema changes
+        // in the background; changing them again within seconds can leave it showing every
+        // item as "Unspecified" until a new window is opened, so let it settle first.
+        Pump(15000);
     }
 
     // --- setup (in Japanese, like the user's machine)
