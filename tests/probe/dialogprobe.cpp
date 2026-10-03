@@ -293,10 +293,14 @@ static HWND WaitWindowOf(const wchar_t* exe, const wchar_t* title, DWORD ms) {
     return NULL;
 }
 
-// Clicks the page's file button through UI Automation (a click by assistive technology
-// counts as a user action, which a page needs to open the file chooser). Runs on its own
-// thread: a browser may only return from the click once its dialog closes.
+// Clicks the element named g_clickName in g_clickHwnd through UI Automation (a click by
+// assistive technology counts as a user action, which a page needs to open the file
+// chooser). Runs on its own thread: a browser may only return from the click once its
+// dialog closes. Leaves the element's position in g_clickRect.
 static HWND g_clickHwnd;
+static const wchar_t* g_clickName;
+static RECT g_clickRect;
+static volatile LONG g_clickFound;
 static DWORD WINAPI ClickThread(LPVOID) {
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
     IUIAutomation* uia = NULL;
@@ -305,34 +309,55 @@ static DWORD WINAPI ClickThread(LPVOID) {
     if (uia) uia->ElementFromHandle(g_clickHwnd, &root);
     VARIANT v;
     v.vt = VT_BSTR;
-    v.bstrVal = SysAllocString(L"pickfile");
+    v.bstrVal = SysAllocString(g_clickName);
     IUIAutomationCondition* cond = NULL;
     if (uia) uia->CreatePropertyCondition(UIA_NamePropertyId, v, &cond);
     IUIAutomationElement* el = NULL;
-    for (int i = 0; i < 40 && root && cond && !el; i++) {
+    for (int i = 0; i < 30 && root && cond && !el; i++) {
         root->FindFirst(TreeScope_Descendants, cond, &el);
         if (!el) Sleep(500);
     }
     HRESULT hr = E_FAIL;
     if (el) {
+        el->get_CurrentBoundingRectangle(&g_clickRect);
+        InterlockedExchange(&g_clickFound, 1);
         IUIAutomationInvokePattern* inv = NULL;
         el->GetCurrentPatternAs(UIA_InvokePatternId, IID_PPV_ARGS(&inv));
         if (inv) {
-            Log(L"  UIA: invoking the file button");
+            Log(L"  UIA: invoking \"%s\"", g_clickName);
             hr = inv->Invoke();
             inv->Release();
         } else {
             IUIAutomationLegacyIAccessiblePattern* acc = NULL;
             el->GetCurrentPatternAs(UIA_LegacyIAccessiblePatternId, IID_PPV_ARGS(&acc));
             if (acc) {
-                Log(L"  UIA: default action on the file button");
+                Log(L"  UIA: default action on \"%s\"", g_clickName);
                 hr = acc->DoDefaultAction();
                 acc->Release();
             }
         }
         el->Release();
-    } else {
-        Log(L"  UIA: file button not found");
+    } else if (root && uia) {
+        Log(L"  UIA: \"%s\" not found; elements:", g_clickName);
+        IUIAutomationCondition* all = NULL;
+        uia->CreateTrueCondition(&all);
+        IUIAutomationElementArray* arr = NULL;
+        if (all) root->FindAll(TreeScope_Descendants, all, &arr);
+        int len = 0;
+        if (arr) arr->get_Length(&len);
+        for (int i = 0; i < len && i < 60; i++) {
+            IUIAutomationElement* e = NULL;
+            arr->GetElement(i, &e);
+            BSTR name = NULL;
+            CONTROLTYPEID type = 0;
+            e->get_CurrentName(&name);
+            e->get_CurrentControlType(&type);
+            Log(L"    %d \"%s\"", type, name ? name : L"");
+            SysFreeString(name);
+            e->Release();
+        }
+        if (arr) arr->Release();
+        if (all) all->Release();
     }
     Log(L"  UIA click: 0x%08lx", (unsigned long)hr);
     VariantClear(&v);
@@ -342,19 +367,41 @@ static DWORD WINAPI ClickThread(LPVOID) {
     CoUninitialize();
     return 0;
 }
+static HANDLE ClickAsync(HWND hwnd, const wchar_t* name) {
+    g_clickHwnd = hwnd;
+    g_clickName = name;
+    g_clickFound = 0;
+    return CreateThread(NULL, 0, ClickThread, NULL, 0, NULL);
+}
 
-static void PressSpace(HWND hwnd) {
+static void TakeForeground(HWND hwnd) {
     // Windows lets a process take the foreground right after a key press.
     keybd_event(VK_MENU, 0, 0, 0);
     keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
     SetForegroundWindow(hwnd);
     Pump(500);
-    Log(L"  keyboard: foreground %s", GetForegroundWindow() == hwnd ? L"ok" : L"not the browser");
+    Log(L"  foreground: %s", GetForegroundWindow() == hwnd ? L"ok" : L"not the browser");
+}
+
+static void MouseClick(HWND hwnd, const RECT& r) {
+    TakeForeground(hwnd);
+    SetCursorPos((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+    INPUT in[2] = {};
+    in[0].type = in[1].type = INPUT_MOUSE;
+    in[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+    in[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    SendInput(2, in, sizeof(INPUT));
+    Log(L"  mouse click at %ld,%ld", (r.left + r.right) / 2, (r.top + r.bottom) / 2);
+}
+
+static void PressSpace(HWND hwnd) {
+    TakeForeground(hwnd);
     INPUT in[2] = {};
     in[0].type = in[1].type = INPUT_KEYBOARD;
     in[0].ki.wVk = in[1].ki.wVk = VK_SPACE;
     in[1].ki.dwFlags = KEYEVENTF_KEYUP;
     SendInput(2, in, sizeof(INPUT));
+    Log(L"  pressed Space");
 }
 
 static int Host(const std::wstring& folder) {
@@ -465,13 +512,27 @@ int wmain(int argc, wchar_t** argv) {
         CloseDialog(dlg, host);
     }
     check(L"D6 saved");
+
+    Log(L"######## D7 opening a subfolder from the view, then Cancel");
+    host = Start(hostCmd);
+    dlg = WaitDialog(host.dwProcessId, 15000);
+    if (dlg) {
+        Watch(dlg, 6000, L"D7");
+        HANDLE t = ClickAsync(dlg, L"delta");
+        WaitForSingleObject(t, 20000);
+        CloseHandle(t);
+        Watch(dlg, 3000, L"D7 in delta");
+        CloseDialog(dlg, host);
+    }
+    check(L"D7 saved");
     DumpBags(HKEY_CURRENT_USER, L"Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\Bags", 0);
 
     // Upload dialogs of web browsers.
     std::wstring page = std::wstring(tmp) + L"ep_upload.html";
     {
         HANDLE h = CreateFileW(page.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        const char html[] = "<!doctype html><title>ep-upload</title><input type=file id=f aria-label=pickfile autofocus>";
+        const char html[] = "<!doctype html><title>ep-upload</title><input type=file id=f style=display:none>"
+                            "<button autofocus onclick=\"document.getElementById('f').click()\">pickfile</button>";
         DWORD w;
         WriteFile(h, html, sizeof(html) - 1, &w, NULL);
         CloseHandle(h);
@@ -543,12 +604,15 @@ int wmain(int argc, wchar_t** argv) {
         HWND bdlg = NULL;
         if (win) {
             Pump(2000);
-            g_clickHwnd = win;
-            CloseHandle(CreateThread(NULL, 0, ClickThread, NULL, 0, NULL));
-            bdlg = WaitWindowOf(b.exe, NULL, 25000);
+            CloseHandle(ClickAsync(win, L"pickfile"));
+            bdlg = WaitWindowOf(b.exe, NULL, 20000);
+            if (!bdlg && g_clickFound) {
+                MouseClick(win, g_clickRect);
+                bdlg = WaitWindowOf(b.exe, NULL, 8000);
+            }
             if (!bdlg) {
                 PressSpace(win);
-                bdlg = WaitWindowOf(b.exe, NULL, 10000);
+                bdlg = WaitWindowOf(b.exe, NULL, 8000);
             }
         }
         if (bdlg) {

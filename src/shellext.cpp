@@ -25,8 +25,11 @@ namespace {
 // {432E90E6-6BCF-44FE-9F87-8BA191F04870}
 const CLSID kOverlayClsid = {0x432e90e6, 0x6bcf, 0x44fe, {0x9f, 0x87, 0x8b, 0xa1, 0x91, 0xf0, 0x48, 0x70}};
 constexpr wchar_t kOverlayClsidString[] = L"{432E90E6-6BCF-44FE-9F87-8BA191F04870}";
+// Windows loads the overlay handlers in the order of these names and uses only the first
+// 15 overlays. The leading spaces get this handler loaded before the others; it takes no
+// overlay slot (GetOverlayInfo fails), so the overlays of other programs are not affected.
 constexpr wchar_t kOverlayKey[] =
-    L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\ShellIconOverlayIdentifiers\\ExplorerPinned";
+    L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\ShellIconOverlayIdentifiers\\    ExplorerPinned";
 
 constexpr UINT kGetShellBrowser = WM_USER + 7;  // WM_GETISHELLBROWSER, answered by shell browser windows
 constexpr DWORD kPollMs = 700;
@@ -239,6 +242,26 @@ void ProcessDialog(HWND dialog) {
     ComPtr<IFolderView2> view = ViewOf(dialog);
     if (!view) return;
     if (!t_dialogs) t_dialogs = new std::map<HWND, Dialog>();
+    if (!t_dialogs->count(dialog)) {
+        // Research: which interfaces the dialog's browser offers (for navigation events).
+        HWND defView = FindDefView(dialog);
+        ComPtr<IShellBrowser> sb = defView ? ShellBrowserOf(dialog, defView) : ComPtr<IShellBrowser>();
+        ComPtr<IServiceProvider> sp = sb ? sb.As<IServiceProvider>() : ComPtr<IServiceProvider>();
+        ComPtr<IExplorerBrowser> eb;
+        ComPtr<IFileDialog> fd;
+        ComPtr<IExplorerBrowser> ebService;
+        ComPtr<IFileDialog> fdService;
+        if (sb) {
+            sb->QueryInterface(IID_PPV_ARGS(eb.Put()));
+            sb->QueryInterface(IID_PPV_ARGS(fd.Put()));
+        }
+        if (sp) {
+            sp->QueryService(SID_SExplorerBrowserFrame, IID_PPV_ARGS(fdService.Put()));
+            sp->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(ebService.Put()));
+        }
+        LogLine(L"dialog: browser %d, IExplorerBrowser %d/%d, IFileDialog %d/%d", sb ? 1 : 0, eb ? 1 : 0,
+                ebService ? 1 : 0, fd ? 1 : 0, fdService ? 1 : 0);
+    }
     Dialog& d = (*t_dialogs)[dialog];
     DWORD now = GetTickCount();
 
@@ -418,13 +441,8 @@ public:
         return r;
     }
     STDMETHODIMP IsMemberOf(PCWSTR, DWORD) override { return S_FALSE; }
-    STDMETHODIMP GetOverlayInfo(PWSTR iconFile, int cch, int* index, DWORD* flags) override {
-        StartOnce();
-        GetModuleFileNameW(g_module, iconFile, cch);
-        *index = 0;
-        *flags = ISIOI_ICONFILE | ISIOI_ICONINDEX;
-        return S_OK;
-    }
+    // No overlay image: Windows then drops this handler without using one of its overlay slots.
+    STDMETHODIMP GetOverlayInfo(PWSTR, int, int*, DWORD*) override { return E_NOTIMPL; }
     STDMETHODIMP GetPriority(int* priority) override {
         *priority = 100;
         return S_OK;
