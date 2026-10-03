@@ -17,8 +17,8 @@ English summary is [below](#english).
 - ピン止めした項目は「ピン止め」グループとして一番上に表示（名前順・更新日時順・サイズ順など、どの並べ替えでも一番上）
 - 右クリック →「**ピン止めを外す**」で解除
 - ダウンロードに限らず、どのフォルダーでも使えます
-- エクスプローラー本体を書き換えたり、エクスプローラーに DLL を読み込ませたりしません
-  （Windows が公開している COM の API だけを使っています）
+- **ファイルを開く・保存する画面や、ブラウザーでファイルをアップロードするときの画面** でも一番上に表示（インストーラー版、[詳しく](#ファイル選択画面開く保存アップロード)）
+- エクスプローラー本体は書き換えません（エクスプローラーのウィンドウは Windows が公開している COM の API だけで操作します）
 - ファイル自体には何も書き込みません（名前も更新日時も変わりません）
 - 日本語と英語に対応（インストーラーで選んだ言語。ポータブル版は Windows の表示言語）
 - 無料・オープンソース（MIT ライセンス）
@@ -34,7 +34,7 @@ English summary is [below](#english).
 
 1. [Releases](https://github.com/ORCA-IRUKA-222/explorer-pinned/releases) から
    `ExplorerPinned-Setup-<バージョン>.exe` をダウンロードして実行します。
-2. 管理者の確認が 1 回表示されます。「ピン止め」グループの名前を Windows に登録するためです。
+2. 管理者の確認が 1 回表示されます。「ピン止め」グループの名前と、ファイル選択画面用の DLL を Windows に登録するためです。
 3. インストールが終わると常駐を開始します（通知領域にピンのアイコンが出ます）。次回からはサインイン時に自動で起動します。
 
 > [!NOTE]
@@ -47,6 +47,7 @@ English summary is [below](#english).
 好きな場所に展開し、`ExplorerPinned.exe` をダブルクリックします。
 初回はセットアップの確認が出るので「OK」を押してください（管理者の確認が 1 回出ます）。
 セットアップ後に exe を別の場所へ移動した場合は、もう一度ダブルクリックしてセットアップし直してください。
+ポータブル版はファイル選択画面（開く・保存・アップロード）には対応していません（インストーラー版を使ってください）。
 
 ## 使い方
 
@@ -75,6 +76,26 @@ English summary is [below](#english).
 - 一時的に別のグループ化（例: 種類）を選ぶと、そのウィンドウではそのまま維持されます。フォルダーを開き直すと「ピン止め」グループに戻ります。
 - フォルダー内のピン止めをすべて外すと、元のグループ化（例: ダウンロードの「更新日時」グループ）に戻ります。
 
+### ファイル選択画面（開く・保存・アップロード）
+
+インストーラー版では、アプリの「ファイルを開く」「名前を付けて保存」の画面や、Chrome・Edge・Firefox などで
+Web サイトにファイルをアップロードするときの画面でも、ピン止めした項目が一番上の「ピン止め」グループに表示されます。
+
+- **しくみ:** 小さな DLL（`ExplorerPinnedShell.dll`）を Windows に登録しておくと、Windows 標準のファイル選択画面を表示するアプリが
+  その DLL を読み込みます。DLL はファイル選択画面の一覧のグループ化だけを変更し、画面を閉じる前や別のフォルダーへ移る前に
+  元のグループ化に戻します。ファイルにもアプリにも何も書き込みません。インターネットへの通信もしません。
+  （Windows に「アイコンのオーバーレイ」用として登録しますが、アイコンには何も表示せず、
+  Windows のオーバーレイの枠（15 個まで）も使いません。）
+- **オフにするには:** 通知領域のアイコン →「ファイル選択画面（開く・保存・アップロード）でも表示」のチェックを外します。
+  開いているファイル選択画面にも 1 秒ほどで反映されます。DLL 自体を取り除くにはアンインストールしてください。
+- 32 ビットのアプリにも対応しています。ARM 版 Windows では、ARM64 版と 32 ビット（x86）のアプリで表示されます
+  （エミュレーションで動く x64 版のアプリでは表示されません）。
+- アプリが独自のファイル選択画面を使っている場合は表示されません。
+- この DLL はファイル選択画面を表示するすべてのアプリ（管理者として実行したアプリも含む）に読み込まれるため、
+  管理者しか変更できない Program Files にインストールした場合だけ登録します。
+- コード署名をしていないため、セキュリティソフトによっては「他のアプリに読み込まれる DLL」として警告することがあります。
+- 更新時にアプリが DLL を使用中の場合は、古い DLL の名前を変えて新しい DLL を入れ、古い DLL は次回の再起動時に削除します。
+
 ### 通知領域（タスクトレイ）のメニュー
 
 | メニュー | 内容 |
@@ -83,6 +104,7 @@ English summary is [below](#english).
 | 開いているウィンドウに再適用 | 表示がずれたときに、開いているすべてのウィンドウへ再適用します |
 | 存在しない項目のピン止めを整理 | 削除済みの項目のピン止めを一覧から消します |
 | Windows の起動時に開始 | 自動起動のオン/オフ |
+| ファイル選択画面（開く・保存・アップロード）でも表示 | ファイル選択画面での表示のオン/オフ（インストーラー版） |
 | 終了 | 常駐を終了し、ピン止めグループにしていたフォルダーのグループ化を元に戻します |
 
 ### うまく表示されないとき
@@ -104,7 +126,8 @@ English summary is [below](#english).
   「今日」「昨日」といった日付のグループは表示されません（並べ替えは日付順にできます）。
 - **ピン止めはパスで記録します。** ピン止めした項目の名前を変えたり別のフォルダーへ移動したりすると、ピン止めは外れます。
   削除した項目と同じ名前の項目が後から作られると、再びピン止めされた状態になります。
-- ファイルを開く/保存するダイアログ、「PC」「ホーム」「ライブラリ」、検索結果などの仮想フォルダーでは使えません。
+- 「PC」「ホーム」「ライブラリ」、検索結果などの仮想フォルダーでは使えません。
+- ファイル選択画面では、ピン止めの変更が反映されるまで 1 秒ほどかかります。
 - ピン止めしていない項目が入る「未指定」グループの名前は変更できません（Windows の仕様）。
 - 同じフォルダーを表示していても、隠しファイルとして非表示になっている項目はピン止めグループに出ません。
 - エクスプローラーの `IFolderView2::SetViewProperty` という API を使っています。現在の Windows 10 / 11 で動作しますが、
@@ -113,8 +136,9 @@ English summary is [below](#english).
 ## アンインストール
 
 「設定」→「アプリ」→「インストールされているアプリ」から **Explorer Pinned** をアンインストールします。
-右クリックメニュー、自動起動、ピン止めの一覧、Windows に登録した「ピン止め」の名前がすべて削除され、
+右クリックメニュー、自動起動、ピン止めの一覧、Windows に登録した「ピン止め」の名前とファイル選択画面用の DLL がすべて削除され、
 ピン止めグループにしていたフォルダーのグループ化も元に戻ります。
+アンインストール時にアプリが DLL を使用中の場合、DLL のファイルは次回の再起動時に削除されます。
 
 ポータブル版の場合は、コマンドプロンプトで次を実行してから exe を削除してください。
 
@@ -136,6 +160,7 @@ ExplorerPinned.exe [コマンド] [パス...]
   reapply             開いているウィンドウに再適用
   setup               右クリックメニュー・「ピン止め」の名前・自動起動を登録
                       (--no-startup: 自動起動を登録しない / --no-agent: 常駐を開始しない / --quiet)
+  register-dialogs    ファイル選択画面用の DLL を登録（管理者として実行。インストーラーが実行します）
   uninstall           このプログラムが登録したものをすべて削除 (--quiet)
   exit                常駐を終了
 ```
@@ -157,6 +182,13 @@ ExplorerPinned.exe [コマンド] [パス...]
 - 右クリックメニューは `HKCU\Software\Classes\*\shell` と `Directory\shell` の静的な項目です。
   `AppliesTo` 条件にピン止め中のパスを入れて、「ピン止めする」と「ピン止めを外す」を出し分けています。
 - ピン止めの一覧は `HKCU\Software\ExplorerPinned\Pins` に保存されます。
+- ファイル選択画面: `ExplorerPinnedShell.dll`（32 ビットのアプリ用は `ExplorerPinnedShell32.dll`）をアイコンオーバーレイハンドラー
+  （`ShellIconOverlayIdentifiers`）として登録すると、シェルのビューを表示するプロセスに読み込まれます。
+  `GetOverlayInfo` が失敗を返すためオーバーレイの枠は使いません。エクスプローラー以外のプロセスでは、
+  そのプロセスの `#32770`（ファイル選択画面）を監視し、画面のスレッドにフックを入れて、そのスレッドで
+  `WM_GETISHELLBROWSER` → `IShellBrowser::QueryActiveShellView` → `IFolderView2` と取得して、エクスプローラーと同じ方法でグループ化します。
+  画面はフォルダーごとにグループ化を保存するため、閉じる操作（OK / キャンセル / 閉じる）と
+  `IExplorerBrowserEvents::OnNavigationPending`（別のフォルダーへの移動）の前に元のグループ化に戻します。
 
 ### ビルド
 
@@ -167,7 +199,8 @@ cmake -B build -A x64
 cmake --build build --config Release
 ```
 
-`build\Release\ExplorerPinned.exe` ができます。ARM64 版は `-A ARM64` で作成できます。
+`build\Release\ExplorerPinned.exe` と `ExplorerPinnedShell.dll` ができます。ARM64 版は `-A ARM64`、
+32 ビットのアプリ用の `ExplorerPinnedShell32.dll` は `-A Win32` で作成できます。
 
 ### テスト
 
@@ -196,7 +229,12 @@ Pinned items are shown in a **"Pinned"** group at the top, whatever the sort ord
 
 - Right-click a file or folder → **"Pin this file to the top"** / **"Pin this folder to the top"**; **"Unpin from the top"** to remove.
   On Windows 11 these items are under **"Show more options"** (or Shift + right-click).
-- Works in every regular folder, e.g. Downloads. Files are never modified; Explorer is not patched or injected into.
+- Works in every regular folder, e.g. Downloads. Files are never modified; Explorer is not patched.
+- With the installer, pinned items are also on top in file dialogs (Open, Save, and choosing a file to upload in Chrome,
+  Edge, Firefox, ...). For this, Windows loads a small DLL (`ExplorerPinnedShell.dll`, registered as an icon overlay
+  handler that shows no overlay and uses no overlay slot) into programs that show a file dialog. It only changes the
+  grouping of the dialog's file list and puts the original grouping back before the dialog closes or leaves the folder.
+  It can be turned off in the notification area menu ("Also in file dialogs"). The portable build does not include it.
 - A small background process (notification area icon) applies the "Pinned" grouping through public Shell COM APIs
   (`IFolderView2::SetViewProperty` + `SetGroupBy`). Unpinned items appear in Explorer's built-in "Unspecified" group.
 - Install with `ExplorerPinned-Setup-<version>.exe` from [Releases](https://github.com/ORCA-IRUKA-222/explorer-pinned/releases)

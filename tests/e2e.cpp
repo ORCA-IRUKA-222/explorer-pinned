@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <functional>
 #include <map>
+#include <memory>
 #include <set>
 
 #include "../src/resource.h"
@@ -602,10 +603,401 @@ int CountLogLines(const wchar_t* text) {
 // Number of times the agent has changed a view's grouping to the pinned grouping.
 int Groupings() { return CountLogLines(L"] group ") + CountLogLines(L"] regroup "); }
 
+// ---------------------------------------------------------------- file dialogs
+// "ExplorerPinnedE2E host <folder>" shows an Open dialog on <folder> (the 32-bit build of
+// this program shows a dialog of a 32-bit program).
+int HostDialog(const std::wstring& folder) {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    IFileOpenDialog* dialog = nullptr;
+    IShellItem* item = nullptr;
+    CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
+    SHCreateItemFromParsingName(folder.c_str(), nullptr, IID_PPV_ARGS(&item));
+    if (dialog && item) {
+        dialog->SetFolder(item);
+        dialog->Show(nullptr);
+    }
+    if (item) item->Release();
+    if (dialog) dialog->Release();
+    CoUninitialize();
+    return 0;
+}
+
+std::wstring ImageName(DWORD pid) {
+    std::wstring result;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return result;
+    wchar_t path[MAX_PATH];
+    DWORD n = MAX_PATH;
+    if (QueryFullProcessImageNameW(h, 0, path, &n)) result = FileNamePart(path);
+    CloseHandle(h);
+    return result;
+}
+
+bool HasShellView(HWND hwnd) {
+    bool found = false;
+    EnumChildWindows(
+        hwnd,
+        [](HWND child, LPARAM lp) -> BOOL {
+            wchar_t cls[64];
+            if (GetClassNameW(child, cls, 64) && wcscmp(cls, L"SHELLDLL_DefView") == 0) {
+                *reinterpret_cast<bool*>(lp) = true;
+                return FALSE;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&found));
+    return found;
+}
+
+// A visible top-level window of a process that `match` accepts: a file dialog, or (with a
+// title) a window whose title contains it.
+HWND WaitWindow(const std::function<bool(DWORD)>& match, const wchar_t* title, DWORD timeoutMs) {
+    struct Search {
+        const std::function<bool(DWORD)>* match;
+        const wchar_t* title;
+        HWND found;
+    } search = {&match, title, nullptr};
+    WaitFor(
+        [&] {
+            EnumWindows(
+                [](HWND hwnd, LPARAM lp) -> BOOL {
+                    auto* s = reinterpret_cast<Search*>(lp);
+                    DWORD pid = 0;
+                    GetWindowThreadProcessId(hwnd, &pid);
+                    if (!IsWindowVisible(hwnd) || !(*s->match)(pid)) return TRUE;
+                    if (s->title) {
+                        wchar_t text[256] = L"";
+                        GetWindowTextW(hwnd, text, 256);
+                        if (!wcsstr(text, s->title)) return TRUE;
+                    } else {
+                        wchar_t cls[32];
+                        if (!GetClassNameW(hwnd, cls, 32) || wcscmp(cls, L"#32770") != 0 || !HasShellView(hwnd)) return TRUE;
+                    }
+                    s->found = hwnd;
+                    return FALSE;
+                },
+                reinterpret_cast<LPARAM>(&search));
+            return search.found != nullptr;
+        },
+        timeoutMs);
+    return search.found;
+}
+
+HWND WaitFileDialogOf(DWORD pid, DWORD timeoutMs = 20000) {
+    return WaitWindow([pid](DWORD p) { return p == pid; }, nullptr, timeoutMs);
+}
+
+// Shows a folder in a dialog by typing its path into the file name box.
+void NavigateDialog(HWND dialog, const std::wstring& folder) {
+    HWND combo = GetDlgItem(dialog, 1148);
+    HWND edit = combo ? FindWindowExW(combo, nullptr, L"ComboBox", nullptr) : nullptr;
+    edit = edit ? FindWindowExW(edit, nullptr, L"Edit", nullptr) : (combo ? FindWindowExW(combo, nullptr, L"Edit", nullptr) : nullptr);
+    if (!edit) {
+        Print(L"no file name box in the dialog");
+        return;
+    }
+    SendMessageW(edit, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(folder.c_str()));
+    PostMessageW(dialog, WM_COMMAND, IDOK, 0);
+}
+
+// Clicks the element named `name` through UI Automation, on a worker thread (a browser may
+// return from the click only once the dialog it opened closes).
+struct ClickRequest {
+    HWND hwnd;
+    std::wstring name;
+};
+DWORD WINAPI ClickThread(LPVOID param) {
+    std::unique_ptr<ClickRequest> req(static_cast<ClickRequest*>(param));
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    IUIAutomation* uia = nullptr;
+    CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&uia));
+    IUIAutomationElement* root = nullptr;
+    if (uia) uia->ElementFromHandle(req->hwnd, &root);
+    VARIANT v;
+    v.vt = VT_BSTR;
+    v.bstrVal = SysAllocString(req->name.c_str());
+    IUIAutomationCondition* cond = nullptr;
+    if (uia) uia->CreatePropertyCondition(UIA_NamePropertyId, v, &cond);
+    IUIAutomationElement* el = nullptr;
+    for (int i = 0; i < 30 && root && cond && !el; i++) {
+        root->FindFirst(TreeScope_Descendants, cond, &el);
+        if (!el) Sleep(500);
+    }
+    if (el) {
+        IUIAutomationInvokePattern* invoke = nullptr;
+        el->GetCurrentPatternAs(UIA_InvokePatternId, IID_PPV_ARGS(&invoke));
+        if (invoke) {
+            invoke->Invoke();
+            invoke->Release();
+        }
+        el->Release();
+    } else {
+        Print(L"\"" + req->name + L"\" not found");
+    }
+    VariantClear(&v);
+    if (cond) cond->Release();
+    if (root) root->Release();
+    if (uia) uia->Release();
+    CoUninitialize();
+    return 0;
+}
+HANDLE ClickAsync(HWND hwnd, const std::wstring& name) {
+    return CreateThread(nullptr, 0, ClickThread, new ClickRequest{hwnd, name}, 0, nullptr);
+}
+
+PROCESS_INFORMATION StartProcess(const std::wstring& cmdLine, bool dialogSupport = true) {
+    std::wstring c = cmdLine;
+    STARTUPINFOW si = {sizeof(si)};
+    PROCESS_INFORMATION pi = {};
+    if (!dialogSupport) SetEnvironmentVariableW(L"EXPLORERPINNED_NO_DIALOG", L"1");
+    if (!CreateProcessW(nullptr, c.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) Print(L"cannot start " + cmdLine);
+    SetEnvironmentVariableW(L"EXPLORERPINNED_NO_DIALOG", nullptr);
+    return pi;
+}
+
+void CloseDialog(HWND dialog, PROCESS_INFORMATION& pi) {
+    PostMessageW(dialog, WM_COMMAND, IDCANCEL, 0);
+    if (pi.hProcess) {
+        DWORD start = GetTickCount();
+        while (WaitForSingleObject(pi.hProcess, 0) == WAIT_TIMEOUT && GetTickCount() - start < 10000) Pump(50);
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    pi = {};
+    Pump(500);
+}
+
+bool ExpectDialogPinned(HWND dialog, const std::set<std::wstring>& expected, const std::wstring& what) {
+    Groups last;
+    bool ok = WaitFor(
+        [&] {
+            last = ReadGroups(dialog);
+            return !last.order.empty() && IsPinnedLabel(last.order[0]) && last.First() == expected;
+        },
+        15000);
+    std::vector<std::wstring> exp(expected.begin(), expected.end());
+    Check(ok, what, L"expected pinned {" + Join(exp) + L"}, got " + last.Describe());
+    return ok;
+}
+
+// What the folder shows in a dialog without dialog support: the grouping saved for it.
+void ExpectSavedGroupingKept(const std::wstring& host, const std::wstring& folder, const std::wstring& what) {
+    PROCESS_INFORMATION pi = StartProcess(L"\"" + host + L"\" host \"" + folder + L"\"", /*dialogSupport=*/false);
+    HWND dialog = WaitFileDialogOf(pi.dwProcessId);
+    Groups last;
+    bool ok = dialog && WaitFor(
+                            [&] {
+                                last = ReadGroups(dialog);
+                                return !last.order.empty() && last.order == std::vector<std::wstring>{L"(none)"};
+                            },
+                            8000);
+    Check(ok, what, last.Describe());
+    if (dialog) CloseDialog(dialog, pi);
+}
+
+std::wstring ProgramFilesDir() {
+    PWSTR p = nullptr;
+    std::wstring result;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_ProgramFiles, 0, nullptr, &p))) result = p;
+    CoTaskMemFree(p);
+    return result;
+}
+
+bool MachineKeyExists(const std::wstring& key, REGSAM view) {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, key.c_str(), 0, KEY_READ | view, &k) != ERROR_SUCCESS) return false;
+    RegCloseKey(k);
+    return true;
+}
+
+const wchar_t kOverlayKey[] = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\ShellIconOverlayIdentifiers\\    ExplorerPinned";
+const wchar_t kTestBag[] =
+    L"Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\Bags\\99999\\ComDlg\\{7D49D726-3C21-4F05-99AA-FDC2C9474656}";
+
+// The upload dialog of a web browser, opened from a page with a file button.
+void BrowserUploadTest(const wchar_t* name, const wchar_t* exeName, const std::vector<std::wstring>& candidates,
+                       const std::wstring& folder, const std::set<std::wstring>& expected) {
+    std::wstring exe;
+    for (const auto& c : candidates)
+        if (PathExists(c)) exe = c;
+    if (exe.empty()) {
+        Print(std::wstring(name) + L" is not installed; skipped");
+        return;
+    }
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    std::wstring page = std::wstring(tmp) + L"ep_upload.html";
+    {
+        HANDLE h = CreateFileW(page.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        const char html[] = "<!doctype html><title>ep-upload</title><input type=file id=f style=display:none>"
+                            "<button onclick=\"document.getElementById('f').click()\">pickfile</button>";
+        DWORD w;
+        WriteFile(h, html, sizeof(html) - 1, &w, nullptr);
+        CloseHandle(h);
+    }
+    std::wstring url = L"file:///" + page;
+    std::replace(url.begin(), url.end(), L'\\', L'/');
+    std::wstring profile = std::wstring(tmp) + L"ep_profile_" + name;
+    std::wstring cmd = L"\"" + exe + L"\" --user-data-dir=\"" + profile +
+                       L"\" --no-first-run --no-default-browser-check --disable-search-engine-choice-screen "
+                       L"--force-renderer-accessibility \"" + url + L"\"";
+    // The browser starts more processes; a job ends them all.
+    HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limit = {};
+    limit.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limit, sizeof(limit));
+    STARTUPINFOW si = {sizeof(si)};
+    PROCESS_INFORMATION pi = {};
+    std::wstring what = std::wstring(name) + L" upload dialog: pinned group on top";
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_SUSPENDED, nullptr, nullptr, &si, &pi)) {
+        Check(false, what, L"cannot start " + exe);
+        CloseHandle(job);
+        return;
+    }
+    AssignProcessToJobObject(job, pi.hProcess);
+    ResumeThread(pi.hThread);
+    auto isBrowser = [exeName](DWORD pid) { return _wcsicmp(ImageName(pid).c_str(), exeName) == 0; };
+    HWND window = WaitWindow(isBrowser, L"ep-upload", 30000);
+    HWND dialog = nullptr;
+    if (window) {
+        Pump(2000);
+        CloseHandle(ClickAsync(window, L"pickfile"));
+        dialog = WaitWindow(isBrowser, nullptr, 25000);
+    }
+    if (dialog) {
+        Pump(1500);
+        NavigateDialog(dialog, folder);
+        ExpectDialogPinned(dialog, expected, what);
+        PostMessageW(dialog, WM_COMMAND, IDCANCEL, 0);
+        Pump(1500);
+    } else {
+        Check(false, what, window ? L"no dialog" : L"no browser window");
+    }
+    TerminateJobObject(job, 0);
+    CloseHandle(job);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    Pump(1000);
+}
+
+void FileDialogTests(const std::wstring& binDir) {
+    // The DLL is loaded by every program that shows a file dialog: it is only registered
+    // from Program Files, where only administrators can change it.
+    Check(RunExe(L"register-dialogs") != 0, L"dialog support is not registered from a user-writable folder");
+    std::wstring installed = ProgramFilesDir() + L"\\Explorer Pinned E2E";
+    SHCreateDirectoryExW(nullptr, installed.c_str(), nullptr);
+    CopyFileW(g_exe.c_str(), (installed + L"\\ExplorerPinned.exe").c_str(), FALSE);
+    CopyFileW((binDir + L"\\ExplorerPinnedShell.dll").c_str(), (installed + L"\\ExplorerPinnedShell.dll").c_str(), FALSE);
+    CopyFileW((binDir + L"\\x86\\ExplorerPinnedShell32.dll").c_str(), (installed + L"\\ExplorerPinnedShell32.dll").c_str(), FALSE);
+    {
+        std::wstring saved = g_exe;
+        g_exe = installed + L"\\ExplorerPinned.exe";
+        Check(RunExe(L"register-dialogs") == 0, L"register-dialogs exits with 0");
+        g_exe = saved;
+    }
+    std::wstring status = RunExeOutput(L"status");
+    Check(status.find(L"dialogs: registered (on)") != std::wstring::npos && status.find(L"ExplorerPinnedShell32.dll") != std::wstring::npos,
+          L"dialog support registered for 64-bit and 32-bit programs", status);
+
+    std::wstring folder = g_dir + L"\\dialog";
+    SHCreateDirectoryExW(nullptr, (folder + L"\\subfolder_ep").c_str(), nullptr);
+    TouchFile(folder + L"\\d1.txt", 2020);
+    TouchFile(folder + L"\\d2.txt", 2021);
+    TouchFile(folder + L"\\d3.txt", 2022);
+    TouchFile(folder + L"\\subfolder_ep\\s1.txt", 2022);
+    RunExe(L"pin \"" + folder + L"\\d2.txt\" \"" + folder + L"\\subfolder_ep\"");
+    std::wstring self = binDir + L"\\ExplorerPinnedE2E.exe";
+    std::wstring hostCmd = L"\"" + self + L"\" host \"" + folder + L"\"";
+
+    // Pinned group, and changes to the pins while the dialog is open
+    PROCESS_INFORMATION pi = StartProcess(hostCmd);
+    HWND dialog = WaitFileDialogOf(pi.dwProcessId);
+    Check(dialog != nullptr, L"file dialog opens");
+    if (dialog) {
+        ExpectDialogPinned(dialog, {L"d2", L"subfolder_ep"}, L"file dialog: pinned group on top");
+        RunExe(L"unpin \"" + folder + L"\\d2.txt\"");
+        ExpectDialogPinned(dialog, {L"subfolder_ep"}, L"file dialog: unpinning updates the open dialog");
+        RunExe(L"pin \"" + folder + L"\\d2.txt\"");
+        ExpectDialogPinned(dialog, {L"d2", L"subfolder_ep"}, L"file dialog: pinning updates the open dialog");
+        CloseDialog(dialog, pi);
+    }
+    // Dialogs save the grouping of a folder when they leave it: it must be the folder's own.
+    ExpectSavedGroupingKept(self, folder, L"file dialog: closing leaves the folder's grouping as it was");
+
+    pi = StartProcess(hostCmd);
+    dialog = WaitFileDialogOf(pi.dwProcessId);
+    if (dialog) {
+        ExpectDialogPinned(dialog, {L"d2", L"subfolder_ep"}, L"file dialog: pinned group before opening a subfolder");
+        HANDLE click = ClickAsync(dialog, L"subfolder_ep");
+        WaitForSingleObject(click, 20000);
+        CloseHandle(click);
+        Pump(2000);
+        CloseDialog(dialog, pi);
+    }
+    ExpectSavedGroupingKept(self, folder, L"file dialog: opening a subfolder leaves the folder's grouping as it was");
+
+    // Turned off and on in the notification area menu (the setting is read while dialogs are open)
+    pi = StartProcess(hostCmd);
+    dialog = WaitFileDialogOf(pi.dwProcessId);
+    if (dialog) {
+        ExpectDialogPinned(dialog, {L"d2", L"subfolder_ep"}, L"file dialog: pinned group before turning it off");
+        RegWriteString(HKEY_CURRENT_USER, kRegRoot, L"Dialogs", L"0");
+        Groups last;
+        Check(WaitFor(
+                  [&] {
+                      last = ReadGroups(dialog);
+                      return last.order == std::vector<std::wstring>{L"(none)"};
+                  },
+                  10000),
+              L"file dialog: turning it off restores the open dialog", last.Describe());
+        Check(RunExeOutput(L"status").find(L"dialogs: registered (off)") != std::wstring::npos, L"status shows dialog support off");
+        RegWriteString(HKEY_CURRENT_USER, kRegRoot, L"Dialogs", L"1");
+        ExpectDialogPinned(dialog, {L"d2", L"subfolder_ep"}, L"file dialog: turning it on again");
+        CloseDialog(dialog, pi);
+    }
+
+    // A 32-bit program
+    std::wstring host32 = binDir + L"\\x86\\ExplorerPinnedE2E.exe";
+    pi = StartProcess(L"\"" + host32 + L"\" host \"" + folder + L"\"");
+    dialog = pi.hProcess ? WaitFileDialogOf(pi.dwProcessId) : nullptr;
+    Check(dialog != nullptr, L"file dialog of a 32-bit program opens", host32);
+    if (dialog) {
+        ExpectDialogPinned(dialog, {L"d2", L"subfolder_ep"}, L"file dialog of a 32-bit program: pinned group on top");
+        CloseDialog(dialog, pi);
+    }
+
+    // Web browsers (choosing a file to upload)
+    wchar_t pf[MAX_PATH], pf86[MAX_PATH];
+    ExpandEnvironmentStringsW(L"%ProgramFiles%", pf, MAX_PATH);
+    ExpandEnvironmentStringsW(L"%ProgramFiles(x86)%", pf86, MAX_PATH);
+    BrowserUploadTest(L"Edge", L"msedge.exe",
+                      {std::wstring(pf86) + L"\\Microsoft\\Edge\\Application\\msedge.exe",
+                       std::wstring(pf) + L"\\Microsoft\\Edge\\Application\\msedge.exe"},
+                      folder, {L"d2", L"subfolder_ep"});
+    BrowserUploadTest(L"Chrome", L"chrome.exe",
+                      {std::wstring(pf86) + L"\\Google\\Chrome\\Application\\chrome.exe",
+                       std::wstring(pf) + L"\\Google\\Chrome\\Application\\chrome.exe"},
+                      folder, {L"d2", L"subfolder_ep"});
+    ExpectSavedGroupingKept(self, folder, L"browser upload dialogs leave the folder's grouping as it was");
+    RunExe(L"unpin \"" + folder + L"\\d2.txt\" \"" + folder + L"\\subfolder_ep\"");
+
+    // A grouping that a program left behind (it ended while showing a pinned folder); uninstall resets it.
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kTestBag, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &k, nullptr) == ERROR_SUCCESS) {
+        RegSetValueExW(k, L"GroupByKey:FMTID", 0, REG_SZ, reinterpret_cast<const BYTE*>(kPinStateFormatId),
+                       sizeof(kPinStateFormatId));
+        DWORD pid = 2;
+        RegSetValueExW(k, L"GroupByKey:PID", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&pid), sizeof(pid));
+        RegCloseKey(k);
+    }
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
     SetConsoleOutputCP(CP_UTF8);
+    if (argc >= 3 && wcscmp(argv[1], L"host") == 0) return HostDialog(argv[2]);
     if (argc < 2) {
         Print(L"usage: ExplorerPinnedE2E <ExplorerPinned.exe> [screenshot directory]");
         return 100;
@@ -979,6 +1371,13 @@ int wmain(int argc, wchar_t** argv) {
         Check(CountLogLines(L"giving up") == 0, L"large folders: the agent never gave up");
     }
 
+    // --- file dialogs (Open/Save, uploads in web browsers)
+    {
+        wchar_t self[MAX_PATH];
+        GetModuleFileNameW(nullptr, self, MAX_PATH);
+        FileDialogTests(ParentPath(self));
+    }
+
     // --- the schema can be re-registered in another language
     Print(L"schemas before: " + RegisteredSchemas());
     Check(RunExe(L"register-schema --lang en") == 0, L"register-schema in English");
@@ -1088,6 +1487,17 @@ int wmain(int argc, wchar_t** argv) {
         Check(!PathExists(std::wstring(programData) + L"\\ExplorerPinned"), L"uninstall removes the schema file");
         auto file = MenuItems(g_dir + L"\\alpha.txt");
         Check(!Contains(file, pinLabel), L"uninstall removes the menu", Join(file));
+        Check(!MachineKeyExists(kOverlayKey, KEY_WOW64_64KEY) && !MachineKeyExists(kOverlayKey, KEY_WOW64_32KEY),
+              L"uninstall unregisters the dialog support");
+        std::wstring fmtid;
+        RegReadString(HKEY_CURRENT_USER, kTestBag, L"GroupByKey:FMTID", &fmtid);
+        Check(fmtid == L"{00000000-0000-0000-0000-000000000000}", L"uninstall resets groupings that dialogs saved", fmtid);
+        RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\Bags\\99999");
+        // Best effort: programs that showed a dialog may still have the DLL loaded.
+        std::wstring installed = ProgramFilesDir() + L"\\Explorer Pinned E2E";
+        for (const wchar_t* f : {L"\\ExplorerPinned.exe", L"\\ExplorerPinnedShell.dll", L"\\ExplorerPinnedShell32.dll"})
+            DeleteFileW((installed + f).c_str());
+        RemoveDirectoryW(installed.c_str());
     }
 
     w.browser->Quit();

@@ -54,6 +54,10 @@ english.Registering=Registering the "Pinned" group...
 [Files]
 Source: "{#BinDir}\x64\{#AppExe}"; DestDir: "{app}"; Check: not IsArm64; Flags: ignoreversion
 Source: "{#BinDir}\arm64\{#AppExe}"; DestDir: "{app}"; Check: IsArm64; Flags: ignoreversion
+; File dialog support. Loaded by programs that show a file dialog, so it can be in use.
+Source: "{#BinDir}\x64\ExplorerPinnedShell.dll"; DestDir: "{app}"; Check: not IsArm64; Flags: ignoreversion uninsrestartdelete
+Source: "{#BinDir}\arm64\ExplorerPinnedShell.dll"; DestDir: "{app}"; Check: IsArm64; Flags: ignoreversion uninsrestartdelete
+Source: "{#BinDir}\x86\ExplorerPinnedShell32.dll"; DestDir: "{app}"; Flags: ignoreversion uninsrestartdelete
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"
 Source: "..\README.md"; DestDir: "{app}"
 
@@ -63,6 +67,7 @@ Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; Parameters: "age
 [Run]
 ; Machine-wide part (needs administrator rights): the property behind the "Pinned" group.
 Filename: "{app}\{#AppExe}"; Parameters: "register-schema --lang {language}"; StatusMsg: "{cm:Registering}"; Flags: runhidden waituntilterminated
+Filename: "{app}\{#AppExe}"; Parameters: "register-dialogs"; StatusMsg: "{cm:Registering}"; Flags: runhidden waituntilterminated
 ; Per-user part: right-click menu entries and the start-up entry.
 Filename: "{app}\{#AppExe}"; Parameters: "setup --quiet --no-agent --lang {language}"; Flags: runasoriginaluser runhidden waituntilterminated
 Filename: "{app}\{#AppExe}"; Parameters: "agent"; Description: "{cm:StartNow}"; Flags: runasoriginaluser nowait postinstall
@@ -72,8 +77,25 @@ Filename: "{app}\{#AppExe}"; Parameters: "uninstall --quiet"; RunOnceId: "Remove
 
 [UninstallDelete]
 Type: files; Name: "{app}\ExplorerPinned.propdesc"
+Type: files; Name: "{app}\*.old"
 
 [Code]
+// A DLL that a running program has loaded cannot be replaced, but it can be renamed: the
+// new version goes in its place (programs started later load it) and the old file is
+// deleted on the next restart.
+procedure MoveAside(const Name: String);
+var
+  Path, Old: String;
+begin
+  Path := ExpandConstant('{app}\' + Name);
+  if FileExists(Path) and not DeleteFile(Path) then
+  begin
+    Old := Path + '.' + GetDateTimeString('yyyymmddhhnnss', #0, #0) + '.old';
+    if RenameFile(Path, Old) then
+      RestartReplace(Old, '');
+  end;
+end;
+
 // Stop a running agent before its executable is replaced.
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
@@ -81,5 +103,7 @@ var
 begin
   if FileExists(ExpandConstant('{app}\{#AppExe}')) then
     Exec(ExpandConstant('{app}\{#AppExe}'), 'exit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  MoveAside('ExplorerPinnedShell.dll');
+  MoveAside('ExplorerPinnedShell32.dll');
   Result := '';
 end;

@@ -17,6 +17,7 @@
 
 #include "comutil.h"
 #include "pinstore.h"
+#include "dialogs.h"
 #include "util.h"
 
 namespace ep {
@@ -24,12 +25,6 @@ namespace {
 
 // {432E90E6-6BCF-44FE-9F87-8BA191F04870}
 const CLSID kOverlayClsid = {0x432e90e6, 0x6bcf, 0x44fe, {0x9f, 0x87, 0x8b, 0xa1, 0x91, 0xf0, 0x48, 0x70}};
-constexpr wchar_t kOverlayClsidString[] = L"{432E90E6-6BCF-44FE-9F87-8BA191F04870}";
-// Windows loads the overlay handlers in the order of these names and uses only the first
-// 15 overlays. The leading spaces get this handler loaded before the others; it takes no
-// overlay slot (GetOverlayInfo fails), so the overlays of other programs are not affected.
-constexpr wchar_t kOverlayKey[] =
-    L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\ShellIconOverlayIdentifiers\\    ExplorerPinned";
 
 constexpr UINT kGetShellBrowser = WM_USER + 7;  // WM_GETISHELLBROWSER, answered by shell browser windows
 constexpr DWORD kPollMs = 700;
@@ -221,8 +216,7 @@ ComPtr<IFolderView2> ViewOf(HWND dialog) {
 void BeforeLeave(HWND dialog) {
     if (!t_dialogs) return;
     auto it = t_dialogs->find(dialog);
-    if (it == t_dialogs->end() || !it->second.grouped || GetEnvironmentVariableW(L"EXPLORERPINNED_NO_RESTORE", nullptr, 0))
-        return;
+    if (it == t_dialogs->end() || !it->second.grouped) return;
     ComPtr<IFolderView2> view = ViewOf(dialog);
     PROPERTYKEY groupKey = {};
     BOOL ascending = TRUE;
@@ -307,6 +301,12 @@ bool IsCloseCommand(UINT message, WPARAM wp) {
 
 // Runs on the dialog's thread.
 void ProcessDialog(HWND dialog) {
+    if (!DialogsSettingOn()) {
+        // Turned off in the notification area menu: leave the dialog as it was.
+        BeforeLeave(dialog);
+        ForgetDialog(dialog);
+        return;
+    }
     ComPtr<IFolderView2> view = ViewOf(dialog);
     if (!view) return;
     if (!t_dialogs) t_dialogs = new std::map<HWND, Dialog>();
@@ -419,6 +419,7 @@ LRESULT CALLBACK CallWndProcHook(int code, WPARAM wp, LPARAM lp) {
 }
 
 std::set<DWORD>* g_hookedThreads = nullptr;  // worker thread only
+bool g_settingOn = true;                     // worker thread only
 
 BOOL CALLBACK VisitWindow(HWND hwnd, LPARAM) {
     DWORD pid = 0;
@@ -428,6 +429,7 @@ BOOL CALLBACK VisitWindow(HWND hwnd, LPARAM) {
     if (!GetClassNameW(hwnd, cls, ARRAYSIZE(cls)) || wcscmp(cls, L"#32770") != 0) return TRUE;
     if (!FindDefView(hwnd)) return TRUE;
     if (!g_hookedThreads->count(tid)) {
+        if (!g_settingOn) return TRUE;
         // A hook on the dialog's thread lets the work run there, where the view lives.
         if (!SetWindowsHookExW(WH_GETMESSAGE, GetMessageHook, g_module, tid)) return TRUE;
         SetWindowsHookExW(WH_CALLWNDPROC, CallWndProcHook, g_module, tid);
@@ -441,26 +443,24 @@ DWORD WINAPI Worker(void*) {
     g_hookedThreads = new std::set<DWORD>();
     for (;;) {
         Sleep(kPollMs);
+        // While turned off, only dialogs that were already handled are visited (to restore them).
+        g_settingOn = DialogsSettingOn();
         EnumWindows(VisitWindow, 0);
     }
 }
 
-bool DialogsEnabled() {
+// Explorer windows are handled by the agent.
+bool ProcessAllowed() {
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    std::wstring name = FileNamePart(exe);
-    // Explorer windows are handled by the agent.
-    if (PathEqualsI(name, L"explorer.exe")) return false;
-    if (GetEnvironmentVariableW(L"EXPLORERPINNED_NO_DIALOG", nullptr, 0) > 0) return false;
-    std::wstring setting;
-    if (RegReadString(HKEY_CURRENT_USER, kRegRoot, L"Dialogs", &setting) && setting == L"0") return false;
-    return true;
+    if (PathEqualsI(FileNamePart(exe), L"explorer.exe")) return false;
+    return GetEnvironmentVariableW(L"EXPLORERPINNED_NO_DIALOG", nullptr, 0) == 0;
 }
 
 void StartOnce() {
     static LONG started = 0;
     if (InterlockedExchange(&started, 1)) return;
-    if (!DialogsEnabled()) return;
+    if (!ProcessAllowed()) return;
     // The hooks and the worker run code from this DLL until the process ends.
     HMODULE self = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
@@ -562,23 +562,14 @@ STDAPI DllGetClassObject(REFCLSID clsid, REFIID riid, void** ppv) {
 // Stays loaded once dialog support has started (see StartOnce).
 STDAPI DllCanUnloadNow() { return g_objects == 0 ? S_OK : S_FALSE; }
 
+// regsvr32 support; the program registers the DLLs itself (see dialogs.cpp).
 STDAPI DllRegisterServer() {
     wchar_t path[MAX_PATH];
     GetModuleFileNameW(g_module, path, MAX_PATH);
-    std::wstring clsidKey = std::wstring(L"Software\\Classes\\CLSID\\") + kOverlayClsidString;
-    bool ok = RegWriteString(HKEY_LOCAL_MACHINE, clsidKey, nullptr, L"Explorer Pinned (file dialogs)") &&
-              RegWriteString(HKEY_LOCAL_MACHINE, clsidKey + L"\\InprocServer32", nullptr, path) &&
-              RegWriteString(HKEY_LOCAL_MACHINE, clsidKey + L"\\InprocServer32", L"ThreadingModel", L"Apartment") &&
-              RegWriteString(HKEY_LOCAL_MACHINE, kOverlayKey, nullptr, kOverlayClsidString);
-    RegWriteString(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows\\CurrentVersion\\Shell Extensions\\Approved",
-                   kOverlayClsidString, L"Explorer Pinned (file dialogs)");
-    return ok ? S_OK : E_ACCESSDENIED;
+    return RegisterDialogExtension(0, path) ? S_OK : E_ACCESSDENIED;
 }
 
 STDAPI DllUnregisterServer() {
-    RegDeleteTreeW(HKEY_LOCAL_MACHINE, kOverlayKey);
-    RegDeleteTreeW(HKEY_LOCAL_MACHINE, (std::wstring(L"Software\\Classes\\CLSID\\") + kOverlayClsidString).c_str());
-    RegDeleteValueIn(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows\\CurrentVersion\\Shell Extensions\\Approved",
-                     kOverlayClsidString);
+    UnregisterDialogExtension(0);
     return S_OK;
 }

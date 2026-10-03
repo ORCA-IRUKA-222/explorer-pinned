@@ -25,17 +25,20 @@ jobs:
     runs-on: windows-2022
     strategy:
       matrix:
-        arch: [x64, arm64]
+        # x86: the file dialog DLL for 32-bit programs (and a 32-bit test program)
+        arch: [x64, arm64, x86]
     steps:
       - uses: actions/checkout@v4
       - name: Configure
-        run: cmake -B build -G "Visual Studio 17 2022" -A ${{ matrix.arch == 'x64' && 'x64' || 'ARM64' }} -DEP_BUILD_TESTS=${{ matrix.arch == 'x64' && 'ON' || 'OFF' }}
+        run: cmake -B build -G "Visual Studio 17 2022" -A ${{ matrix.arch == 'x64' && 'x64' || matrix.arch == 'arm64' && 'ARM64' || 'Win32' }} -DEP_BUILD_TESTS=${{ matrix.arch == 'arm64' && 'OFF' || 'ON' }}
       - name: Build
         run: cmake --build build --config Release
       - uses: actions/upload-artifact@v4
         with:
           name: bin-${{ matrix.arch }}
-          path: build/Release/*.exe
+          path: |
+            build/Release/*.exe
+            build/Release/*.dll
           if-no-files-found: error
 
   e2e:
@@ -52,6 +55,10 @@ jobs:
         with:
           name: bin-x64
           path: bin
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-x86
+          path: bin/x86
       - name: Run
         shell: pwsh
         run: |
@@ -103,6 +110,10 @@ jobs:
         with:
           name: bin-arm64
           path: dist/arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-x86
+          path: dist/x86
       - name: Read version
         id: version
         shell: pwsh
@@ -168,6 +179,26 @@ jobs:
           $menu = (Get-ItemProperty -LiteralPath "HKCU:\Software\Classes\*\shell\ExplorerPinned.Pin").MUIVerb
           Write-Host "menu text: $menu"
           if ($menu -ne "このファイルをピン止めする") { throw "unexpected menu text" }
+          if ($status -notmatch "dialogs: registered \(on\)") { throw "file dialog support not registered" }
+          $overlay = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers\    ExplorerPinned"
+          $overlay32 = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers\    ExplorerPinned"
+          if (-not (Test-Path -LiteralPath $overlay) -or -not (Test-Path -LiteralPath $overlay32)) { throw "dialog DLLs not registered" }
+
+          # Installing again while a program has the dialog DLL loaded (it is moved aside).
+          $dll = "$env:ProgramFiles\Explorer Pinned\ExplorerPinnedShell.dll"
+          $handle = [System.Runtime.InteropServices.NativeLibrary]::Load($dll)
+          $p = Start-Process $setup.FullName -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LANG=japanese", "/LOG=reinstall.log" -PassThru
+          $null = $p.Handle
+          if (-not $p.WaitForExit(300000)) { throw "second setup timed out" }
+          Start-Sleep -Seconds 3
+          if ($p.ExitCode -ne 0) { Get-Content reinstall.log; throw "second setup failed: $($p.ExitCode)" }
+          if (-not (Test-Path $dll)) { throw "DLL missing after installing again" }
+          $old = Get-ChildItem "$env:ProgramFiles\Explorer Pinned\ExplorerPinnedShell.dll.*.old"
+          Write-Host "moved aside: $($old.Name)"
+          if (-not $old) { throw "the loaded DLL was not moved aside" }
+          [System.Runtime.InteropServices.NativeLibrary]::Free($handle)
+          $status = & $exe status | Out-String
+          if ($status -notmatch "dialogs: registered \(on\)") { throw "file dialog support not registered after installing again" }
 
           $uninstaller = Get-ChildItem "$env:ProgramFiles\Explorer Pinned\unins*.exe" | Select-Object -First 1
           $p = Start-Process $uninstaller.FullName -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -PassThru
@@ -185,6 +216,8 @@ jobs:
             ForEach-Object { (Get-ItemProperty $_.PSPath).PSObject.Properties.Value } | Where-Object { "$_" -like "*ExplorerPinned*" }
           if ($schemas) { throw "schema left behind: $schemas" }
           if (Get-Process ExplorerPinned -ErrorAction SilentlyContinue) { throw "agent still running" }
+          if ((Test-Path -LiteralPath $overlay) -or (Test-Path -LiteralPath $overlay32)) { throw "dialog DLLs still registered" }
+          if (Test-Path "HKLM:\SOFTWARE\Classes\CLSID\{432E90E6-6BCF-44FE-9F87-8BA191F04870}") { throw "DLL class left behind" }
           Write-Host "installer test passed"
 
   release:

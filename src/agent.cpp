@@ -12,6 +12,7 @@
 #include <set>
 
 #include "comutil.h"
+#include "dialogs.h"
 #include "displaycheck.h"
 #include "pinstore.h"
 #include "resource.h"
@@ -49,6 +50,7 @@ constexpr UINT kCmdCleanup = 2;
 constexpr UINT kCmdStartup = 3;
 constexpr UINT kCmdWebsite = 4;
 constexpr UINT kCmdExit = 5;
+constexpr UINT kCmdDialogs = 6;
 constexpr UINT kCmdOpenBase = 1000;   // + index into the pin list
 constexpr UINT kCmdUnpinBase = 3000;  // + index into the pin list
 constexpr size_t kMaxMenuPins = 100;
@@ -965,6 +967,8 @@ void Agent::ShowTrayMenu() {
     AppendMenuW(menu, MF_STRING, kCmdCleanup, LoadStr(IDS_TRAY_CLEANUP).c_str());
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (IsStartupEnabled() ? MF_CHECKED : 0), kCmdStartup, LoadStr(IDS_TRAY_STARTUP).c_str());
+    if (!RegisteredDialogExtension(KEY_WOW64_64KEY).empty())
+        AppendMenuW(menu, MF_STRING | (DialogsSettingOn() ? MF_CHECKED : 0), kCmdDialogs, LoadStr(IDS_TRAY_DIALOGS).c_str());
     AppendMenuW(menu, MF_STRING, kCmdWebsite, LoadStr(IDS_TRAY_WEBSITE).c_str());
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kCmdExit, LoadStr(IDS_TRAY_EXIT).c_str());
@@ -1011,6 +1015,10 @@ void Agent::OnCommand(UINT id) {
         }
         case kCmdStartup:
             SetStartupEnabled(!IsStartupEnabled());
+            break;
+        case kCmdDialogs:
+            // Open dialogs follow within a second.
+            SetDialogsSetting(!DialogsSettingOn());
             break;
         case kCmdWebsite:
             ShellExecuteW(nullptr, L"open", kProjectUrl, nullptr, nullptr, SW_SHOWNORMAL);
