@@ -71,6 +71,33 @@ bool IsPinKey(const PROPERTYKEY& key) {
            IsEqualPropertyKey(key, kLegacyPinStateKeys[1]);
 }
 
+// The grouping a folder had in dialogs before it was grouped by pins; dialogs save their view
+// state per folder, so a dialog opened later may already show the pinned grouping.
+void SavePreviousGrouping(const std::wstring& folder, const PROPERTYKEY& key, BOOL ascending) {
+    std::wstring existing;
+    if (RegReadString(HKEY_CURRENT_USER, kRegPreviousDialogGroupBy, folder.c_str(), &existing)) return;
+    wchar_t guid[64];
+    StringFromGUID2(key.fmtid, guid, ARRAYSIZE(guid));
+    RegWriteString(HKEY_CURRENT_USER, kRegPreviousDialogGroupBy, folder.c_str(),
+                   std::wstring(guid) + L"," + std::to_wstring(key.pid) + L"," + (ascending ? L"1" : L"0"));
+}
+
+void ReadPreviousGrouping(const std::wstring& folder, PROPERTYKEY* key, BOOL* ascending) {
+    *key = PROPERTYKEY{GUID_NULL, 0};
+    *ascending = TRUE;
+    std::wstring value;
+    if (!RegReadString(HKEY_CURRENT_USER, kRegPreviousDialogGroupBy, folder.c_str(), &value)) return;
+    size_t c1 = value.find(L',');
+    size_t c2 = value.find(L',', c1 + 1);
+    GUID g;
+    if (c1 == std::wstring::npos || c2 == std::wstring::npos || FAILED(CLSIDFromString(value.substr(0, c1).c_str(), &g)))
+        return;
+    PROPERTYKEY k = {g, (DWORD)wcstoul(value.substr(c1 + 1, c2 - c1 - 1).c_str(), nullptr, 10)};
+    if (IsPinKey(k)) return;
+    *key = k;
+    *ascending = value.substr(c2 + 1) != L"0";
+}
+
 PITEMID_CHILD ParseChild(IShellFolder* folder, const std::wstring& name) {
     PIDLIST_RELATIVE pidl = nullptr;
     std::wstring buf = name;
@@ -90,9 +117,6 @@ struct Dialog {
     NameSet applied[2];
     NameSet lastNames;
     bool grouped = false;  // the pinned grouping was applied to this view
-    bool havePrevious = false;
-    PROPERTYKEY previous = {};
-    BOOL previousAscending = TRUE;
     DWORD lastRegroup = 0;
     int attempts = 0;
     bool gaveUp = false;
@@ -171,14 +195,48 @@ HWND FindDefView(HWND parent) {
     return found;
 }
 
-// Runs on the dialog's thread.
-void ProcessDialog(HWND dialog) {
+void RestoreGrouping(Dialog& d, IFolderView2* view) {
+    PROPERTYKEY key;
+    BOOL ascending;
+    ReadPreviousGrouping(d.folderPath, &key, &ascending);
+    view->SetGroupBy(key, ascending);
+    d.grouped = false;
+    LogLine(L"dialog: restore grouping %s", d.folderPath.c_str());
+}
+
+ComPtr<IFolderView2> ViewOf(HWND dialog) {
     HWND defView = FindDefView(dialog);
-    if (!defView) return;
+    if (!defView) return ComPtr<IFolderView2>();
     ComPtr<IShellBrowser> browser = ShellBrowserOf(dialog, defView);
     ComPtr<IShellView> shellView;
-    if (!browser || FAILED(browser->QueryActiveShellView(shellView.Put())) || !shellView) return;
-    ComPtr<IFolderView2> view = shellView.As<IFolderView2>();
+    if (!browser || FAILED(browser->QueryActiveShellView(shellView.Put())) || !shellView) return ComPtr<IFolderView2>();
+    return shellView.As<IFolderView2>();
+}
+
+// The dialog is about to close (or to leave the folder for a typed path): put the original
+// grouping back first, since the dialog saves its view state for the folder.
+void BeforeClose(HWND dialog) {
+    if (!t_dialogs) return;
+    auto it = t_dialogs->find(dialog);
+    if (it == t_dialogs->end() || !it->second.grouped || GetEnvironmentVariableW(L"EXPLORERPINNED_NO_RESTORE", nullptr, 0))
+        return;
+    ComPtr<IFolderView2> view = ViewOf(dialog);
+    PROPERTYKEY groupKey = {};
+    BOOL ascending = TRUE;
+    if (view && SUCCEEDED(view->GetGroupBy(&groupKey, &ascending)) && IsPinKey(groupKey)) RestoreGrouping(it->second, view.Get());
+    // If the dialog stays open, group the view again.
+    it->second.attempts = 0;
+    it->second.lastRegroup = 0;
+}
+
+bool IsCloseCommand(UINT message, WPARAM wp) {
+    return (message == WM_COMMAND && (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL)) || message == WM_CLOSE ||
+           (message == WM_SYSCOMMAND && (wp & 0xFFF0) == SC_CLOSE);
+}
+
+// Runs on the dialog's thread.
+void ProcessDialog(HWND dialog) {
+    ComPtr<IFolderView2> view = ViewOf(dialog);
     if (!view) return;
     if (!t_dialogs) t_dialogs = new std::map<HWND, Dialog>();
     Dialog& d = (*t_dialogs)[dialog];
@@ -222,8 +280,8 @@ void ProcessDialog(HWND dialog) {
 
     if (names.empty()) {
         if (IsPinKey(groupKey)) {
-            view->SetGroupBy(d.havePrevious ? d.previous : PROPERTYKEY{GUID_NULL, 0}, d.havePrevious ? d.previousAscending : TRUE);
-            LogLine(L"dialog: restore grouping %s", d.folderPath.c_str());
+            RestoreGrouping(d, view.Get());
+            RegDeleteValueIn(HKEY_CURRENT_USER, kRegPreviousDialogGroupBy, d.folderPath.c_str());
         }
         d.grouped = false;
         d.lastNames.clear();
@@ -243,18 +301,14 @@ void ProcessDialog(HWND dialog) {
     if ((current < 0 && d.grouped && !pinsChanged) || d.gaveUp) return;
     if (d.attempts >= kMaxAttempts) {
         LogLine(L"dialog: grouping does not hold in %s; giving up", d.folderPath.c_str());
-        if (IsPinKey(groupKey)) view->SetGroupBy(d.havePrevious ? d.previous : PROPERTYKEY{GUID_NULL, 0}, TRUE);
+        if (IsPinKey(groupKey)) RestoreGrouping(d, view.Get());
         d.gaveUp = true;
         return;
     }
     if (now - d.lastRegroup < 1000) return;
 
     int key = current < 0 ? 0 : 1 - current;
-    if (current < 0 && !d.havePrevious && !IsPinKey(groupKey)) {
-        d.havePrevious = true;
-        d.previous = groupKey;
-        d.previousAscending = ascending;
-    }
+    if (current < 0 && !IsPinKey(groupKey)) SavePreviousGrouping(d.folderPath, groupKey, ascending);
     if (!WriteKey(d, view.Get(), folder.Get(), key, names)) return;  // items not in the view yet
     d.lastRegroup = now;
     d.attempts++;
@@ -268,11 +322,22 @@ void ProcessDialog(HWND dialog) {
 
 LRESULT CALLBACK GetMessageHook(int code, WPARAM wp, LPARAM lp) {
     MSG* msg = reinterpret_cast<MSG*>(lp);
-    if (code == HC_ACTION && wp == PM_REMOVE && msg->message == g_tickMessage && g_tickMessage) {
-        HWND dialog = msg->hwnd;
-        msg->message = WM_NULL;
-        ProcessDialog(dialog);
+    if (code == HC_ACTION && wp == PM_REMOVE) {
+        if (msg->message == g_tickMessage && g_tickMessage) {
+            HWND dialog = msg->hwnd;
+            msg->message = WM_NULL;
+            ProcessDialog(dialog);
+        } else if (IsCloseCommand(msg->message, msg->wParam)) {
+            BeforeClose(msg->hwnd);
+        }
     }
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
+
+// Sent messages: the buttons, Enter and Esc reach the dialog as a sent WM_COMMAND.
+LRESULT CALLBACK CallWndProcHook(int code, WPARAM wp, LPARAM lp) {
+    const CWPSTRUCT* msg = reinterpret_cast<const CWPSTRUCT*>(lp);
+    if (code == HC_ACTION && IsCloseCommand(msg->message, msg->wParam)) BeforeClose(msg->hwnd);
     return CallNextHookEx(nullptr, code, wp, lp);
 }
 
@@ -288,6 +353,7 @@ BOOL CALLBACK VisitWindow(HWND hwnd, LPARAM) {
     if (!g_hookedThreads->count(tid)) {
         // A hook on the dialog's thread lets the work run there, where the view lives.
         if (!SetWindowsHookExW(WH_GETMESSAGE, GetMessageHook, g_module, tid)) return TRUE;
+        SetWindowsHookExW(WH_CALLWNDPROC, CallWndProcHook, g_module, tid);
         g_hookedThreads->insert(tid);
     }
     PostMessageW(hwnd, g_tickMessage, 0, 0);

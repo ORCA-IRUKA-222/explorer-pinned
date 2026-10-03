@@ -188,6 +188,40 @@ static void CloseDialog(HWND dlg, PROCESS_INFORMATION& pi) {
     }
 }
 
+// Prints the view-state bags that mention the pinned property.
+static void DumpBags(HKEY root, const std::wstring& path, int depth) {
+    HKEY k;
+    if (RegOpenKeyExW(root, path.c_str(), 0, KEY_READ, &k) != ERROR_SUCCESS) return;
+    std::wstring lines;
+    bool ours = false;
+    wchar_t name[512];
+    BYTE data[4096];
+    for (DWORD i = 0;; i++) {
+        DWORD nl = 512, dl = sizeof(data), type = 0;
+        if (RegEnumValueW(k, i, name, &nl, NULL, &type, data, &dl) != ERROR_SUCCESS) break;
+        wchar_t line[1200];
+        if (type == REG_SZ) {
+            std::wstring v((wchar_t*)data);
+            if (_wcsnicmp(v.c_str(), L"{B1113708", 9) == 0) ours = true;
+            swprintf_s(line, L"    %s = %s", name, v.c_str());
+        } else if (type == REG_DWORD) {
+            swprintf_s(line, L"    %s = %lu", name, *(DWORD*)data);
+        } else {
+            swprintf_s(line, L"    %s (type %lu, %lu bytes)", name, type, dl);
+        }
+        lines += std::wstring(line) + L"\n";
+    }
+    if (ours) Log(L"  bag %s\n%s", path.c_str(), lines.c_str());
+    if (depth < 6) {
+        for (DWORD i = 0;; i++) {
+            DWORD nl = 512;
+            if (RegEnumKeyExW(k, i, name, &nl, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) break;
+            DumpBags(root, path + L"\\" + name, depth + 1);
+        }
+    }
+    RegCloseKey(k);
+}
+
 static int Host(const std::wstring& folder) {
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     IFileOpenDialog* d = NULL;
@@ -249,29 +283,76 @@ int wmain(int argc, wchar_t** argv) {
     }
     RegCloseKey(k);
 
-    Log(L"######## D1 an Open dialog of a test program");
-    PROCESS_INFORMATION host = Start(L"\"" + std::wstring(self) + L"\" host \"" + dir + L"\"");
+    std::wstring hostCmd = L"\"" + std::wstring(self) + L"\" host \"" + dir + L"\"";
+    auto check = [&](const wchar_t* label) {
+        PROCESS_INFORMATION h = Start(hostCmd, true);
+        HWND d = WaitDialog(h.dwProcessId, 15000);
+        if (d) {
+            Watch(d, 3000, label);
+            CloseDialog(d, h);
+        }
+    };
+    auto setPin = [&](const wchar_t* name, bool on) {
+        HKEY pk;
+        RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\ExplorerPinned\\Pins", 0, NULL, 0, KEY_SET_VALUE, NULL, &pk, NULL);
+        std::wstring p = dir + L"\\" + name;
+        if (on)
+            RegSetValueExW(pk, p.c_str(), 0, REG_SZ, (const BYTE*)L"x", 4);
+        else
+            RegDeleteValueW(pk, p.c_str());
+        RegCloseKey(pk);
+    };
+
+    Log(L"######## D1 an Open dialog of a test program, closed with a posted Cancel");
+    PROCESS_INFORMATION host = Start(hostCmd);
     HWND dlg = WaitDialog(host.dwProcessId, 15000);
     Log(L"  dialog %p", dlg);
     if (dlg) {
-        Watch(dlg, 12000, L"D1");
+        Watch(dlg, 8000, L"D1");
         Log(L"  -- unpin bravo");
-        RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\ExplorerPinned\\Pins", 0, KEY_SET_VALUE, &k);
-        RegDeleteValueW(k, (dir + L"\\bravo.txt").c_str());
-        RegCloseKey(k);
-        Watch(dlg, 5000, L"D1 unpin");
+        setPin(L"bravo.txt", false);
+        Watch(dlg, 4000, L"D1 unpin");
+        setPin(L"bravo.txt", true);
+        Watch(dlg, 4000, L"D1 pin again");
         CloseDialog(dlg, host);
     }
+    check(L"D1 saved");
 
-    Log(L"######## D2 the same folder again without dialog support (what Explorer saved for the dialog)");
-    host = Start(L"\"" + std::wstring(self) + L"\" host \"" + dir + L"\"", true);
+    Log(L"######## D2 closed with the Cancel button (sent WM_COMMAND)");
+    host = Start(hostCmd);
     dlg = WaitDialog(host.dwProcessId, 15000);
     if (dlg) {
-        Watch(dlg, 4000, L"D2");
+        Watch(dlg, 6000, L"D2");
+        SendMessageW(dlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), (LPARAM)GetDlgItem(dlg, IDCANCEL));
+        Pump(1500);
         CloseDialog(dlg, host);
     }
+    check(L"D2 saved");
 
-    Log(L"######## D3 Notepad's Open dialog");
+    Log(L"######## D3 closed from the title bar (SC_CLOSE)");
+    host = Start(hostCmd);
+    dlg = WaitDialog(host.dwProcessId, 15000);
+    if (dlg) {
+        Watch(dlg, 6000, L"D3");
+        PostMessageW(dlg, WM_SYSCOMMAND, SC_CLOSE, 0);
+        Pump(1500);
+        CloseDialog(dlg, host);
+    }
+    check(L"D3 saved");
+
+    Log(L"######## D4 without restoring on close: where the dialog saves the grouping");
+    SetEnvironmentVariableW(L"EXPLORERPINNED_NO_RESTORE", L"1");
+    host = Start(hostCmd);
+    SetEnvironmentVariableW(L"EXPLORERPINNED_NO_RESTORE", NULL);
+    dlg = WaitDialog(host.dwProcessId, 15000);
+    if (dlg) {
+        Watch(dlg, 6000, L"D4");
+        CloseDialog(dlg, host);
+    }
+    DumpBags(HKEY_CURRENT_USER, L"Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\Bags", 0);
+    check(L"D4 saved");
+
+    Log(L"######## D5 Notepad's Open dialog");
     PROCESS_INFORMATION np = Start(L"notepad.exe");
     Pump(3000);
     HWND main = NULL;
@@ -298,7 +379,13 @@ int wmain(int argc, wchar_t** argv) {
     Log(L"  notepad window %p", main);
     if (main) {
         HMENU file = GetSubMenu(GetMenu(main), 0);
-        UINT openId = file ? GetMenuItemID(file, 1) : 0;
+        UINT openId = 0;
+        for (int i = 0; file && i < GetMenuItemCount(file) && !openId; i++) {
+            wchar_t text[128] = L"";
+            GetMenuStringW(file, i, text, 128, MF_BYPOSITION);
+            Log(L"  menu %d: %s", i, text);
+            if (wcsstr(text, L"Open")) openId = GetMenuItemID(file, i);
+        }
         Log(L"  open command %u", openId);
         PostMessageW(main, WM_COMMAND, openId, 0);
         dlg = WaitDialog(np.dwProcessId, 15000);
@@ -314,7 +401,7 @@ int wmain(int argc, wchar_t** argv) {
                 SendMessageW(edit, WM_SETTEXT, 0, (LPARAM)dir.c_str());
                 PostMessageW(dlg, WM_COMMAND, IDOK, 0);
             }
-            Watch(dlg, 12000, L"D3");
+            Watch(dlg, 12000, L"D5");
             PostMessageW(dlg, WM_COMMAND, IDCANCEL, 0);
         }
     }
