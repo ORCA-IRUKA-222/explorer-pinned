@@ -575,7 +575,9 @@ int wmain(int argc, wchar_t** argv) {
             const char prefs[] = "user_pref(\"browser.aboutwelcome.enabled\", false);\n"
                                  "user_pref(\"browser.startup.homepage_override.mstone\", \"ignore\");\n"
                                  "user_pref(\"datareporting.policy.firstRunURL\", \"\");\n"
-                                 "user_pref(\"browser.shell.checkDefaultBrowser\", false);\n";
+                                 "user_pref(\"browser.shell.checkDefaultBrowser\", false);\n"
+                                 "user_pref(\"termsofuse.bypassNotification\", true);\n"
+                                 "user_pref(\"datareporting.policy.dataSubmissionPolicyBypassNotification\", true);\n";
             DWORD w;
             WriteFile(h, prefs, sizeof(prefs) - 1, &w, NULL);
             CloseHandle(h);
@@ -604,6 +606,13 @@ int wmain(int argc, wchar_t** argv) {
         HWND bdlg = NULL;
         if (win) {
             Pump(2000);
+            if (wcscmp(b.exe, L"firefox.exe") == 0) {
+                // The welcome screen of a new profile covers the page.
+                HANDLE t = ClickAsync(win, L"Continue");
+                WaitForSingleObject(t, 20000);
+                CloseHandle(t);
+                Pump(2000);
+            }
             CloseHandle(ClickAsync(win, L"pickfile"));
             bdlg = WaitWindowOf(b.exe, NULL, 20000);
             if (!bdlg && g_clickFound) {

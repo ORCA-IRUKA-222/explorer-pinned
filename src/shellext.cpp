@@ -216,9 +216,9 @@ ComPtr<IFolderView2> ViewOf(HWND dialog) {
     return shellView.As<IFolderView2>();
 }
 
-// The dialog is about to close (or to leave the folder for a typed path): put the original
-// grouping back first, since the dialog saves its view state for the folder.
-void BeforeClose(HWND dialog) {
+// The dialog is about to close or to show another folder: put the original grouping back
+// first, since the dialog saves its view state for the folder it leaves.
+void BeforeLeave(HWND dialog) {
     if (!t_dialogs) return;
     auto it = t_dialogs->find(dialog);
     if (it == t_dialogs->end() || !it->second.grouped || GetEnvironmentVariableW(L"EXPLORERPINNED_NO_RESTORE", nullptr, 0))
@@ -232,6 +232,74 @@ void BeforeClose(HWND dialog) {
     it->second.lastRegroup = 0;
 }
 
+// Reports navigation inside a dialog (opening a subfolder, the address bar, the navigation
+// pane), where no close command passes by.
+class NavigationEvents : public IExplorerBrowserEvents {
+public:
+    explicit NavigationEvents(HWND dialog) : dialog_(dialog) {}
+    virtual ~NavigationEvents() = default;
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (riid == IID_IUnknown || riid == IID_IExplorerBrowserEvents) {
+            *ppv = static_cast<IExplorerBrowserEvents*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return InterlockedIncrement(&ref_); }
+    STDMETHODIMP_(ULONG) Release() override {
+        LONG r = InterlockedDecrement(&ref_);
+        if (!r) delete this;
+        return r;
+    }
+    STDMETHODIMP OnNavigationPending(PCIDLIST_ABSOLUTE) override {
+        BeforeLeave(dialog_);
+        return S_OK;
+    }
+    STDMETHODIMP OnViewCreated(IShellView*) override { return S_OK; }
+    STDMETHODIMP OnNavigationComplete(PCIDLIST_ABSOLUTE) override {
+        PostMessageW(dialog_, g_tickMessage, 0, 0);
+        return S_OK;
+    }
+    STDMETHODIMP OnNavigationFailed(PCIDLIST_ABSOLUTE) override { return S_OK; }
+
+private:
+    HWND dialog_;
+    LONG ref_ = 1;
+};
+
+struct Watched {
+    ComPtr<IExplorerBrowser> browser;
+    DWORD cookie = 0;
+};
+thread_local std::map<HWND, Watched>* t_watched = nullptr;
+
+void WatchNavigation(HWND dialog) {
+    if (!t_watched) t_watched = new std::map<HWND, Watched>();
+    if (t_watched->count(dialog)) return;
+    Watched& w = (*t_watched)[dialog];
+    HWND defView = FindDefView(dialog);
+    ComPtr<IShellBrowser> sb = defView ? ShellBrowserOf(dialog, defView) : ComPtr<IShellBrowser>();
+    HRESULT hr = sb ? sb->QueryInterface(IID_PPV_ARGS(w.browser.Put())) : E_NOINTERFACE;
+    if (SUCCEEDED(hr)) {
+        auto* events = new NavigationEvents(dialog);
+        hr = w.browser->Advise(events, &w.cookie);
+        events->Release();
+    }
+    // Without it (older style dialogs), only closing and typed paths are noticed.
+    LogLine(L"dialog: navigation events 0x%08lX", (unsigned long)hr);
+}
+
+void ForgetDialog(HWND dialog) {
+    if (t_dialogs) t_dialogs->erase(dialog);
+    if (!t_watched) return;
+    auto it = t_watched->find(dialog);
+    if (it == t_watched->end()) return;
+    if (it->second.browser && it->second.cookie) it->second.browser->Unadvise(it->second.cookie);
+    t_watched->erase(it);
+}
+
 bool IsCloseCommand(UINT message, WPARAM wp) {
     return (message == WM_COMMAND && (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL)) || message == WM_CLOSE ||
            (message == WM_SYSCOMMAND && (wp & 0xFFF0) == SC_CLOSE);
@@ -242,26 +310,7 @@ void ProcessDialog(HWND dialog) {
     ComPtr<IFolderView2> view = ViewOf(dialog);
     if (!view) return;
     if (!t_dialogs) t_dialogs = new std::map<HWND, Dialog>();
-    if (!t_dialogs->count(dialog)) {
-        // Research: which interfaces the dialog's browser offers (for navigation events).
-        HWND defView = FindDefView(dialog);
-        ComPtr<IShellBrowser> sb = defView ? ShellBrowserOf(dialog, defView) : ComPtr<IShellBrowser>();
-        ComPtr<IServiceProvider> sp = sb ? sb.As<IServiceProvider>() : ComPtr<IServiceProvider>();
-        ComPtr<IExplorerBrowser> eb;
-        ComPtr<IFileDialog> fd;
-        ComPtr<IExplorerBrowser> ebService;
-        ComPtr<IFileDialog> fdService;
-        if (sb) {
-            sb->QueryInterface(IID_PPV_ARGS(eb.Put()));
-            sb->QueryInterface(IID_PPV_ARGS(fd.Put()));
-        }
-        if (sp) {
-            sp->QueryService(SID_SExplorerBrowserFrame, IID_PPV_ARGS(fdService.Put()));
-            sp->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(ebService.Put()));
-        }
-        LogLine(L"dialog: browser %d, IExplorerBrowser %d/%d, IFileDialog %d/%d", sb ? 1 : 0, eb ? 1 : 0,
-                ebService ? 1 : 0, fd ? 1 : 0, fdService ? 1 : 0);
-    }
+    WatchNavigation(dialog);
     Dialog& d = (*t_dialogs)[dialog];
     DWORD now = GetTickCount();
 
@@ -351,7 +400,7 @@ LRESULT CALLBACK GetMessageHook(int code, WPARAM wp, LPARAM lp) {
             msg->message = WM_NULL;
             ProcessDialog(dialog);
         } else if (IsCloseCommand(msg->message, msg->wParam)) {
-            BeforeClose(msg->hwnd);
+            BeforeLeave(msg->hwnd);
         }
     }
     return CallNextHookEx(nullptr, code, wp, lp);
@@ -360,7 +409,12 @@ LRESULT CALLBACK GetMessageHook(int code, WPARAM wp, LPARAM lp) {
 // Sent messages: the buttons, Enter and Esc reach the dialog as a sent WM_COMMAND.
 LRESULT CALLBACK CallWndProcHook(int code, WPARAM wp, LPARAM lp) {
     const CWPSTRUCT* msg = reinterpret_cast<const CWPSTRUCT*>(lp);
-    if (code == HC_ACTION && IsCloseCommand(msg->message, msg->wParam)) BeforeClose(msg->hwnd);
+    if (code == HC_ACTION) {
+        if (IsCloseCommand(msg->message, msg->wParam))
+            BeforeLeave(msg->hwnd);
+        else if (msg->message == WM_NCDESTROY)
+            ForgetDialog(msg->hwnd);
+    }
     return CallNextHookEx(nullptr, code, wp, lp);
 }
 
