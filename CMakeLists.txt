@@ -26,6 +26,16 @@ if(MSVC)
     target_compile_options(ExplorerPinned PRIVATE /W4 /permissive- /utf-8 /EHsc)
 endif()
 
+# Loaded into programs that show a file dialog (registered as an icon overlay handler) to
+# show the pinned group in Open/Save dialogs too.
+add_library(ExplorerPinnedShell SHARED src/shellext.cpp src/comutil.cpp src/pinstore.cpp src/util.cpp
+    src/shellext.def src/shellext.rc)
+target_compile_definitions(ExplorerPinnedShell PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
+target_link_libraries(ExplorerPinnedShell PRIVATE ole32 oleaut32 shell32 shlwapi propsys uuid user32 advapi32)
+if(MSVC)
+    target_compile_options(ExplorerPinnedShell PRIVATE /W4 /permissive- /utf-8 /EHsc)
+endif()
+
 option(EP_BUILD_TESTS "Build the end-to-end test program" ON)
 if(EP_BUILD_TESTS)
     add_executable(ExplorerPinnedE2E tests/e2e.cpp src/util.cpp)

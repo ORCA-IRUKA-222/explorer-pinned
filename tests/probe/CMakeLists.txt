@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(dialogprobe CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+add_executable(dialogprobe dialogprobe.cpp)
+target_compile_definitions(dialogprobe PRIVATE UNICODE _UNICODE)
+target_compile_options(dialogprobe PRIVATE /utf-8)
+target_link_libraries(dialogprobe ole32 oleaut32 shell32 shlwapi propsys uuid user32)

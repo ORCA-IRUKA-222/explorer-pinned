@@ -1,0 +1,34 @@
+name: Probe
+on:
+  push:
+    branches: ["feature/file-dialog-pins"]
+    paths: ["tests/probe/**", ".github/workflows/probe.yml", "src/shellext*"]
+jobs:
+  probe:
+    name: Probe (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -B build -A x64 -DEP_BUILD_TESTS=OFF
+          cmake --build build --config Release
+          cmake -S tests/probe -B build-probe -A x64
+          cmake --build build-probe --config Release
+      - name: Run
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath build-probe\Release\dialogprobe.exe -ArgumentList "build\Release\ExplorerPinned.exe", "build\Release\ExplorerPinnedShell.dll" `
+            -NoNewWindow -PassThru -RedirectStandardOutput out.txt
+          $null = $p.Handle
+          if (-not $p.WaitForExit(600000)) { "TIMEOUT"; $p.Kill() }
+          Get-Content out.txt -Encoding utf8
+          Write-Host "---- agent.log"
+          Get-Content "$env:LOCALAPPDATA\ExplorerPinned\agent.log" -Encoding utf8 -ErrorAction SilentlyContinue
+          Write-Host "---- overlay identifiers"
+          Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers" | ForEach-Object { $_.PSChildName }
