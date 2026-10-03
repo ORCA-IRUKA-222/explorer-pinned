@@ -368,6 +368,16 @@ bool ExpectPinned(Window& w, const std::set<std::wstring>& expected, const std::
     return ok;
 }
 
+// Waits until Explorer lists the items of a freshly filled folder. Right after it is
+// created, a large folder can keep Explorer busy (icons, virus scan) for a while, and the
+// agent cannot group a view that shows nothing yet.
+void WaitForItems(Window& w, const std::wstring& what) {
+    DWORD start = GetTickCount();
+    bool ok = WaitFor([&] { return !ReadGroups(w.hwnd).order.empty(); }, 60000);
+    Print(what + (ok ? L": Explorer lists the items after " : L": Explorer lists no items after ") +
+          std::to_wstring((GetTickCount() - start) / 1000) + L" s");
+}
+
 bool ExpectNoPinnedGroup(Window& w, const std::wstring& what) {
     Groups last;
     bool ok = WaitFor(
@@ -876,6 +886,7 @@ int wmain(int argc, wchar_t** argv) {
         w.Navigate(large);
         w.Refresh();
         w.view->SetViewModeAndIconSize(FVM_ICON, 96);
+        WaitForItems(w, L"large folder");
         ExpectPinned(w, {L"photo_050", L"folder_007"}, L"large folder: pinned group on top in large-icon view");
 
         // Signing in again: Explorer opens the folder with the pinned grouping it saved (the
@@ -913,6 +924,7 @@ int wmain(int argc, wchar_t** argv) {
             w.Navigate(unc);
             w.Refresh();
             w.view->SetViewModeAndIconSize(FVM_ICON, 96);
+            WaitForItems(w, L"network folder");
             ExpectPinned(w, {L"photo_050", L"folder_007"}, L"network folder: pinned group on top");
             Pump(8000);
             groupings = Groupings() - before;
