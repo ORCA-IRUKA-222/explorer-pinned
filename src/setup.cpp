@@ -42,7 +42,17 @@ void WriteVerb(const wchar_t* cls, const wchar_t* verb, UINT labelId, const std:
     RegWriteString(HKEY_CURRENT_USER, key + L"\\command", nullptr, L"\"" + exe + L"\" " + command + L" \"%1\"");
 }
 
-std::wstring SchemaPath() { return ExeDirectory() + L"\\ExplorerPinned.propdesc"; }
+std::wstring SchemaDirectory() {
+    std::wstring result;
+    PWSTR dir = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_ProgramData, 0, nullptr, &dir))) {
+        result = std::wstring(dir) + L"\\" + kSchemaDirName;
+        CoTaskMemFree(dir);
+    }
+    return result;
+}
+
+constexpr wchar_t kSchemaListKey[] = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\PropertySystem\\PropertySchema";
 
 std::wstring XmlEscape(const std::wstring& s) {
     std::wstring r;
@@ -60,16 +70,16 @@ std::wstring XmlEscape(const std::wstring& s) {
 
 // The labels are written as text in the current UI language: the schema is machine-wide
 // and Explorer shows these strings as the group name.
-std::wstring SchemaXml() {
+std::wstring SchemaXml(const wchar_t* formatId, const PROPERTYKEY (&keys)[2], const wchar_t* const (&names)[2]) {
     std::wstring label = XmlEscape(LoadStr(IDS_PROP_LABEL));
     std::wstring pinned = XmlEscape(LoadStr(IDS_PROP_PINNED));
     std::wstring xml =
         L"<?xml version=\"1.0\" encoding=\"utf-16\"?>\r\n"
         L"<schema xmlns=\"http://schemas.microsoft.com/windows/2006/propertydescription\" schemaVersion=\"1.0\">\r\n"
         L"  <propertyDescriptionList publisher=\"ExplorerPinned\" product=\"ExplorerPinned\">\r\n";
-    for (size_t i = 0; i < std::size(kPinStateKeys); i++) {
-        xml += L"    <propertyDescription name=\"" + std::wstring(kPinStateNames[i]) + L"\" formatID=\"" +
-               kPinStateFormatId + L"\" propID=\"" + std::to_wstring(kPinStateKeys[i].pid) + L"\">\r\n";
+    for (size_t i = 0; i < 2; i++) {
+        xml += L"    <propertyDescription name=\"" + std::wstring(names[i]) + L"\" formatID=\"" + formatId +
+               L"\" propID=\"" + std::to_wstring(keys[i].pid) + L"\">\r\n";
         xml +=
             L"      <searchInfo inInvertedIndex=\"false\" isColumn=\"false\"/>\r\n"
             L"      <typeInfo type=\"UInt32\" isInnate=\"true\" isViewable=\"true\" groupingRange=\"Enumerated\"/>\r\n"
@@ -145,28 +155,98 @@ bool IsSchemaRegistered() {
     return true;
 }
 
-// Registering a file that is already registered adds a second entry, and the first one
-// keeps winning, so remove every entry for the path before registering again.
-static void UnregisterAll(const std::wstring& path) {
-    for (int i = 0; i < 8 && SUCCEEDED(PSUnregisterPropertySchema(path.c_str())); i++) {
+std::wstring SchemaPath() { return SchemaDirectory() + L"\\" + kSchemaFileName; }
+
+// Schema registrations of this program: the current file and ExplorerPinned.propdesc of
+// versions 1.0.0 and 1.0.1, wherever they were registered from. Windows identifies a schema
+// by its file name (the "URI" value).
+std::vector<SchemaRegistration> SchemaRegistrations() {
+    std::vector<SchemaRegistration> result;
+    HKEY root;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kSchemaListKey, 0, KEY_READ, &root) != ERROR_SUCCESS) return result;
+    wchar_t sub[256];
+    for (DWORD i = 0;; i++) {
+        DWORD len = ARRAYSIZE(sub);
+        if (RegEnumKeyExW(root, i, sub, &len, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+        std::wstring path, uri;
+        RegReadString(root, sub, nullptr, &path);
+        RegReadString(root, sub, L"URI", &uri);
+        std::wstring file = FileNamePart(path);
+        bool legacy = PathEqualsI(uri, kLegacySchemaFileName) || PathEqualsI(file, kLegacySchemaFileName);
+        bool current = PathEqualsI(uri, kSchemaFileName) || PathEqualsI(file, kSchemaFileName);
+        if (legacy || current) result.push_back({path, legacy, PathExists(path)});
     }
+    RegCloseKey(root);
+    return result;
 }
 
+namespace {
+
+// Removes every registration of `path`. Windows reports success for a file that no longer
+// exists but keeps its registration (which then keeps the descriptions from loading), so a
+// missing file is written again for the duration of the call.
+void RemoveRegistration(const SchemaRegistration& r) {
+    std::vector<std::wstring> createdDirs;
+    bool createdFile = false;
+    if (!r.exists && !r.path.empty()) {
+        for (std::wstring dir = ParentPath(r.path); !dir.empty() && !PathExists(dir); dir = ParentPath(dir)) {
+            createdDirs.push_back(dir);
+            if (dir.size() <= 3) break;
+        }
+        for (auto it = createdDirs.rbegin(); it != createdDirs.rend(); ++it) CreateDirectoryW(it->c_str(), nullptr);
+        createdFile = WriteUtf16File(r.path, r.legacy ? SchemaXml(kLegacyPinStateFormatId, kLegacyPinStateKeys, kLegacyPinStateNames)
+                                                      : SchemaXml(kPinStateFormatId, kPinStateKeys, kPinStateNames));
+    }
+    // Windows also reports success when the file is not registered; stop once it is gone,
+    // since every call makes running programs reload their property descriptions.
+    auto registered = [&] {
+        for (const auto& other : SchemaRegistrations())
+            if (PathEqualsI(other.path, r.path)) return true;
+        return false;
+    };
+    int removed = 0;
+    while (removed < 8 && registered() && SUCCEEDED(PSUnregisterPropertySchema(r.path.c_str()))) removed++;
+    if (createdFile) DeleteFileW(r.path.c_str());
+    for (const auto& dir : createdDirs) RemoveDirectoryW(dir.c_str());
+    LogLine(L"unregister schema %s (%s, %s): %d", r.path.c_str(), r.legacy ? L"old" : L"current",
+            r.exists ? L"present" : L"missing", removed);
+}
+
+void LogRegistrations(const wchar_t* when) {
+    auto list = SchemaRegistrations();
+    LogLine(L"schema registrations %s: %zu", when, list.size());
+    for (const auto& r : list)
+        LogLine(L"  %s (%s, %s)", r.path.c_str(), r.legacy ? L"old" : L"current", r.exists ? L"present" : L"missing");
+}
+
+}  // namespace
+
 HRESULT RegisterSchema() {
-    std::wstring path = SchemaPath();
-    UnregisterAll(path);
-    if (!WriteUtf16File(path, SchemaXml())) return HRESULT_FROM_WIN32(GetLastError());
+    // Start from a clean slate: a second registration of a file with the same name (from
+    // another folder, or one whose file is gone) makes the registration fail partly.
+    LogRegistrations(L"before");
+    for (const auto& r : SchemaRegistrations()) RemoveRegistration(r);
+    // A copy of version 1.0.x installed in this folder left its schema file here.
+    DeleteFileW((ExeDirectory() + L"\\" + kLegacySchemaFileName).c_str());
+    PSRefreshPropertySchema();
+
+    std::wstring dir = SchemaDirectory(), path = SchemaPath();
+    SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
+    if (!WriteUtf16File(path, SchemaXml(kPinStateFormatId, kPinStateKeys, kPinStateNames)))
+        return HRESULT_FROM_WIN32(GetLastError());
     HRESULT hr = PSRegisterPropertySchema(path.c_str());
     PSRefreshPropertySchema();
     LogLine(L"RegisterSchema(%s) hr=0x%08x", path.c_str(), hr);
+    if (hr != S_OK) LogRegistrations(L"after");
     return hr;
 }
 
 HRESULT UnregisterSchema() {
-    std::wstring path = SchemaPath();
-    UnregisterAll(path);
+    for (const auto& r : SchemaRegistrations()) RemoveRegistration(r);
     HRESULT hr = PSRefreshPropertySchema();
-    DeleteFileW(path.c_str());
+    DeleteFileW(SchemaPath().c_str());
+    RemoveDirectoryW(SchemaDirectory().c_str());
+    DeleteFileW((ExeDirectory() + L"\\" + kLegacySchemaFileName).c_str());
     return hr;
 }
 

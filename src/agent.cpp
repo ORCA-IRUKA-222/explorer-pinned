@@ -12,27 +12,45 @@
 #include <set>
 
 #include "comutil.h"
+#include "dialogs.h"
+#include "displaycheck.h"
 #include "pinstore.h"
 #include "resource.h"
 #include "setup.h"
 #include "util.h"
+#include "version.h"
 
 namespace ep {
 namespace {
 
 // DShellFolderViewEvents
-constexpr DISPID kDispEnumDone = 201;        // DISPID_FILELISTENUMDONE (also after a refresh)
-constexpr DISPID kDispContentsChanged = 207;  // DISPID_CONTENTSCHANGED
+constexpr DISPID kDispSelectionChanged = 200;
+constexpr DISPID kDispEnumDone = 201;  // DISPID_FILELISTENUMDONE (also after a refresh or a regroup)
+constexpr DISPID kDispFocusChanged = 208;
 
 constexpr UINT_PTR kTimerWork = 1;
 constexpr UINT_PTR kTimerPoll = 2;
 constexpr UINT kPollIntervalMs = 2000;
+
+// Explorer loads a view after a navigation and reloads it after every SetGroupBy; in a large
+// or slow folder (e.g. on the network, or while signing in) that takes seconds and ends with
+// DocumentComplete and EnumDone. A SetGroupBy made while a load is still running is undone
+// when that load finishes: the pinned values are dropped and every item is "Unspecified".
+// So the agent changes the grouping only when the view has finished loading and has had no
+// load for kQuietMs (kIdleMs after Explorer dropped the values once).
+constexpr DWORD kQuietMs = 400;
+constexpr DWORD kIdleMs = 3000;
+constexpr DWORD kMaxLoadMs = 15000;  // a load whose end was not reported, or a view that keeps loading
+// Groupings applied to one view that did not hold before the agent stops trying and puts
+// the original grouping back (instead of reloading the view endlessly).
+constexpr int kMaxAttempts = 4;
 
 constexpr UINT kCmdReapply = 1;
 constexpr UINT kCmdCleanup = 2;
 constexpr UINT kCmdStartup = 3;
 constexpr UINT kCmdWebsite = 4;
 constexpr UINT kCmdExit = 5;
+constexpr UINT kCmdDialogs = 6;
 constexpr UINT kCmdOpenBase = 1000;   // + index into the pin list
 constexpr UINT kCmdUnpinBase = 3000;  // + index into the pin list
 constexpr size_t kMaxMenuPins = 100;
@@ -67,6 +85,12 @@ int KeyIndex(const PROPERTYKEY& key) {
     return -1;
 }
 
+// Also the keys of version 1.0.x, which Explorer may still have saved for a folder.
+bool IsPinKey(const PROPERTYKEY& key) {
+    return KeyIndex(key) >= 0 || IsEqualPropertyKey(key, kLegacyPinStateKeys[0]) ||
+           IsEqualPropertyKey(key, kLegacyPinStateKeys[1]);
+}
+
 bool IsDisconnected(HRESULT hr) {
     return hr == RPC_E_DISCONNECTED || hr == HRESULT_FROM_WIN32(RPC_S_SERVER_UNAVAILABLE) ||
            hr == HRESULT_FROM_WIN32(RPC_S_CALL_FAILED) || hr == CO_E_OBJNOTCONNECTED;
@@ -74,9 +98,10 @@ bool IsDisconnected(HRESULT hr) {
 
 // Grouping that a folder had before the agent took it over, restored when the
 // folder no longer contains pins.
-void SavePreviousGroupBy(const std::wstring& folder, const PROPERTYKEY& key, BOOL ascending) {
+void SavePreviousGroupBy(const std::wstring& folder, PROPERTYKEY key, BOOL ascending) {
     std::wstring existing;
     if (RegReadString(HKEY_CURRENT_USER, kRegPreviousGroupBy, folder.c_str(), &existing)) return;
+    if (IsPinKey(key)) key = PROPERTYKEY{GUID_NULL, 0};
     wchar_t guid[64];
     StringFromGUID2(key.fmtid, guid, ARRAYSIZE(guid));
     RegWriteString(HKEY_CURRENT_USER, kRegPreviousGroupBy, folder.c_str(),
@@ -96,7 +121,7 @@ bool ReadPreviousGroupBy(const std::wstring& folder, PROPERTYKEY* key, BOOL* asc
     key->fmtid = g;
     key->pid = (DWORD)wcstoul(value.substr(c1 + 1, c2 - c1 - 1).c_str(), nullptr, 10);
     *ascending = value.substr(c2 + 1) != L"0";
-    if (KeyIndex(*key) >= 0) *key = PROPERTYKEY{GUID_NULL, 0};  // never "restore" to our own grouping
+    if (IsPinKey(*key)) *key = PROPERTYKEY{GUID_NULL, 0};  // never "restore" to our own grouping
     return true;
 }
 
@@ -168,6 +193,7 @@ struct TrackedWindow {
     std::wstring folderPath;
     std::vector<BYTE> folderIdList;  // the ID list this window uses for the folder
     NameSet applied[2];       // names given the pinned value on each key in this view
+    NameSet unwritable[2];    // pinned names the view refused a value for (e.g. hidden items)
     bool initialized = false;  // grouping was enforced once in this view
 
     bool pending = false;
@@ -177,6 +203,17 @@ struct TrackedWindow {
     bool leaving = false;  // the original grouping was put back because the view is going away
     DWORD leaveTick = 0;
     bool seen = false;
+
+    bool loading = false;    // a navigation or our SetGroupBy is being loaded
+    DWORD loadStart = 0;
+    DWORD lastLoad = 0;      // last time a load started or finished
+    DWORD waitSince = 0;     // first time processing was put off for a load
+    int attempts = 0;        // groupings applied in this view since the grouping last held
+    int churn = 0;           // regroups in a row that came soon after the previous one
+    int writeFailures = 0;   // tries in a row in which the view took no pinned value
+    bool dropped = false;    // Explorer dropped the values of the grouping applied last
+    bool gaveUp = false;     // the grouping did not hold; left alone until the pins change
+    bool displayLogged = false;  // what Explorer shows was written to the log
 };
 
 class Agent {
@@ -198,8 +235,9 @@ private:
 
     void ProcessWindow(TrackedWindow& w);
     bool AcquireView(TrackedWindow& w, bool* newSession);
+    bool Settling(TrackedWindow& w, DWORD* waitMs);
     PITEMID_CHILD ParseChild(TrackedWindow& w, const std::wstring& name);
-    void WriteKey(TrackedWindow& w, int keyIndex, const NameSet& names);
+    size_t WriteKey(TrackedWindow& w, int keyIndex, const NameSet& names, HRESULT* failure);
     bool KeyMatches(TrackedWindow& w, int keyIndex, const NameSet& names);
     void RestoreGrouping(TrackedWindow& w, bool forget);
     void LeaveView(TrackedWindow& w);
@@ -233,6 +271,36 @@ private:
 };
 
 Agent* g_agent = nullptr;
+
+// Version, Windows build and the state of the property schema, for diagnosing problems.
+void LogEnvironment(size_t pinCount) {
+    const wchar_t* nt = L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
+    std::wstring product, display, build;
+    RegReadString(HKEY_LOCAL_MACHINE, nt, L"ProductName", &product);
+    RegReadString(HKEY_LOCAL_MACHINE, nt, L"DisplayVersion", &display);
+    RegReadString(HKEY_LOCAL_MACHINE, nt, L"CurrentBuild", &build);
+    DWORD ubr = 0, size = sizeof(ubr);
+    RegGetValueW(HKEY_LOCAL_MACHINE, nt, L"UBR", RRF_RT_REG_DWORD, nullptr, &ubr, &size);
+    LogLine(L"agent " EP_VERSION_STRING_W L" started on %s %s (build %s.%lu), %zu pin(s)", product.c_str(), display.c_str(),
+            build.c_str(), ubr, pinCount);
+    for (const auto& key : kPinStateKeys) {
+        IPropertyDescription* desc = nullptr;
+        HRESULT hr = PSGetPropertyDescription(key, IID_PPV_ARGS(&desc));
+        if (FAILED(hr)) {
+            LogLine(L"  property %lu: not available (0x%08lX)", key.pid, (unsigned long)hr);
+            continue;
+        }
+        PWSTR text = nullptr;
+        PROPVARIANT pinned;
+        InitPropVariantFromUInt32(kPinnedValue, &pinned);
+        desc->FormatForDisplay(pinned, PDFF_DEFAULT, &text);
+        LogLine(L"  property %lu: \"%s\"", key.pid, text ? text : L"?");
+        CoTaskMemFree(text);
+        desc->Release();
+    }
+    for (const auto& r : SchemaRegistrations())
+        LogLine(L"  schema %s%s%s", r.path.c_str(), r.legacy ? L" (old)" : L"", r.exists ? L"" : L" (missing)");
+}
 
 LRESULT CALLBACK Agent::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (g_agent && g_agent->hwnd_ == hwnd) return g_agent->OnMessage(msg, wp, lp);
@@ -268,7 +336,7 @@ int Agent::Run() {
     SetTimer(hwnd_, kTimerPoll, kPollIntervalMs, nullptr);
     rescanPending_ = true;
     ArmWorkTimer();
-    LogLine(L"agent started, %zu pin(s)", pins_.size());
+    LogEnvironment(pins_.size());
 
     MSG msg;
     for (;;) {
@@ -471,7 +539,12 @@ void Agent::RescanWindows() {
                 LeaveView(*raw);
             }
             if (id == DISPID_NAVIGATECOMPLETE2 || id == DISPID_DOCUMENTCOMPLETE) {
-                Schedule(raw, 30, false);
+                // A navigation starts loading the new view; the next DocumentComplete (or
+                // EnumDone) reports that the load is done.
+                raw->loading = id == DISPID_NAVIGATECOMPLETE2;
+                raw->lastLoad = GetTickCount();
+                if (raw->loading) raw->loadStart = raw->lastLoad;
+                Schedule(raw, kQuietMs, false);
                 ArmWorkTimer();
             } else if (id == DISPID_ONQUIT) {
                 rescanPending_ = true;
@@ -514,8 +587,20 @@ bool Agent::AcquireView(TrackedWindow& w, bool* newSession) {
     w.folderIdList.clear();
     w.applied[0].clear();
     w.applied[1].clear();
+    w.unwritable[0].clear();
+    w.unwritable[1].clear();
     w.initialized = false;
     w.leaving = false;
+    w.waitSince = 0;
+    w.attempts = 0;
+    w.churn = 0;
+    w.writeFailures = 0;
+    w.dropped = false;
+    w.gaveUp = false;
+    w.displayLogged = false;
+    // A view found without seeing its navigation (e.g. when the agent starts) may still be
+    // loading; give it a moment.
+    if (!w.loading) w.lastLoad = GetTickCount();
     view->GetFolder(IID_PPV_ARGS(w.folder.Put()));
     if (ComPtr<IPersistFolder2> pf = w.folder.As<IPersistFolder2>()) {
         PIDLIST_ABSOLUTE pidl = nullptr;
@@ -534,10 +619,13 @@ bool Agent::AcquireView(TrackedWindow& w, bool* newSession) {
     TrackedWindow* raw = &w;
     if (SUCCEEDED(w.browser->get_Document(doc.Put())) && doc) {
         w.viewEvents.Connect(doc.Get(), DIID_DShellFolderViewEvents, [this, raw](DISPID id) {
-            if (id == kDispEnumDone || id == kDispContentsChanged) {
-                Schedule(raw, 150, false);
-                ArmWorkTimer();
+            if (id == kDispSelectionChanged || id == kDispFocusChanged) return;
+            if (id == kDispEnumDone) {
+                raw->loading = false;
+                raw->lastLoad = GetTickCount();
             }
+            Schedule(raw, kQuietMs, false);
+            ArmWorkTimer();
         });
     }
     return true;
@@ -556,8 +644,10 @@ PITEMID_CHILD Agent::ParseChild(TrackedWindow& w, const std::wstring& name) {
 }
 
 // Gives `names` the pinned value on the key and clears names pinned earlier in this view.
-void Agent::WriteKey(TrackedWindow& w, int k, const NameSet& names) {
+// Returns how many pinned items got the value; `failure` receives the last error.
+size_t Agent::WriteKey(TrackedWindow& w, int k, const NameSet& names, HRESULT* failure) {
     const PROPERTYKEY& key = kPinStateKeys[k];
+    *failure = S_OK;
     PROPVARIANT empty;
     PropVariantInit(&empty);
     for (const auto& name : w.applied[k]) {
@@ -568,14 +658,22 @@ void Agent::WriteKey(TrackedWindow& w, int k, const NameSet& names) {
         }
     }
     w.applied[k].clear();
+    w.unwritable[k].clear();
     PROPVARIANT pinned;
     InitPropVariantFromUInt32(kPinnedValue, &pinned);
     for (const auto& name : names) {
         if (PITEMID_CHILD child = ParseChild(w, name)) {
-            if (SUCCEEDED(SetViewValue(w.view.Get(), child, key, pinned))) w.applied[k].insert(name);
+            HRESULT hr = SetViewValue(w.view.Get(), child, key, pinned);
+            if (SUCCEEDED(hr)) {
+                w.applied[k].insert(name);
+            } else {
+                w.unwritable[k].insert(name);
+                *failure = hr;
+            }
             CoTaskMemFree(child);
         }
     }
+    return w.applied[k].size();
 }
 
 // True when the active key already shows exactly the pinned items. Values disappear
@@ -584,17 +682,40 @@ bool Agent::KeyMatches(TrackedWindow& w, int k, const NameSet& names) {
     for (const auto& name : w.applied[k])
         if (!names.count(name)) return false;
     for (const auto& name : names) {
+        if (w.unwritable[k].count(name)) continue;  // not in the view (e.g. hidden); nothing to show
         PITEMID_CHILD child = ParseChild(w, name);
         if (!child) continue;  // not present in this folder (yet)
         PROPVARIANT value;
         PropVariantInit(&value);
         HRESULT hr = GetViewValue(w.view.Get(), child, kPinStateKeys[k], &value);
-        // Failure means the item is not in the view (e.g. hidden); nothing to show for it.
-        bool ok = FAILED(hr) || (value.vt == VT_UI4 && value.ulVal == kPinnedValue);
+        // TYPE_E_ELEMENTNOTFOUND: the view has the item but no value for it (Explorer dropped
+        // it, or the item was pinned since). Other failures mean the item is not in the view.
+        bool ok = (FAILED(hr) && hr != TYPE_E_ELEMENTNOTFOUND) || (value.vt == VT_UI4 && value.ulVal == kPinnedValue);
         PropVariantClear(&value);
         CoTaskMemFree(child);
         if (!ok) return false;
     }
+    return true;
+}
+
+// True while the view is loading or a load ended only recently; *waitMs tells when to look
+// again. A view that never calms down is processed anyway after a while.
+bool Agent::Settling(TrackedWindow& w, DWORD* waitMs) {
+    DWORD now = GetTickCount();
+    DWORD quiet = w.dropped ? kIdleMs : kQuietMs;
+    DWORD since = now - w.lastLoad;
+    if ((!w.loading || now - w.loadStart >= kMaxLoadMs) && since >= quiet) {
+        w.loading = false;
+        w.waitSince = 0;
+        return false;
+    }
+    if (!w.waitSince) w.waitSince = now;
+    if (now - w.waitSince >= kMaxLoadMs) {
+        w.loading = false;
+        w.waitSince = 0;
+        return false;
+    }
+    *waitMs = w.loading ? 250 : quiet - since;
     return true;
 }
 
@@ -610,6 +731,11 @@ void Agent::ProcessWindow(TrackedWindow& w) {
         w.view->SetRedraw(TRUE);
         w.leaving = false;
         w.enforce = true;
+    }
+    DWORD wait = 0;
+    if (Settling(w, &wait)) {
+        Schedule(&w, wait, false);
+        return;
     }
 
     // Only pins whose item exists count; a stale pin must not keep the folder grouped.
@@ -631,38 +757,104 @@ void Agent::ProcessWindow(TrackedWindow& w) {
     int current = KeyIndex(groupKey);
 
     if (names.empty()) {
-        if (current >= 0) RestoreGrouping(w, /*forget=*/true);
+        if (IsPinKey(groupKey)) RestoreGrouping(w, /*forget=*/true);
         // Take over again as soon as a pinned item shows up in this view.
         w.initialized = false;
         w.enforce = false;
+        w.attempts = 0;
+        w.dropped = false;
+        w.gaveUp = false;
         return;
     }
 
-    if (current < 0) {
-        // Respect a grouping the user picked in this view; take over on a new view or a pin change.
-        if (w.initialized && !w.enforce) return;
-        SavePreviousGroupBy(w.folderPath, groupKey, ascending);
-        WriteKey(w, 0, names);
-        if (!w.folderIdList.empty())
-            MarkGrouped(w.folderPath, reinterpret_cast<PCIDLIST_ABSOLUTE>(w.folderIdList.data()));
-        w.view->SetGroupBy(kPinStateKeys[0], TRUE);
-        LogLine(L"group %s (%zu pinned)", w.folderPath.c_str(), names.size());
-    } else if (!ascending || !KeyMatches(w, current, names)) {
-        // Something keeps clearing the values (e.g. a pinned file that is written to
-        // continuously); don't regroup more than about once a second.
-        DWORD now = GetTickCount();
-        if (now - w.lastRegroup < 1000) {
-            Schedule(&w, 1000 - (now - w.lastRegroup), false);
-            return;
-        }
-        w.lastRegroup = now;
-        int other = 1 - current;
-        WriteKey(w, other, names);
-        w.view->SetGroupBy(kPinStateKeys[other], TRUE);
-        LogLine(L"regroup %s (%zu pinned)", w.folderPath.c_str(), names.size());
+    if (w.enforce) {
+        // The pins changed (or "reapply"): start over, also in a view the agent gave up on.
+        w.displayLogged = false;
+        w.attempts = 0;
+        w.churn = 0;
+        w.dropped = false;
+        w.gaveUp = false;
     }
+    if (current >= 0 && ascending && KeyMatches(w, current, names)) {
+        w.attempts = 0;
+        w.dropped = false;
+        w.initialized = true;
+        w.enforce = false;
+        if (!w.displayLogged) {
+            // Record what Explorer actually shows (the values can be in place while Explorer
+            // still lists every item as "Unspecified", e.g. when the schema is not usable).
+            w.displayLogged = true;
+            SHANDLE_PTR hwnd = 0;
+            if (SUCCEEDED(w.browser->get_HWND(&hwnd)) && hwnd) LogDisplayedGroups(reinterpret_cast<HWND>(hwnd), w.folderPath);
+        }
+        return;
+    }
+    // Respect a grouping the user picked in this view; take over again on a new view or a
+    // pin change.
+    if ((current < 0 && w.initialized && !w.enforce) || w.gaveUp) return;
+
+    if (w.attempts > 0 && !w.dropped) {
+        // The grouping applied last did not hold: Explorer reloaded the view and dropped the
+        // values (or put the saved grouping back). Try again once the view has been idle.
+        w.dropped = true;
+        LogLine(L"grouping did not hold in %s (attempt %d); waiting for the view to be idle", w.folderPath.c_str(),
+                w.attempts);
+        Schedule(&w, kIdleMs, false);
+        return;
+    }
+    if (w.attempts >= kMaxAttempts) {
+        // Stop instead of reloading the view forever, and don't leave every item in the
+        // "Unspecified" group.
+        LogLine(L"grouping does not hold in %s after %d attempts; giving up", w.folderPath.c_str(), w.attempts);
+        if (IsPinKey(groupKey)) RestoreGrouping(w, /*forget=*/false);
+        w.gaveUp = true;
+        w.enforce = false;
+        return;
+    }
+    // A pinned item that keeps changing (e.g. a file that is being written) loses its value
+    // each time. Regroup at most about once a second, and less and less often (down to twice
+    // a minute) while that goes on, since every regroup makes Explorer reload the view.
+    DWORD now = GetTickCount();
+    DWORD gap = w.churn < 3 ? 1000 : std::min<DWORD>(30000, 1000u << std::min(w.churn - 2, 5));
+    if (now - w.lastRegroup < gap) {
+        Schedule(&w, gap - (now - w.lastRegroup), false);
+        return;
+    }
+    w.churn = w.lastRegroup && now - w.lastRegroup < gap + 10000 ? w.churn + 1 : 0;
+
+    // Explorer only re-groups items when the group-by key changes: write the values to the
+    // key that is not active and switch to it.
+    int key = current < 0 ? 0 : 1 - current;
+    if (current < 0) SavePreviousGroupBy(w.folderPath, groupKey, ascending);
+    HRESULT failure = S_OK;
+    size_t written = WriteKey(w, key, names, &failure);
+    if (!written) {
+        // The view does not have the items yet (Explorer is still filling it) or does not
+        // show them (hidden items). Grouping now would only show "Unspecified": try again
+        // every second for a while, then every ten seconds, without counting it as a
+        // failed grouping.
+        if (++w.writeFailures == 1 || w.writeFailures % 10 == 0)
+            LogLine(L"cannot set the pinned value in %s yet (0x%08lX, try %d)", w.folderPath.c_str(),
+                    (unsigned long)failure, w.writeFailures);
+        Schedule(&w, w.writeFailures < 20 ? 1000 : 10000, false);
+        return;
+    }
+    w.writeFailures = 0;
+    w.lastRegroup = now;
+    w.attempts++;
+    w.dropped = false;
     w.initialized = true;
     w.enforce = false;
+    if (current < 0 && !w.folderIdList.empty())
+        MarkGrouped(w.folderPath, reinterpret_cast<PCIDLIST_ABSOLUTE>(w.folderIdList.data()));
+    // Explorer reloads the view for the new grouping; check the result once that is done.
+    w.loading = true;
+    w.loadStart = now;
+    w.lastLoad = now;
+    hr = w.view->SetGroupBy(kPinStateKeys[key], TRUE);
+    LogLine(L"%s %s (%zu of %zu pinned, attempt %d, 0x%08lX)", current < 0 ? L"group" : L"regroup", w.folderPath.c_str(),
+            written, names.size(), w.attempts, (unsigned long)hr);
+    Schedule(&w, kQuietMs, false);
 }
 
 // Puts back the grouping the folder had before. `forget` drops the saved grouping (the
@@ -672,6 +864,8 @@ void Agent::RestoreGrouping(TrackedWindow& w, bool forget) {
     BOOL ascending;
     ReadPreviousGroupBy(w.folderPath, &key, &ascending);
     if (forget) RegDeleteValueIn(HKEY_CURRENT_USER, kRegPreviousGroupBy, w.folderPath.c_str());
+    w.loading = true;  // Explorer reloads the view for this grouping too
+    w.loadStart = w.lastLoad = GetTickCount();
     w.view->SetGroupBy(key, ascending);
     ClearGrouped(w.folderPath);
     // The values stay in the view's cache; `applied` keeps tracking them so they are
@@ -685,7 +879,7 @@ void Agent::LeaveView(TrackedWindow& w) {
     if (!w.view || w.folderPath.empty() || w.leaving) return;
     PROPERTYKEY groupKey = {};
     BOOL ascending = TRUE;
-    if (FAILED(w.view->GetGroupBy(&groupKey, &ascending)) || KeyIndex(groupKey) < 0) return;
+    if (FAILED(w.view->GetGroupBy(&groupKey, &ascending)) || !IsPinKey(groupKey)) return;
     w.view->SetRedraw(FALSE);  // the view is about to go away; don't show the regrouping
     RestoreGrouping(w, /*forget=*/false);
     w.leaving = true;
@@ -697,7 +891,7 @@ void Agent::RestoreAll() {
         if (!w->view || w->folderPath.empty()) continue;
         PROPERTYKEY groupKey = {};
         BOOL ascending = TRUE;
-        if (SUCCEEDED(w->view->GetGroupBy(&groupKey, &ascending)) && KeyIndex(groupKey) >= 0)
+        if (SUCCEEDED(w->view->GetGroupBy(&groupKey, &ascending)) && IsPinKey(groupKey))
             RestoreGrouping(*w, /*forget=*/false);
     }
 }
@@ -773,6 +967,8 @@ void Agent::ShowTrayMenu() {
     AppendMenuW(menu, MF_STRING, kCmdCleanup, LoadStr(IDS_TRAY_CLEANUP).c_str());
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (IsStartupEnabled() ? MF_CHECKED : 0), kCmdStartup, LoadStr(IDS_TRAY_STARTUP).c_str());
+    if (!RegisteredDialogExtension(KEY_WOW64_64KEY).empty())
+        AppendMenuW(menu, MF_STRING | (DialogsSettingOn() ? MF_CHECKED : 0), kCmdDialogs, LoadStr(IDS_TRAY_DIALOGS).c_str());
     AppendMenuW(menu, MF_STRING, kCmdWebsite, LoadStr(IDS_TRAY_WEBSITE).c_str());
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kCmdExit, LoadStr(IDS_TRAY_EXIT).c_str());
@@ -819,6 +1015,10 @@ void Agent::OnCommand(UINT id) {
         }
         case kCmdStartup:
             SetStartupEnabled(!IsStartupEnabled());
+            break;
+        case kCmdDialogs:
+            // Open dialogs follow within a second.
+            SetDialogsSetting(!DialogsSettingOn());
             break;
         case kCmdWebsite:
             ShellExecuteW(nullptr, L"open", kProjectUrl, nullptr, nullptr, SW_SHOWNORMAL);
@@ -994,7 +1194,7 @@ void RestoreFolderInWindow(const GroupedEntry& entry) {
         view = BrowseTo(browser.Get(), folder, reinterpret_cast<PCIDLIST_ABSOLUTE>(entry.idList.data()));
     PROPERTYKEY current = {};
     BOOL ascending = TRUE;
-    if (view && SUCCEEDED(view->GetGroupBy(&current, &ascending)) && KeyIndex(current) >= 0) {
+    if (view && SUCCEEDED(view->GetGroupBy(&current, &ascending)) && IsPinKey(current)) {
         PROPERTYKEY key;
         ReadPreviousGroupBy(folder, &key, &ascending);
         view->SetGroupBy(key, ascending);

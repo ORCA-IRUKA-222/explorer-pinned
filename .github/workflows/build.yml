@@ -2,10 +2,19 @@ name: Build
 
 on:
   push:
-    branches: [main, "feature/**"]
+    branches: [main, "feature/**", "fix/**"]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      release:
+        description: "Publish a release tagged v<version in src/version.h>"
+        type: boolean
+        default: false
+      target:
+        description: "Commit for the release tag (default: the commit being built)"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -16,24 +25,27 @@ jobs:
     runs-on: windows-2022
     strategy:
       matrix:
-        arch: [x64, arm64]
+        # x86: the file dialog DLL for 32-bit programs (and a 32-bit test program)
+        arch: [x64, arm64, x86]
     steps:
       - uses: actions/checkout@v4
       - name: Configure
-        run: cmake -B build -G "Visual Studio 17 2022" -A ${{ matrix.arch == 'x64' && 'x64' || 'ARM64' }} -DEP_BUILD_TESTS=${{ matrix.arch == 'x64' && 'ON' || 'OFF' }}
+        run: cmake -B build -G "Visual Studio 17 2022" -A ${{ matrix.arch == 'x64' && 'x64' || matrix.arch == 'arm64' && 'ARM64' || 'Win32' }} -DEP_BUILD_TESTS=${{ matrix.arch == 'arm64' && 'OFF' || 'ON' }}
       - name: Build
         run: cmake --build build --config Release
       - uses: actions/upload-artifact@v4
         with:
           name: bin-${{ matrix.arch }}
-          path: build/Release/*.exe
+          path: |
+            build/Release/*.exe
+            build/Release/*.dll
           if-no-files-found: error
 
   e2e:
     name: End-to-end test (${{ matrix.os }})
     needs: build
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -43,6 +55,10 @@ jobs:
         with:
           name: bin-x64
           path: bin
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-x86
+          path: bin/x86
       - name: Run
         shell: pwsh
         run: |
@@ -52,10 +68,12 @@ jobs:
           $p = Start-Process -FilePath bin\ExplorerPinnedE2E.exe -ArgumentList "bin\ExplorerPinned.exe", "$PWD\screenshots" `
             -NoNewWindow -PassThru -RedirectStandardOutput e2e.txt
           $null = $p.Handle
-          $finished = $p.WaitForExit(600000)
+          $finished = $p.WaitForExit(1080000)
           if (-not $finished) { $p.Kill() }
           Get-Content e2e.txt -Encoding utf8
           Write-Host "---- agent.log"
+          Get-Content "$env:TEMP\ep_agent.log" -Encoding utf8 -ErrorAction SilentlyContinue
+          Write-Host "---- agent.log after uninstall"
           Get-Content "$env:LOCALAPPDATA\ExplorerPinned\agent.log" -Encoding utf8 -ErrorAction SilentlyContinue
           if (-not $finished) { Write-Error "E2E timed out"; exit 1 }
           exit $p.ExitCode
@@ -92,6 +110,10 @@ jobs:
         with:
           name: bin-arm64
           path: dist/arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-x86
+          path: dist/x86
       - name: Read version
         id: version
         shell: pwsh
@@ -157,6 +179,26 @@ jobs:
           $menu = (Get-ItemProperty -LiteralPath "HKCU:\Software\Classes\*\shell\ExplorerPinned.Pin").MUIVerb
           Write-Host "menu text: $menu"
           if ($menu -ne "このファイルをピン止めする") { throw "unexpected menu text" }
+          if ($status -notmatch "dialogs: registered \(on\)") { throw "file dialog support not registered" }
+          $overlay = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers\    ExplorerPinned"
+          $overlay32 = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers\    ExplorerPinned"
+          if (-not (Test-Path -LiteralPath $overlay) -or -not (Test-Path -LiteralPath $overlay32)) { throw "dialog DLLs not registered" }
+
+          # Installing again while a program has the dialog DLL loaded (it is moved aside).
+          $dll = "$env:ProgramFiles\Explorer Pinned\ExplorerPinnedShell.dll"
+          $handle = [System.Runtime.InteropServices.NativeLibrary]::Load($dll)
+          $p = Start-Process $setup.FullName -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LANG=japanese", "/LOG=reinstall.log" -PassThru
+          $null = $p.Handle
+          if (-not $p.WaitForExit(300000)) { throw "second setup timed out" }
+          Start-Sleep -Seconds 3
+          if ($p.ExitCode -ne 0) { Get-Content reinstall.log; throw "second setup failed: $($p.ExitCode)" }
+          if (-not (Test-Path $dll)) { throw "DLL missing after installing again" }
+          $old = Get-ChildItem "$env:ProgramFiles\Explorer Pinned\ExplorerPinnedShell.dll.*.old"
+          Write-Host "moved aside: $($old.Name)"
+          if (-not $old) { throw "the loaded DLL was not moved aside" }
+          [System.Runtime.InteropServices.NativeLibrary]::Free($handle)
+          $status = & $exe status | Out-String
+          if ($status -notmatch "dialogs: registered \(on\)") { throw "file dialog support not registered after installing again" }
 
           $uninstaller = Get-ChildItem "$env:ProgramFiles\Explorer Pinned\unins*.exe" | Select-Object -First 1
           $p = Start-Process $uninstaller.FullName -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -PassThru
@@ -167,21 +209,26 @@ jobs:
           if (Test-Path $exe) { throw "files left behind" }
           if (Test-Path -LiteralPath "HKCU:\Software\Classes\*\shell\ExplorerPinned.Pin") { throw "menu left behind" }
           if (Test-Path "HKCU:\Software\ExplorerPinned") { throw "settings left behind" }
+          if (Test-Path "$env:LOCALAPPDATA\ExplorerPinned") { throw "log left behind" }
+          if (Test-Path "$env:ProgramData\ExplorerPinned") { throw "schema file left behind" }
           if ((Get-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run).ExplorerPinned) { throw "startup entry left behind" }
           $schemas = Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\PropertySystem\PropertySchema" -ErrorAction SilentlyContinue |
             ForEach-Object { (Get-ItemProperty $_.PSPath).PSObject.Properties.Value } | Where-Object { "$_" -like "*ExplorerPinned*" }
           if ($schemas) { throw "schema left behind: $schemas" }
           if (Get-Process ExplorerPinned -ErrorAction SilentlyContinue) { throw "agent still running" }
+          if ((Test-Path -LiteralPath $overlay) -or (Test-Path -LiteralPath $overlay32)) { throw "dialog DLLs still registered" }
+          if (Test-Path "HKLM:\SOFTWARE\Classes\CLSID\{432E90E6-6BCF-44FE-9F87-8BA191F04870}") { throw "DLL class left behind" }
           Write-Host "installer test passed"
 
   release:
     name: Release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release)
     needs: [e2e, package, installer-test]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: packages
@@ -189,6 +236,12 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ inputs.target }}
         run: |
-          gh release create "$GITHUB_REF_NAME" packages/* \
-            --repo "$GITHUB_REPOSITORY" --title "Explorer Pinned ${GITHUB_REF_NAME#v}" --generate-notes
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="v$(sed -n 's/.*EP_VERSION_STRING "\(.*\)"/\1/p' src/version.h)"
+          fi
+          gh release create "$tag" packages/* --repo "$GITHUB_REPOSITORY" --target "${TARGET:-$GITHUB_SHA}" \
+            --title "Explorer Pinned ${tag#v}" --notes-file .github/release-notes.md --generate-notes

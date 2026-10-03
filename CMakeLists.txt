@@ -10,6 +10,8 @@ set(EP_SOURCES
     src/agent.cpp
     src/comutil.cpp
     src/console.cpp
+    src/dialogs.cpp
+    src/displaycheck.cpp
     src/main.cpp
     src/pinstore.cpp
     src/setup.cpp
@@ -23,6 +25,20 @@ target_compile_definitions(ExplorerPinned PRIVATE UNICODE _UNICODE NOMINMAX WIN3
 target_link_libraries(ExplorerPinned PRIVATE ole32 oleaut32 shell32 shlwapi propsys uuid comctl32 user32 advapi32)
 if(MSVC)
     target_compile_options(ExplorerPinned PRIVATE /W4 /permissive- /utf-8 /EHsc)
+endif()
+
+# Loaded into programs that show a file dialog (registered as an icon overlay handler) to
+# show the pinned group in Open/Save dialogs too.
+add_library(ExplorerPinnedShell SHARED src/shellext.cpp src/comutil.cpp src/dialogs.cpp src/pinstore.cpp src/util.cpp
+    src/shellext.def src/shellext.rc)
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    # For 32-bit programs on 64-bit Windows; installed next to the 64-bit DLL.
+    set_target_properties(ExplorerPinnedShell PROPERTIES OUTPUT_NAME ExplorerPinnedShell32)
+endif()
+target_compile_definitions(ExplorerPinnedShell PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
+target_link_libraries(ExplorerPinnedShell PRIVATE ole32 oleaut32 shell32 shlwapi propsys uuid user32 advapi32)
+if(MSVC)
+    target_compile_options(ExplorerPinnedShell PRIVATE /W4 /permissive- /utf-8 /EHsc)
 endif()
 
 option(EP_BUILD_TESTS "Build the end-to-end test program" ON)

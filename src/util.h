@@ -31,6 +31,9 @@ bool IsElevated();
 // True when running elevated through a UAC prompt (Explorer itself is not elevated then).
 bool IsUacElevated();
 
+// Diagnostic log (agent.log) in %LOCALAPPDATA%\ExplorerPinned.
 void LogLine(const wchar_t* fmt, ...);
+std::wstring LogDirectory();
+void DeleteLogs();
 
 }  // namespace ep

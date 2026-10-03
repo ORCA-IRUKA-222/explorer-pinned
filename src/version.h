@@ -1,6 +1,9 @@
 #pragma once
 
 #define EP_VERSION_MAJOR 1
-#define EP_VERSION_MINOR 0
+#define EP_VERSION_MINOR 1
 #define EP_VERSION_PATCH 0
-#define EP_VERSION_STRING "1.0.0"
+#define EP_VERSION_STRING "1.1.0"
+#define EP_WIDEN_(x) L##x
+#define EP_WIDEN(x) EP_WIDEN_(x)
+#define EP_VERSION_STRING_W EP_WIDEN(EP_VERSION_STRING)

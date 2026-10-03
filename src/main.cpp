@@ -8,6 +8,7 @@
 
 #include "agent.h"
 #include "console.h"
+#include "dialogs.h"
 #include "pinstore.h"
 #include "resource.h"
 #include "setup.h"
@@ -94,8 +95,15 @@ std::wstring SchemaLabel() {
 int Status() {
     std::wstring s;
     s += L"schema: " + std::wstring(IsSchemaRegistered() ? L"registered (" + SchemaLabel() + L")" : L"not registered") + L"\n";
+    for (const auto& r : SchemaRegistrations())
+        s += L"  " + r.path + (r.legacy ? L" (old)" : L"") + (r.exists ? L"" : L" (missing)") + L"\n";
     s += L"menu: " + std::wstring(IsContextMenuRegistered() ? L"registered" : L"not registered") + L"\n";
     s += L"startup: " + std::wstring(IsStartupEnabled() ? L"on" : L"off") + L"\n";
+    std::wstring dll = RegisteredDialogExtension(KEY_WOW64_64KEY), dll32 = RegisteredDialogExtension(KEY_WOW64_32KEY);
+    s += L"dialogs: " +
+         std::wstring(dll.empty() ? L"not registered" : DialogsSettingOn() ? L"registered (on)" : L"registered (off)") + L"\n";
+    if (!dll.empty()) s += L"  " + dll + L"\n";
+    if (!dll32.empty()) s += L"  " + dll32 + L"\n";
     s += L"agent: " + std::wstring(FindAgentWindow() ? L"running" : L"not running") + L"\n";
     s += L"pins: " + std::to_wstring(PinStore::LoadAll().size()) + L"\n";
     ConsoleWrite(s);
@@ -112,9 +120,31 @@ int RegisterSchemaCommand() {
     return SUCCEEDED(hr) ? kOk : kError;
 }
 
+// Removes everything machine-wide: the property and the file dialog support.
 int UnregisterSchemaCommand() {
     UnregisterSchema();
+    UnregisterDialogExtension(KEY_WOW64_64KEY);
+    UnregisterDialogExtension(KEY_WOW64_32KEY);
     return kOk;
+}
+
+// The machine-wide part of the file dialog support: registers the DLLs installed next to
+// the program (the installer runs this).
+int RegisterDialogsCommand() {
+    std::wstring dll = ExeDirectory() + L"\\" + kShellDllName;
+    std::wstring dll32 = ExeDirectory() + L"\\" + kShellDll32Name;
+    if (!PathExists(dll)) {
+        ConsoleWrite(L"register-dialogs: " + dll + L" is missing\n");
+        return kError;
+    }
+    if (!IsProtectedLocation(dll)) {
+        ConsoleWrite(L"register-dialogs: the program must be installed under Program Files\n");
+        return kError;
+    }
+    bool ok = RegisterDialogExtension(KEY_WOW64_64KEY, dll);
+    if (ok && PathExists(dll32)) ok = RegisterDialogExtension(KEY_WOW64_32KEY, dll32);
+    if (!ok) ConsoleWrite(L"register-dialogs failed (administrator rights are needed)\n");
+    return ok ? kOk : kError;
 }
 
 // Registers the property schema, elevating when necessary.
@@ -148,12 +178,15 @@ int Uninstall(bool keepSchema, bool quiet) {
     RemoveContextMenu();
     SetStartupEnabled(false);
     RegDeleteTreeW(HKEY_CURRENT_USER, kRegRoot);
-    if (!keepSchema && IsSchemaRegistered()) {
+    ResetSavedPinnedGroupings();
+    bool dialogs = !RegisteredDialogExtension(KEY_WOW64_64KEY).empty() || !RegisteredDialogExtension(KEY_WOW64_32KEY).empty();
+    if (!keepSchema && (IsSchemaRegistered() || dialogs)) {
         if (IsElevated())
-            UnregisterSchema();
+            UnregisterSchemaCommand();
         else
             RunElevated(L"unregister-schema");
     }
+    DeleteLogs();
     if (!quiet) ShowInfo(LoadStr(IDS_MSG_UNINSTALLED));
     return kOk;
 }
@@ -197,6 +230,13 @@ int Dispatch(const std::wstring& command, const std::vector<std::wstring>& rest,
     if (command == L"uninstall") return Uninstall(hasFlag(L"--keep-schema"), hasFlag(L"--quiet"));
     if (command == L"register-schema") return RegisterSchemaCommand();
     if (command == L"unregister-schema") return UnregisterSchemaCommand();
+    if (command == L"register-dialogs") return RegisterDialogsCommand();
+    if (command == L"unregister-dialogs") {
+        UnregisterDialogExtension(KEY_WOW64_64KEY);
+        UnregisterDialogExtension(KEY_WOW64_32KEY);
+        ResetSavedPinnedGroupings();
+        return kOk;
+    }
 
     ShowInfo(LoadStr(IDS_MSG_USAGE));
     return (command == L"help" || command == L"--help" || command == L"/?" || command == L"-h") ? kOk : kUsage;

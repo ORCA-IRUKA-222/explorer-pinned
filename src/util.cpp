@@ -160,21 +160,38 @@ bool IsUacElevated() {
     return ok && type == TokenElevationTypeFull;
 }
 
-// Diagnostics go to OutputDebugString always, and to
-// %LOCALAPPDATA%\ExplorerPinned\agent.log when HKCU\Software\ExplorerPinned\Log = "1".
+std::wstring LogDirectory() {
+    std::wstring result;
+    PWSTR dir = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &dir))) {
+        result = std::wstring(dir) + L"\\ExplorerPinned";
+        CoTaskMemFree(dir);
+    }
+    return result;
+}
+
+void DeleteLogs() {
+    std::wstring dir = LogDirectory();
+    if (dir.empty()) return;
+    DeleteFileW((dir + L"\\agent.log").c_str());
+    DeleteFileW((dir + L"\\agent.old.log").c_str());
+    RemoveDirectoryW(dir.c_str());
+}
+
+// Diagnostics go to OutputDebugString and to %LOCALAPPDATA%\ExplorerPinned\agent.log
+// (about 1 MB at most, the previous part is kept in agent.old.log), unless
+// HKCU\Software\ExplorerPinned\Log = "0".
 void LogLine(const wchar_t* fmt, ...) {
     static int enabled = -1;
     static std::wstring logPath;
     if (enabled < 0) {
         std::wstring v;
-        enabled = RegReadString(HKEY_CURRENT_USER, kRegRoot, L"Log", &v) && v == L"1";
+        enabled = !(RegReadString(HKEY_CURRENT_USER, kRegRoot, L"Log", &v) && v == L"0");
         if (enabled) {
-            PWSTR dir = nullptr;
-            if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &dir))) {
-                logPath = std::wstring(dir) + L"\\ExplorerPinned";
+            logPath = LogDirectory();
+            if (!logPath.empty()) {
                 CreateDirectoryW(logPath.c_str(), nullptr);
                 logPath += L"\\agent.log";
-                CoTaskMemFree(dir);
             }
         }
     }
@@ -189,8 +206,16 @@ void LogLine(const wchar_t* fmt, ...) {
     OutputDebugStringW(buf);
     OutputDebugStringW(L"\n");
     if (enabled > 0 && !logPath.empty()) {
-        HANDLE h = CreateFileW(logPath.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                               OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        HANDLE h = CreateFileW(logPath.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        LARGE_INTEGER size = {};
+        if (h != INVALID_HANDLE_VALUE && GetFileSizeEx(h, &size) && size.QuadPart > 1024 * 1024) {
+            CloseHandle(h);
+            std::wstring old = logPath.substr(0, logPath.size() - 4) + L".old.log";
+            MoveFileExW(logPath.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING);
+            h = CreateFileW(logPath.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        }
         if (h != INVALID_HANDLE_VALUE) {
             char out[4096];
             int n = WideCharToMultiByte(CP_UTF8, 0, buf, -1, out, sizeof(out) - 2, nullptr, nullptr);
