@@ -1021,6 +1021,11 @@ int wmain(int argc, wchar_t** argv) {
     TouchFile(g_dir + L"\\" + special, 2022);
     CreateDirectoryW((g_dir + L"\\delta").c_str(), nullptr);
     DeleteFileW((g_dir + L"\\echo.txt").c_str());
+    // A folder like a well-used Downloads folder, created now: on a real machine its files
+    // exist long before the folder is opened. Right after hundreds of new files appear,
+    // Explorer can stay busy (icons, virus scan) and show no items for more than a minute.
+    const std::wstring large = g_dir + L"\\large";
+    PopulateLargeFolder(large);
 
     // --- resources
     Check(ExeString(IDS_MENU_PIN_FILE, kJapanese) == L"このファイルをピン止めする", L"Japanese string table");
@@ -1272,8 +1277,6 @@ int wmain(int argc, wchar_t** argv) {
 
     // --- a large folder (like a well-used Downloads folder) in large-icon view
     {
-        std::wstring large = g_dir + L"\\large";
-        PopulateLargeFolder(large);
         RunExe(L"pin \"" + large + L"\\photo_050.bmp\" \"" + large + L"\\folder_007\"");
         w.Navigate(large);
         w.Refresh();
