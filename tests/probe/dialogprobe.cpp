@@ -222,6 +222,141 @@ static void DumpBags(HKEY root, const std::wstring& path, int depth) {
     RegCloseKey(k);
 }
 
+// Types a path into the dialog's file name box and presses Open: the dialog shows that folder.
+static void NavigateDialog(HWND dlg, const std::wstring& path) {
+    HWND combo = GetDlgItem(dlg, 1148);
+    HWND edit = combo ? FindWindowExW(combo, NULL, L"ComboBox", NULL) : NULL;
+    if (edit) edit = FindWindowExW(edit, NULL, L"Edit", NULL);
+    if (!edit && combo) edit = FindWindowExW(combo, NULL, L"Edit", NULL);
+    Log(L"  navigate to %s (file name box %p / %p)", path.c_str(), combo, edit);
+    if (!edit) return;
+    SendMessageW(edit, WM_SETTEXT, 0, (LPARAM)path.c_str());
+    PostMessageW(dlg, WM_COMMAND, IDOK, 0);
+}
+
+static std::wstring ImageName(DWORD pid) {
+    std::wstring result;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return result;
+    wchar_t path[MAX_PATH];
+    DWORD n = MAX_PATH;
+    if (QueryFullProcessImageNameW(h, 0, path, &n)) {
+        const wchar_t* slash = wcsrchr(path, L'\\');
+        result = slash ? slash + 1 : path;
+    }
+    CloseHandle(h);
+    return result;
+}
+
+static BOOL CALLBACK HasDefViewProc(HWND hwnd, LPARAM lp) {
+    wchar_t cls[64];
+    if (GetClassNameW(hwnd, cls, 64) && wcscmp(cls, L"SHELLDLL_DefView") == 0) {
+        *(bool*)lp = true;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+struct FindByImage {
+    const wchar_t* exe;
+    const wchar_t* title;  // NULL: a file dialog
+    HWND found;
+};
+static BOOL CALLBACK FindByImageProc(HWND hwnd, LPARAM lp) {
+    FindByImage* r = (FindByImage*)lp;
+    if (!IsWindowVisible(hwnd)) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (_wcsicmp(ImageName(pid).c_str(), r->exe) != 0) return TRUE;
+    if (r->title) {
+        wchar_t text[256] = L"";
+        GetWindowTextW(hwnd, text, 256);
+        if (!wcsstr(text, r->title)) return TRUE;
+    } else {
+        wchar_t cls[32];
+        if (!GetClassNameW(hwnd, cls, 32) || wcscmp(cls, L"#32770") != 0) return TRUE;
+        bool defView = false;
+        EnumChildWindows(hwnd, HasDefViewProc, (LPARAM)&defView);
+        if (!defView) return TRUE;
+    }
+    r->found = hwnd;
+    return FALSE;
+}
+static HWND WaitWindowOf(const wchar_t* exe, const wchar_t* title, DWORD ms) {
+    DWORD start = GetTickCount();
+    do {
+        FindByImage r = {exe, title, NULL};
+        EnumWindows(FindByImageProc, (LPARAM)&r);
+        if (r.found) return r.found;
+        Pump(250);
+    } while (GetTickCount() - start < ms);
+    return NULL;
+}
+
+// Clicks the page's file button through UI Automation (a click by assistive technology
+// counts as a user action, which a page needs to open the file chooser). Runs on its own
+// thread: a browser may only return from the click once its dialog closes.
+static HWND g_clickHwnd;
+static DWORD WINAPI ClickThread(LPVOID) {
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    IUIAutomation* uia = NULL;
+    CoCreateInstance(CLSID_CUIAutomation, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&uia));
+    IUIAutomationElement* root = NULL;
+    if (uia) uia->ElementFromHandle(g_clickHwnd, &root);
+    VARIANT v;
+    v.vt = VT_BSTR;
+    v.bstrVal = SysAllocString(L"pickfile");
+    IUIAutomationCondition* cond = NULL;
+    if (uia) uia->CreatePropertyCondition(UIA_NamePropertyId, v, &cond);
+    IUIAutomationElement* el = NULL;
+    for (int i = 0; i < 40 && root && cond && !el; i++) {
+        root->FindFirst(TreeScope_Descendants, cond, &el);
+        if (!el) Sleep(500);
+    }
+    HRESULT hr = E_FAIL;
+    if (el) {
+        IUIAutomationInvokePattern* inv = NULL;
+        el->GetCurrentPatternAs(UIA_InvokePatternId, IID_PPV_ARGS(&inv));
+        if (inv) {
+            Log(L"  UIA: invoking the file button");
+            hr = inv->Invoke();
+            inv->Release();
+        } else {
+            IUIAutomationLegacyIAccessiblePattern* acc = NULL;
+            el->GetCurrentPatternAs(UIA_LegacyIAccessiblePatternId, IID_PPV_ARGS(&acc));
+            if (acc) {
+                Log(L"  UIA: default action on the file button");
+                hr = acc->DoDefaultAction();
+                acc->Release();
+            }
+        }
+        el->Release();
+    } else {
+        Log(L"  UIA: file button not found");
+    }
+    Log(L"  UIA click: 0x%08lx", (unsigned long)hr);
+    VariantClear(&v);
+    if (cond) cond->Release();
+    if (root) root->Release();
+    if (uia) uia->Release();
+    CoUninitialize();
+    return 0;
+}
+
+static void PressSpace(HWND hwnd) {
+    // Windows lets a process take the foreground right after a key press.
+    keybd_event(VK_MENU, 0, 0, 0);
+    keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+    SetForegroundWindow(hwnd);
+    Pump(500);
+    Log(L"  keyboard: foreground %s", GetForegroundWindow() == hwnd ? L"ok" : L"not the browser");
+    INPUT in[2] = {};
+    in[0].type = in[1].type = INPUT_KEYBOARD;
+    in[0].ki.wVk = in[1].ki.wVk = VK_SPACE;
+    in[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(2, in, sizeof(INPUT));
+}
+
 static int Host(const std::wstring& folder) {
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     IFileOpenDialog* d = NULL;
@@ -318,97 +453,122 @@ int wmain(int argc, wchar_t** argv) {
     }
     check(L"D1 saved");
 
-    Log(L"######## D2 closed with the Cancel button (sent WM_COMMAND)");
+    Log(L"######## D6 navigating to another folder inside the dialog, then Cancel");
     host = Start(hostCmd);
     dlg = WaitDialog(host.dwProcessId, 15000);
     if (dlg) {
-        Watch(dlg, 6000, L"D2");
-        SendMessageW(dlg, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED), (LPARAM)GetDlgItem(dlg, IDCANCEL));
-        Pump(1500);
+        Watch(dlg, 6000, L"D6");
+        wchar_t win[MAX_PATH];
+        GetWindowsDirectoryW(win, MAX_PATH);
+        NavigateDialog(dlg, win);
+        Pump(3000);
         CloseDialog(dlg, host);
     }
-    check(L"D2 saved");
-
-    Log(L"######## D3 closed from the title bar (SC_CLOSE)");
-    host = Start(hostCmd);
-    dlg = WaitDialog(host.dwProcessId, 15000);
-    if (dlg) {
-        Watch(dlg, 6000, L"D3");
-        PostMessageW(dlg, WM_SYSCOMMAND, SC_CLOSE, 0);
-        Pump(1500);
-        CloseDialog(dlg, host);
-    }
-    check(L"D3 saved");
-
-    Log(L"######## D4 without restoring on close: where the dialog saves the grouping");
-    SetEnvironmentVariableW(L"EXPLORERPINNED_NO_RESTORE", L"1");
-    host = Start(hostCmd);
-    SetEnvironmentVariableW(L"EXPLORERPINNED_NO_RESTORE", NULL);
-    dlg = WaitDialog(host.dwProcessId, 15000);
-    if (dlg) {
-        Watch(dlg, 6000, L"D4");
-        CloseDialog(dlg, host);
-    }
+    check(L"D6 saved");
     DumpBags(HKEY_CURRENT_USER, L"Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\Bags", 0);
-    check(L"D4 saved");
 
-    Log(L"######## D5 Notepad's Open dialog");
-    PROCESS_INFORMATION np = Start(L"notepad.exe");
-    Pump(3000);
-    HWND main = NULL;
-    for (int i = 0; i < 20 && !main; i++) {
-        struct R {
-            DWORD pid;
-            HWND w;
-        } r = {np.dwProcessId, NULL};
-        EnumWindows(
-            [](HWND h, LPARAM lp) -> BOOL {
-                R* r = (R*)lp;
-                DWORD pid = 0;
-                GetWindowThreadProcessId(h, &pid);
-                if (pid == r->pid && IsWindowVisible(h) && GetMenu(h)) {
-                    r->w = h;
-                    return FALSE;
-                }
-                return TRUE;
-            },
-            (LPARAM)&r);
-        main = r.w;
-        if (!main) Pump(500);
+    // Upload dialogs of web browsers.
+    std::wstring page = std::wstring(tmp) + L"ep_upload.html";
+    {
+        HANDLE h = CreateFileW(page.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        const char html[] = "<!doctype html><title>ep-upload</title><input type=file id=f aria-label=pickfile autofocus>";
+        DWORD w;
+        WriteFile(h, html, sizeof(html) - 1, &w, NULL);
+        CloseHandle(h);
     }
-    Log(L"  notepad window %p", main);
-    if (main) {
-        HMENU file = GetSubMenu(GetMenu(main), 0);
-        UINT openId = 0;
-        for (int i = 0; file && i < GetMenuItemCount(file) && !openId; i++) {
-            wchar_t text[128] = L"";
-            GetMenuStringW(file, i, text, 128, MF_BYPOSITION);
-            Log(L"  menu %d: %s", i, text);
-            if (wcsstr(text, L"Open")) openId = GetMenuItemID(file, i);
+    std::wstring url = L"file:///" + page;
+    std::replace(url.begin(), url.end(), L'\\', L'/');
+    struct Browser {
+        const wchar_t* name;
+        const wchar_t* exe;
+        std::vector<std::wstring> paths;
+    };
+    wchar_t pf[MAX_PATH], pf86[MAX_PATH];
+    ExpandEnvironmentStringsW(L"%ProgramFiles%", pf, MAX_PATH);
+    ExpandEnvironmentStringsW(L"%ProgramFiles(x86)%", pf86, MAX_PATH);
+    std::vector<Browser> browsers = {
+        {L"Chrome", L"chrome.exe",
+         {std::wstring(pf) + L"\\Google\\Chrome\\Application\\chrome.exe",
+          std::wstring(pf86) + L"\\Google\\Chrome\\Application\\chrome.exe"}},
+        {L"Edge", L"msedge.exe",
+         {std::wstring(pf86) + L"\\Microsoft\\Edge\\Application\\msedge.exe",
+          std::wstring(pf) + L"\\Microsoft\\Edge\\Application\\msedge.exe"}},
+        {L"Firefox", L"firefox.exe", {std::wstring(pf) + L"\\Mozilla Firefox\\firefox.exe"}},
+    };
+    for (auto& b : browsers) {
+        Log(L"######## %s upload dialog", b.name);
+        std::wstring exe;
+        for (auto& p : b.paths)
+            if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) exe = p;
+        if (exe.empty()) {
+            Log(L"  not installed");
+            continue;
         }
-        Log(L"  open command %u", openId);
-        PostMessageW(main, WM_COMMAND, openId, 0);
-        dlg = WaitDialog(np.dwProcessId, 15000);
-        Log(L"  dialog %p", dlg);
-        if (dlg) {
-            Pump(1500);
-            HWND combo = GetDlgItem(dlg, 1148);
-            HWND edit = combo ? FindWindowExW(combo, NULL, L"ComboBox", NULL) : NULL;
-            if (edit) edit = FindWindowExW(edit, NULL, L"Edit", NULL);
-            if (!edit && combo) edit = FindWindowExW(combo, NULL, L"Edit", NULL);
-            Log(L"  file name box %p / %p", combo, edit);
-            if (edit) {
-                SendMessageW(edit, WM_SETTEXT, 0, (LPARAM)dir.c_str());
-                PostMessageW(dlg, WM_COMMAND, IDOK, 0);
+        std::wstring profile = std::wstring(tmp) + L"ep_profile_" + b.name;
+        SHCreateDirectoryExW(NULL, profile.c_str(), NULL);
+        std::wstring cmd = L"\"" + exe + L"\" ";
+        if (wcscmp(b.exe, L"firefox.exe") == 0) {
+            // No welcome pages in the fresh profile.
+            HANDLE h = CreateFileW((profile + L"\\user.js").c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                                   FILE_ATTRIBUTE_NORMAL, NULL);
+            const char prefs[] = "user_pref(\"browser.aboutwelcome.enabled\", false);\n"
+                                 "user_pref(\"browser.startup.homepage_override.mstone\", \"ignore\");\n"
+                                 "user_pref(\"datareporting.policy.firstRunURL\", \"\");\n"
+                                 "user_pref(\"browser.shell.checkDefaultBrowser\", false);\n";
+            DWORD w;
+            WriteFile(h, prefs, sizeof(prefs) - 1, &w, NULL);
+            CloseHandle(h);
+        }
+        if (wcscmp(b.exe, L"firefox.exe") == 0)
+            cmd += L"-no-remote -profile \"" + profile + L"\" \"" + url + L"\"";
+        else
+            cmd += L"--user-data-dir=\"" + profile +
+                   L"\" --no-first-run --no-default-browser-check --disable-search-engine-choice-screen "
+                   L"--force-renderer-accessibility \"" + url + L"\"";
+        HANDLE job = CreateJobObjectW(NULL, NULL);
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION lim = {};
+        lim.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &lim, sizeof(lim));
+        STARTUPINFOW si = {sizeof(si)};
+        PROCESS_INFORMATION pi = {};
+        if (!CreateProcessW(NULL, cmd.data(), NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
+            Log(L"  CreateProcess failed %lu", GetLastError());
+            CloseHandle(job);
+            continue;
+        }
+        AssignProcessToJobObject(job, pi.hProcess);
+        ResumeThread(pi.hThread);
+        HWND win = WaitWindowOf(b.exe, L"ep-upload", 30000);
+        Log(L"  browser window %p", win);
+        HWND bdlg = NULL;
+        if (win) {
+            Pump(2000);
+            g_clickHwnd = win;
+            CloseHandle(CreateThread(NULL, 0, ClickThread, NULL, 0, NULL));
+            bdlg = WaitWindowOf(b.exe, NULL, 25000);
+            if (!bdlg) {
+                PressSpace(win);
+                bdlg = WaitWindowOf(b.exe, NULL, 10000);
             }
-            Watch(dlg, 12000, L"D5");
-            PostMessageW(dlg, WM_COMMAND, IDCANCEL, 0);
         }
-    }
-    if (np.hProcess) {
-        TerminateProcess(np.hProcess, 0);
-        CloseHandle(np.hProcess);
-        CloseHandle(np.hThread);
+        if (bdlg) {
+            DWORD dpid = 0;
+            GetWindowThreadProcessId(bdlg, &dpid);
+            Log(L"  dialog %p in process %lu (browser process %lu)", bdlg, dpid, pi.dwProcessId);
+            Pump(1500);
+            Watch(bdlg, 2500, b.name);
+            NavigateDialog(bdlg, dir);
+            Watch(bdlg, 10000, b.name);
+            PostMessageW(bdlg, WM_COMMAND, IDCANCEL, 0);
+            Pump(2000);
+        } else {
+            Log(L"  no file dialog");
+        }
+        TerminateJobObject(job, 0);
+        CloseHandle(job);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        Pump(2000);
     }
 
     Fn unreg = m ? (Fn)GetProcAddress(m, "DllUnregisterServer") : NULL;

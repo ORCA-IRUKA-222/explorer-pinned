@@ -89,7 +89,7 @@ void ReadPreviousGrouping(const std::wstring& folder, PROPERTYKEY* key, BOOL* as
     if (!RegReadString(HKEY_CURRENT_USER, kRegPreviousDialogGroupBy, folder.c_str(), &value)) return;
     size_t c1 = value.find(L',');
     size_t c2 = value.find(L',', c1 + 1);
-    GUID g;
+    GUID g = GUID_NULL;
     if (c1 == std::wstring::npos || c2 == std::wstring::npos || FAILED(CLSIDFromString(value.substr(0, c1).c_str(), &g)))
         return;
     PROPERTYKEY k = {g, (DWORD)wcstoul(value.substr(c1 + 1, c2 - c1 - 1).c_str(), nullptr, 10)};
