@@ -88,6 +88,18 @@ jobs:
             $img.Dispose()
             Remove-Item $_.FullName
           }
+          # The corner with the on/off button, printed so that it can be looked at from the log.
+          foreach ($name in "explorer-button-on", "explorer-button-off", "dialog-button-on", "dialog-button-off") {
+            $file = "$PWD\screenshots\$name.png"
+            if (-not (Test-Path $file)) { continue }
+            $img = [System.Drawing.Bitmap]::FromFile($file)
+            $w = [Math]::Min(520, $img.Width); $h = [Math]::Min(170, $img.Height)
+            $crop = $img.Clone((New-Object System.Drawing.Rectangle ($img.Width - $w), ($img.Height - $h), $w, $h), $img.PixelFormat)
+            $ms = New-Object System.IO.MemoryStream
+            $crop.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+            Write-Host "SHOT $name $([Convert]::ToBase64String($ms.ToArray()))"
+            $crop.Dispose(); $img.Dispose()
+          }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
