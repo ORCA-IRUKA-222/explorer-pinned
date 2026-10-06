@@ -26,6 +26,7 @@
 #include <set>
 
 #include "../src/resource.h"
+#include "toggle.h"
 #include "util.h"
 
 using namespace ep;
@@ -40,6 +41,7 @@ int g_failures = 0;
 std::wstring g_exe;
 std::wstring g_dir;
 std::wstring g_pinnedLabel;
+std::wstring g_shots;  // where screenshots go (empty: none)
 
 void Print(const std::wstring& s) {
     int n = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0, nullptr, nullptr);
@@ -506,6 +508,124 @@ void SaveScreenshot(HWND hwnd, const std::wstring& path) {
     DeleteObject(bmp);
     DeleteDC(mem);
     ReleaseDC(nullptr, screen);
+}
+
+// Saves what the screen shows in the window's rectangle, with the windows over it (the on/off
+// button is a window of its own, which PrintWindow leaves out).
+void SaveScreenArea(HWND hwnd, const std::wstring& name) {
+    if (g_shots.empty()) return;
+    RECT r;
+    GetWindowRect(hwnd, &r);
+    int width = r.right - r.left, height = r.bottom - r.top;
+    HDC screen = GetDC(nullptr);
+    HDC mem = CreateCompatibleDC(screen);
+    HBITMAP bmp = CreateCompatibleBitmap(screen, width, height);
+    HGDIOBJ old = SelectObject(mem, bmp);
+    BitBlt(mem, 0, 0, width, height, screen, r.left, r.top, SRCCOPY | CAPTUREBLT);
+    SelectObject(mem, old);
+    BITMAPINFOHEADER bi = {sizeof(bi)};
+    bi.biWidth = width;
+    bi.biHeight = height;
+    bi.biPlanes = 1;
+    bi.biBitCount = 24;
+    bi.biCompression = BI_RGB;
+    DWORD stride = ((width * 3 + 3) & ~3);
+    std::vector<BYTE> pixels(stride * height);
+    GetDIBits(mem, bmp, 0, height, pixels.data(), reinterpret_cast<BITMAPINFO*>(&bi), DIB_RGB_COLORS);
+    BITMAPFILEHEADER bf = {};
+    bf.bfType = 0x4D42;
+    bf.bfOffBits = sizeof(bf) + sizeof(bi);
+    bf.bfSize = bf.bfOffBits + (DWORD)pixels.size();
+    HANDLE f = CreateFileW((g_shots + L"\\" + name + L".bmp").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        DWORD written;
+        WriteFile(f, &bf, sizeof(bf), &written, nullptr);
+        WriteFile(f, &bi, sizeof(bi), &written, nullptr);
+        WriteFile(f, pixels.data(), (DWORD)pixels.size(), &written, nullptr);
+        CloseHandle(f);
+    }
+    DeleteObject(bmp);
+    DeleteDC(mem);
+    ReleaseDC(nullptr, screen);
+}
+
+// ---------------------------------------------------------------- on/off button
+// The on/off button shown for `owner` (an Explorer window or a file dialog), if any.
+HWND FindToggle(HWND owner) {
+    struct Search {
+        HWND owner;
+        HWND found;
+    } search = {owner, nullptr};
+    EnumWindows(
+        [](HWND hwnd, LPARAM lp) -> BOOL {
+            auto* s = reinterpret_cast<Search*>(lp);
+            wchar_t cls[64];
+            if (GetClassNameW(hwnd, cls, 64) && wcscmp(cls, kToggleClass) == 0 && GetWindow(hwnd, GW_OWNER) == s->owner) {
+                s->found = hwnd;
+                return FALSE;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&search));
+    return search.found;
+}
+
+bool ToggleShown(HWND owner) {
+    HWND b = FindToggle(owner);
+    return b && IsWindowVisible(b);
+}
+
+// What the button says (its window text, also read by screen readers): 1 = on, 0 = off.
+int ButtonState(HWND button) {
+    wchar_t text[128] = L"";
+    GetWindowTextW(button, text, 128);
+    if (wcsstr(text, L"オン（") || wcsstr(text, L": on")) return 1;
+    if (wcsstr(text, L"オフ（") || wcsstr(text, L": off")) return 0;
+    return -1;
+}
+
+std::wstring RectText(const RECT& r) {
+    return std::to_wstring(r.left) + L"," + std::to_wstring(r.top) + L"-" + std::to_wstring(r.right) + L"," +
+           std::to_wstring(r.bottom);
+}
+
+// The button lies within its window.
+void CheckToggleInside(HWND owner, const std::wstring& what) {
+    HWND b = FindToggle(owner);
+    RECT br = {}, wr = {};
+    if (b) GetWindowRect(b, &br);
+    GetWindowRect(owner, &wr);
+    bool inside = b && br.right > br.left && br.left >= wr.left && br.right <= wr.right && br.top >= wr.top &&
+                  br.bottom <= wr.bottom;
+    Check(inside, what, L"button " + RectText(br) + L", window " + RectText(wr));
+}
+
+bool SettingOff(const wchar_t* name) {
+    std::wstring v;
+    return RegReadString(HKEY_CURRENT_USER, kRegRoot, name, &v) && v == L"0";
+}
+
+// A real mouse click in the middle of the button.
+bool ClickToggleWithMouse(HWND owner) {
+    HWND b = FindToggle(owner);
+    if (!b) return false;
+    RECT r;
+    GetWindowRect(b, &r);
+    POINT pt = {(r.left + r.right) / 2, (r.top + r.bottom) / 2};
+    HWND under = WindowFromPoint(pt);
+    if (under != b) {
+        wchar_t cls[64] = L"";
+        GetClassNameW(under, cls, 64);
+        Print(L"the window under the button's middle is " + std::wstring(cls));
+    }
+    SetCursorPos(pt.x, pt.y);
+    Pump(100);
+    INPUT in[2] = {};
+    in[0].type = INPUT_MOUSE;
+    in[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+    in[1].type = INPUT_MOUSE;
+    in[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    return SendInput(2, in, sizeof(INPUT)) == 2;
 }
 
 bool IsPinnedInRegistry(const std::wstring& path) {
@@ -992,6 +1112,41 @@ void FileDialogTests(const std::wstring& binDir) {
         CloseDialog(dialog, pi);
     }
 
+    // The on/off button in the dialog
+    pi = StartProcess(hostCmd);
+    dialog = WaitFileDialogOf(pi.dwProcessId);
+    if (dialog) {
+        ExpectDialogPinned(dialog, {L"d2", L"subfolder_ep"}, L"file dialog: pinned group before using the on/off button");
+        Check(WaitFor([&] { return ToggleShown(dialog); }, 5000), L"file dialog: on/off button is shown");
+        CheckToggleInside(dialog, L"file dialog: on/off button lies inside the dialog");
+        HWND button = FindToggle(dialog);
+        Check(button && ButtonState(button) == 1, L"file dialog: the button says on");
+        SetForegroundWindow(dialog);
+        Pump(500);
+        SaveScreenArea(dialog, L"dialog-button-on");
+        DWORD t = GetTickCount();
+        PostMessageW(button, WM_LBUTTONUP, 0, 0);
+        Groups last;
+        long off = ElapsedUntil(t, [&] {
+            last = ReadGroups(dialog);
+            return last.order == std::vector<std::wstring>{L"(none)"};
+        });
+        Timing(L"file dialog: turn off with the button", off);
+        Check(off >= 0, L"file dialog: the button turns the pinned group off", last.Describe());
+        Check(SettingOff(L"Enabled"), L"file dialog: the button turns it off everywhere");
+        Check(WaitFor([&] { return ToggleShown(dialog) && ButtonState(FindToggle(dialog)) == 0; }, 5000),
+              L"file dialog: the button says off");
+        Pump(300);
+        SaveScreenArea(dialog, L"dialog-button-off");
+        t = GetTickCount();
+        PostMessageW(FindToggle(dialog), WM_LBUTTONUP, 0, 0);
+        Timing(L"file dialog: turn on with the button",
+               ElapsedUntil(t, [&] { return ShowsPinned(dialog, {L"d2", L"subfolder_ep"}); }));
+        ExpectDialogPinned(dialog, {L"d2", L"subfolder_ep"}, L"file dialog: the button turns it on again");
+        CloseDialog(dialog, pi);
+    }
+    RegWriteString(HKEY_CURRENT_USER, kRegRoot, L"Enabled", L"1");
+
     // A 32-bit program
     std::wstring host32 = binDir + L"\\x86\\ExplorerPinnedE2E.exe";
     pi = StartProcess(L"\"" + host32 + L"\" host \"" + folder + L"\"");
@@ -1038,6 +1193,7 @@ int wmain(int argc, wchar_t** argv) {
         return 100;
     }
     std::wstring shots = argc > 2 ? argv[2] : L"";
+    g_shots = shots;
     wchar_t full[MAX_PATH];
     GetFullPathNameW(argv[1], MAX_PATH, full, nullptr);
     g_exe = full;
@@ -1295,6 +1451,82 @@ int wmain(int argc, wchar_t** argv) {
         Timing(L"unpin", shown);
         Check(shown >= 0, L"speed: an unpinned item leaves the group");
         RunExe(L"unpin \"" + speed + L"\\s2.txt\"");
+        w.Navigate(g_dir);
+    }
+
+    // --- the on/off button in the window (one switch for every window and file dialog)
+    {
+        std::wstring sw = g_dir + L"\\switch";
+        CreateDirectoryW(sw.c_str(), nullptr);
+        for (const wchar_t* n : {L"\\k1.txt", L"\\k2.txt", L"\\k3.txt"}) TouchFile(sw + n, 2022);
+        RunExe(L"pin \"" + sw + L"\\k2.txt\"");
+        w.Navigate(sw);
+        ExpectPinned(w, {L"k2"}, L"switch: pinned group before turning it off");
+        Check(WaitFor([&] { return ToggleShown(w.hwnd); }, 5000), L"on/off button is shown in a folder with pins");
+        CheckToggleInside(w.hwnd, L"on/off button lies inside the window");
+        Check(FindToggle(w.hwnd) && ButtonState(FindToggle(w.hwnd)) == 1, L"the button says on");
+        SetForegroundWindow(w.hwnd);
+        Pump(800);
+        SaveScreenArea(w.hwnd, L"explorer-button-on");
+
+        DWORD t = GetTickCount();
+        bool clicked = ClickToggleWithMouse(w.hwnd) && WaitFor([] { return SettingOff(L"Enabled"); }, 3000);
+        Check(clicked, L"a mouse click on the button turns it off");
+        if (!clicked) PostMessageW(FindToggle(w.hwnd), WM_LBUTTONUP, 0, 0);  // go on with the rest
+        long off = ElapsedUntil(t, [&] {
+            Groups g = ReadGroups(w.hwnd);
+            return !g.order.empty() && std::none_of(g.order.begin(), g.order.end(), IsPinnedLabel);
+        });
+        Timing(L"turn off with the button", off);
+        ExpectNoPinnedGroup(w, L"switch: turning it off shows the folder's own grouping");
+        Check(WaitFor([&] { return ToggleShown(w.hwnd) && ButtonState(FindToggle(w.hwnd)) == 0; }, 5000),
+              L"the button says off (and stays to turn it on again)");
+        Pump(300);
+        SaveScreenArea(w.hwnd, L"explorer-button-off");
+        Check(IsPinnedInRegistry(sw + L"\\k2.txt"), L"turning it off keeps the pins");
+        Check(RunExeOutput(L"status").find(L"pinned group: off") != std::wstring::npos, L"status shows the pinned group off");
+        // Pins made while it is off are kept for later.
+        RunExe(L"pin \"" + sw + L"\\k3.txt\"");
+        Pump(1500);
+        ExpectNoPinnedGroup(w, L"switch: a new pin while off does not group the folder");
+
+        t = GetTickCount();
+        PostMessageW(FindToggle(w.hwnd), WM_LBUTTONUP, 0, 0);
+        Timing(L"turn on with the button", ElapsedUntil(t, [&] { return ShowsPinned(w.hwnd, {L"k2", L"k3"}); }));
+        ExpectPinned(w, {L"k2", L"k3"}, L"switch: the button turns it on again");
+        Check(WaitFor([&] { return ButtonState(FindToggle(w.hwnd)) == 1; }, 5000), L"the button says on again");
+
+        Check(RunExe(L"off") == 0, L"off command exits with 0");
+        ExpectNoPinnedGroup(w, L"switch: off command");
+        Check(RunExe(L"on") == 0, L"on command exits with 0");
+        ExpectPinned(w, {L"k2", L"k3"}, L"switch: on command");
+
+        // Only in folders with pins, and it can be hidden.
+        w.Navigate(g_dir + L"\\speed");
+        Check(WaitFor([&] { return !ToggleShown(w.hwnd); }, 5000), L"no on/off button in a folder without pins");
+        w.Navigate(sw);
+        Check(WaitFor([&] { return ToggleShown(w.hwnd); }, 5000), L"the button comes back in a folder with pins");
+        RegWriteString(HKEY_CURRENT_USER, kRegRoot, L"Button", L"0");
+        Check(WaitFor([&] { return !ToggleShown(w.hwnd); }, 5000), L"the button can be hidden");
+        ExpectPinned(w, {L"k2", L"k3"}, L"hiding the button keeps the pinned group");
+        RegWriteString(HKEY_CURRENT_USER, kRegRoot, L"Button", L"1");
+        Check(WaitFor([&] { return ToggleShown(w.hwnd); }, 5000), L"the button is shown again");
+
+        // The button follows its window.
+        RECT before = {}, after = {};
+        GetWindowRect(FindToggle(w.hwnd), &before);
+        RECT wr;
+        GetWindowRect(w.hwnd, &wr);
+        SetWindowPos(w.hwnd, nullptr, wr.left + 40, wr.top + 30, wr.right - wr.left - 60, wr.bottom - wr.top - 40,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        Pump(800);
+        GetWindowRect(FindToggle(w.hwnd), &after);
+        CheckToggleInside(w.hwnd, L"the button follows when the window moves and shrinks");
+        Check(after.left != before.left || after.top != before.top, L"the button moved with its window",
+              RectText(before) + L" -> " + RectText(after));
+        SetWindowPos(w.hwnd, nullptr, wr.left, wr.top, wr.right - wr.left, wr.bottom - wr.top, SWP_NOZORDER | SWP_NOACTIVATE);
+
+        RunExe(L"unpin \"" + sw + L"\\k2.txt\" \"" + sw + L"\\k3.txt\"");
         w.Navigate(g_dir);
     }
 

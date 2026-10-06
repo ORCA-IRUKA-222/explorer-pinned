@@ -12,6 +12,7 @@
 #include "pinstore.h"
 #include "resource.h"
 #include "setup.h"
+#include "toggle.h"
 #include "util.h"
 
 using namespace ep;
@@ -104,6 +105,8 @@ int Status() {
          std::wstring(dll.empty() ? L"not registered" : DialogsSettingOn() ? L"registered (on)" : L"registered (off)") + L"\n";
     if (!dll.empty()) s += L"  " + dll + L"\n";
     if (!dll32.empty()) s += L"  " + dll32 + L"\n";
+    s += L"pinned group: " + std::wstring(PinsEnabled() ? L"on" : L"off") +
+         (ToggleButtonEnabled() ? L"" : L" (no on/off button)") + L"\n";
     s += L"agent: " + std::wstring(FindAgentWindow() ? L"running" : L"not running") + L"\n";
     s += L"pins: " + std::to_wstring(PinStore::LoadAll().size()) + L"\n";
     ConsoleWrite(s);
@@ -212,6 +215,12 @@ int Dispatch(const std::wstring& command, const std::vector<std::wstring>& rest,
     if (command == L"pin" || command == L"unpin" || command == L"toggle") return ChangePins(rest, command);
     if (command == L"list") return ListPins();
     if (command == L"status") return Status();
+    if (command == L"on" || command == L"off") {
+        // Open windows and file dialogs follow at once (they watch the setting).
+        SetPinsEnabled(command == L"on");
+        ConsoleWrite(L"pinned group: " + command + L"\n");
+        return kOk;
+    }
     if (command == L"reapply") {
         NotifyAgent(kMsgReapply);
         return kOk;

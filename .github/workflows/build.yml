@@ -77,17 +77,16 @@ jobs:
           Get-Content "$env:LOCALAPPDATA\ExplorerPinned\agent.log" -Encoding utf8 -ErrorAction SilentlyContinue
           if (-not $finished) { Write-Error "E2E timed out"; exit 1 }
           exit $p.ExitCode
-      - name: Convert screenshot
+      - name: Convert screenshots
         if: always()
         shell: pwsh
         run: |
-          $bmp = "$PWD\screenshots\sorted-by-date.bmp"
-          if (Test-Path $bmp) {
-            Add-Type -AssemblyName System.Drawing
-            $img = [System.Drawing.Image]::FromFile($bmp)
-            $img.Save("$PWD\screenshots\sorted-by-date.png", [System.Drawing.Imaging.ImageFormat]::Png)
+          Add-Type -AssemblyName System.Drawing
+          Get-ChildItem "$PWD\screenshots\*.bmp" -ErrorAction SilentlyContinue | ForEach-Object {
+            $img = [System.Drawing.Image]::FromFile($_.FullName)
+            $img.Save([System.IO.Path]::ChangeExtension($_.FullName, ".png"), [System.Drawing.Imaging.ImageFormat]::Png)
             $img.Dispose()
-            Remove-Item $bmp
+            Remove-Item $_.FullName
           }
       - uses: actions/upload-artifact@v4
         if: always()
