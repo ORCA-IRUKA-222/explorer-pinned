@@ -297,7 +297,8 @@ struct Window {
         if (Refresh()) view->GetGroupBy(&k, &asc);
         return k;
     }
-    void Navigate(const std::wstring& path) {
+    // Starts a navigation and returns right away.
+    void Go(const std::wstring& path) {
         PIDLIST_ABSOLUTE pidl = nullptr;
         SHParseDisplayName(path.c_str(), nullptr, &pidl, 0, nullptr);
         IServiceProvider* sp = nullptr;
@@ -308,6 +309,9 @@ struct Window {
         if (sb) sb->Release();
         if (sp) sp->Release();
         CoTaskMemFree(pidl);
+    }
+    void Navigate(const std::wstring& path) {
+        Go(path);
         WaitFor([&] { return Refresh() && _wcsicmp(Path().c_str(), path.c_str()) == 0; }, 10000);
         Pump(1000);
     }
@@ -390,6 +394,25 @@ bool ExpectNoPinnedGroup(Window& w, const std::wstring& what) {
         15000);
     Check(ok, what, last.Describe());
     return ok;
+}
+
+// ---------------------------------------------------------------- timing
+// Milliseconds from `start` until `cond` holds (checked every 30 ms), or -1 after the timeout.
+long ElapsedUntil(DWORD start, const std::function<bool()>& cond, DWORD timeoutMs = 15000) {
+    for (;;) {
+        if (cond()) return (long)(GetTickCount() - start);
+        if (GetTickCount() - start > timeoutMs) return -1;
+        Pump(30);
+    }
+}
+
+void Timing(const std::wstring& what, long ms) {
+    Print(L"TIME " + what + L": " + (ms < 0 ? std::wstring(L"timeout") : std::to_wstring(ms) + L" ms"));
+}
+
+bool ShowsPinned(HWND hwnd, const std::set<std::wstring>& expected) {
+    Groups g = ReadGroups(hwnd);
+    return !g.order.empty() && IsPinnedLabel(g.order[0]) && g.First() == expected;
 }
 
 // ---------------------------------------------------------------- context menu
@@ -651,36 +674,37 @@ bool HasShellView(HWND hwnd) {
 
 // A visible top-level window of a process that `match` accepts: a file dialog, or (with a
 // title) a window whose title contains it.
-HWND WaitWindow(const std::function<bool(DWORD)>& match, const wchar_t* title, DWORD timeoutMs) {
+HWND FindWindowOf(const std::function<bool(DWORD)>& match, const wchar_t* title) {
     struct Search {
         const std::function<bool(DWORD)>* match;
         const wchar_t* title;
         HWND found;
     } search = {&match, title, nullptr};
-    WaitFor(
-        [&] {
-            EnumWindows(
-                [](HWND hwnd, LPARAM lp) -> BOOL {
-                    auto* s = reinterpret_cast<Search*>(lp);
-                    DWORD pid = 0;
-                    GetWindowThreadProcessId(hwnd, &pid);
-                    if (!IsWindowVisible(hwnd) || !(*s->match)(pid)) return TRUE;
-                    if (s->title) {
-                        wchar_t text[256] = L"";
-                        GetWindowTextW(hwnd, text, 256);
-                        if (!wcsstr(text, s->title)) return TRUE;
-                    } else {
-                        wchar_t cls[32];
-                        if (!GetClassNameW(hwnd, cls, 32) || wcscmp(cls, L"#32770") != 0 || !HasShellView(hwnd)) return TRUE;
-                    }
-                    s->found = hwnd;
-                    return FALSE;
-                },
-                reinterpret_cast<LPARAM>(&search));
-            return search.found != nullptr;
+    EnumWindows(
+        [](HWND hwnd, LPARAM lp) -> BOOL {
+            auto* s = reinterpret_cast<Search*>(lp);
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hwnd, &pid);
+            if (!IsWindowVisible(hwnd) || !(*s->match)(pid)) return TRUE;
+            if (s->title) {
+                wchar_t text[256] = L"";
+                GetWindowTextW(hwnd, text, 256);
+                if (!wcsstr(text, s->title)) return TRUE;
+            } else {
+                wchar_t cls[32];
+                if (!GetClassNameW(hwnd, cls, 32) || wcscmp(cls, L"#32770") != 0 || !HasShellView(hwnd)) return TRUE;
+            }
+            s->found = hwnd;
+            return FALSE;
         },
-        timeoutMs);
+        reinterpret_cast<LPARAM>(&search));
     return search.found;
+}
+
+HWND WaitWindow(const std::function<bool(DWORD)>& match, const wchar_t* title, DWORD timeoutMs) {
+    HWND found = nullptr;
+    WaitFor([&] { return (found = FindWindowOf(match, title)) != nullptr; }, timeoutMs);
+    return found;
 }
 
 HWND WaitFileDialogOf(DWORD pid, DWORD timeoutMs = 20000) {
@@ -911,14 +935,25 @@ void FileDialogTests(const std::wstring& binDir) {
     std::wstring hostCmd = L"\"" + self + L"\" host \"" + folder + L"\"";
 
     // Pinned group, and changes to the pins while the dialog is open
+    DWORD started = GetTickCount();
     PROCESS_INFORMATION pi = StartProcess(hostCmd);
-    HWND dialog = WaitFileDialogOf(pi.dwProcessId);
+    HWND dialog = nullptr;
+    long shownAt = ElapsedUntil(started, [&] {
+        dialog = FindWindowOf([&](DWORD p) { return p == pi.dwProcessId; }, nullptr);
+        return dialog != nullptr;
+    }, 20000);
     Check(dialog != nullptr, L"file dialog opens");
     if (dialog) {
+        long pinnedAt = ElapsedUntil(started, [&] { return ShowsPinned(dialog, {L"d2", L"subfolder_ep"}); });
+        Timing(L"file dialog (shown after " + std::to_wstring(shownAt) + L" ms)", pinnedAt);
         ExpectDialogPinned(dialog, {L"d2", L"subfolder_ep"}, L"file dialog: pinned group on top");
+        DWORD t = GetTickCount();
         RunExe(L"unpin \"" + folder + L"\\d2.txt\"");
+        Timing(L"file dialog: unpin", ElapsedUntil(t, [&] { return ShowsPinned(dialog, {L"subfolder_ep"}); }));
         ExpectDialogPinned(dialog, {L"subfolder_ep"}, L"file dialog: unpinning updates the open dialog");
+        t = GetTickCount();
         RunExe(L"pin \"" + folder + L"\\d2.txt\"");
+        Timing(L"file dialog: pin", ElapsedUntil(t, [&] { return ShowsPinned(dialog, {L"d2", L"subfolder_ep"}); }));
         ExpectDialogPinned(dialog, {L"d2", L"subfolder_ep"}, L"file dialog: pinning updates the open dialog");
         CloseDialog(dialog, pi);
     }
@@ -1228,6 +1263,39 @@ int wmain(int argc, wchar_t** argv) {
         std::wstring args = L"unpin";
         for (int i = 1; i <= 6; i++) args += L" \"" + multi + L"\\m" + std::to_wstring(i) + L".txt\"";
         RunExe(args);
+    }
+
+    // --- how fast the pinned group shows up (printed as TIME lines)
+    {
+        std::wstring speed = g_dir + L"\\speed";
+        CreateDirectoryW(speed.c_str(), nullptr);
+        for (const wchar_t* n : {L"\\s1.txt", L"\\s2.txt", L"\\s3.txt", L"\\s4.txt"}) TouchFile(speed + n, 2021);
+        RunExe(L"pin \"" + speed + L"\\s2.txt\"");
+        long worst = 0;
+        for (int i = 0; i < 3; i++) {
+            w.Navigate(L"C:\\Windows");
+            DWORD start = GetTickCount();
+            w.Go(speed);
+            long items = ElapsedUntil(start, [&] { return !ReadGroups(w.hwnd).order.empty(); });
+            long pinned = ElapsedUntil(start, [&] { return ShowsPinned(w.hwnd, {L"s2"}); });
+            Timing(L"open folder #" + std::to_wstring(i + 1) + L" (items listed after " + std::to_wstring(items) + L" ms)", pinned);
+            worst = pinned < 0 ? 99999 : std::max(worst, pinned);
+        }
+        Check(worst < 15000, L"speed: pinned group when a folder opens", std::to_wstring(worst) + L" ms at most");
+        Pump(1500);
+        DWORD start = GetTickCount();
+        RunExe(L"pin \"" + speed + L"\\s3.txt\"");
+        long cmd = (long)(GetTickCount() - start);
+        long shown = ElapsedUntil(start, [&] { return ShowsPinned(w.hwnd, {L"s2", L"s3"}); });
+        Timing(L"pin (the command took " + std::to_wstring(cmd) + L" ms)", shown);
+        Check(shown >= 0, L"speed: a new pin shows up");
+        start = GetTickCount();
+        RunExe(L"unpin \"" + speed + L"\\s3.txt\"");
+        shown = ElapsedUntil(start, [&] { return ShowsPinned(w.hwnd, {L"s2"}); });
+        Timing(L"unpin", shown);
+        Check(shown >= 0, L"speed: an unpinned item leaves the group");
+        RunExe(L"unpin \"" + speed + L"\\s2.txt\"");
+        w.Navigate(g_dir);
     }
 
     // --- the Downloads folder (grouped by date by default on client editions)
