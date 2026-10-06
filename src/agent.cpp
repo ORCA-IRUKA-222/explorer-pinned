@@ -638,7 +638,9 @@ bool Agent::AcquireView(TrackedWindow& w, bool* newSession) {
     w.leaving = false;
     w.waitSince = 0;
     w.attempts = 0;
+    // Regroups are only spaced out within one view: opening another folder is grouped at once.
     w.churn = 0;
+    w.lastRegroup = 0;
     w.writeFailures = 0;
     w.dropped = false;
     w.gaveUp = false;
@@ -877,7 +879,6 @@ void Agent::ProcessWindow(TrackedWindow& w) {
         Schedule(&w, gap - (now - w.lastRegroup), false);
         return;
     }
-    w.churn = w.lastRegroup && now - w.lastRegroup < gap + 10000 ? w.churn + 1 : 0;
 
     // Explorer only re-groups items when the group-by key changes: write the values to the
     // key that is not active and switch to it.
@@ -893,10 +894,13 @@ void Agent::ProcessWindow(TrackedWindow& w) {
         if (++w.writeFailures == 1 || w.writeFailures % 10 == 0)
             LogLine(L"cannot set the pinned value in %s yet (0x%08lX, try %d)", w.folderPath.c_str(),
                     (unsigned long)failure, w.writeFailures);
-        Schedule(&w, w.writeFailures < 20 ? 1000 : 10000, false);
+        Schedule(&w, w.writeFailures < 8 ? 250 : w.writeFailures < 30 ? 1000 : 10000, false);
         return;
     }
+    if (w.writeFailures) LogLine(L"set the pinned value in %s after %d tries", w.folderPath.c_str(), w.writeFailures + 1);
     w.writeFailures = 0;
+    // Only regroups count (not the tries above, in which nothing changed).
+    w.churn = w.lastRegroup && now - w.lastRegroup < gap + 10000 ? w.churn + 1 : 0;
     w.lastRegroup = now;
     w.attempts++;
     w.dropped = false;
