@@ -1247,6 +1247,7 @@ int wmain(int argc, wchar_t** argv) {
 
     // --- setup (in Japanese, like the user's machine)
     RegWriteString(HKEY_CURRENT_USER, kRegRoot, L"Language", L"ja");
+    RegWriteString(HKEY_CURRENT_USER, kRegRoot, L"Trace", L"1");
     Check(RunExe(L"setup --no-startup --no-agent --quiet") == 0, L"setup exits with 0");
     {
         std::wstring schemas = RegisteredSchemas();
@@ -1428,15 +1429,20 @@ int wmain(int argc, wchar_t** argv) {
         for (const wchar_t* n : {L"\\s1.txt", L"\\s2.txt", L"\\s3.txt", L"\\s4.txt"}) TouchFile(speed + n, 2021);
         RunExe(L"pin \"" + speed + L"\\s2.txt\"");
         long worst = 0;
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 6; i++) {
+            // The last three with the on/off button hidden: the button must not slow Explorer down.
+            RegWriteString(HKEY_CURRENT_USER, kRegRoot, L"Button", i < 3 ? L"1" : L"0");
             w.Navigate(L"C:\\Windows");
             DWORD start = GetTickCount();
             w.Go(speed);
             long items = ElapsedUntil(start, [&] { return !ReadGroups(w.hwnd).order.empty(); });
             long pinned = ElapsedUntil(start, [&] { return ShowsPinned(w.hwnd, {L"s2"}); });
-            Timing(L"open folder #" + std::to_wstring(i + 1) + L" (items listed after " + std::to_wstring(items) + L" ms)", pinned);
+            Timing(L"open folder #" + std::to_wstring(i + 1) + (i < 3 ? L", button" : L", no button") +
+                       L" (items listed after " + std::to_wstring(items) + L" ms)",
+                   pinned);
             worst = pinned < 0 ? 99999 : std::max(worst, pinned);
         }
+        RegWriteString(HKEY_CURRENT_USER, kRegRoot, L"Button", L"1");
         Check(worst < 15000, L"speed: pinned group when a folder opens", std::to_wstring(worst) + L" ms at most");
         Pump(1500);
         DWORD start = GetTickCount();
@@ -1560,7 +1566,11 @@ int wmain(int argc, wchar_t** argv) {
         TouchFile(old + L"\\g2.txt", 2021);
         RunExe(L"pin \"" + old + L"\\g1.txt\"");
         w.Navigate(old);
-        ExpectPinned(w, {L"g1"}, L"old grouping: folder is grouped");
+        if (!ExpectPinned(w, {L"g1"}, L"old grouping: folder is grouped")) {
+            int items = -1;
+            if (w.Refresh()) w.view->ItemCount(SVGIO_ALLVIEW, &items);
+            Print(L"old grouping: the view has " + std::to_wstring(items) + L" item(s)");
+        }
         w.Refresh();
         w.view->SetGroupBy(kLegacyPinStateKeys[0], TRUE);
         Pump(1500);

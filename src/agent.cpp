@@ -292,6 +292,8 @@ private:
 };
 
 Agent* g_agent = nullptr;
+// HKCU\Software\ExplorerPinned: Trace = "1" also logs every navigation and view event.
+bool g_trace = false;
 
 // Version, Windows build and the state of the property schema, for diagnosing problems.
 void LogEnvironment(size_t pinCount) {
@@ -358,6 +360,10 @@ int Agent::Run() {
     enabled_ = PinsEnabled();
     showButtons_ = ToggleButtonEnabled();
     ArmSettingsWatch();
+    {
+        std::wstring trace;
+        g_trace = RegReadString(HKEY_CURRENT_USER, kRegRoot, L"Trace", &trace) && trace == L"1";
+    }
     buttons_.Start();
 
     AddTrayIcon();
@@ -577,6 +583,8 @@ void Agent::RescanWindows() {
                 // (Explorer does not raise BeforeNavigate2 for folder navigation.)
                 LeaveView(*raw);
             }
+            if (g_trace && (id == DISPID_NAVIGATECOMPLETE2 || id == DISPID_DOCUMENTCOMPLETE))
+                LogLine(L"trace: %s", id == DISPID_NAVIGATECOMPLETE2 ? L"NavigateComplete2" : L"DocumentComplete");
             if (id == DISPID_NAVIGATECOMPLETE2 || id == DISPID_DOCUMENTCOMPLETE) {
                 // A navigation starts loading the new view; the next DocumentComplete (or
                 // EnumDone) reports that the load is done.
@@ -625,6 +633,7 @@ bool Agent::AcquireView(TrackedWindow& w, bool* newSession) {
 
     // New view: new navigation (values set on the old view are gone).
     *newSession = true;
+    if (g_trace) LogLine(L"trace: new view%s", w.loading ? L" (loading)" : L"");
     w.view = view;
     w.viewIdentity = id;
     w.folder.Reset();
@@ -673,6 +682,7 @@ bool Agent::AcquireView(TrackedWindow& w, bool* newSession) {
     if (SUCCEEDED(w.browser->get_Document(doc.Put())) && doc) {
         w.viewEvents.Connect(doc.Get(), DIID_DShellFolderViewEvents, [this, raw](DISPID id) {
             if (id == kDispSelectionChanged || id == kDispFocusChanged) return;
+            if (g_trace) LogLine(L"trace: view event %ld in %s", (long)id, raw->folderPath.c_str());
             if (id == kDispEnumDone) {
                 raw->loading = false;
                 raw->enumDone = true;
@@ -891,9 +901,12 @@ void Agent::ProcessWindow(TrackedWindow& w) {
         // show them (hidden items). Grouping now would only show "Unspecified": try again
         // every second for a while, then every ten seconds, without counting it as a
         // failed grouping.
-        if (++w.writeFailures == 1 || w.writeFailures % 10 == 0)
-            LogLine(L"cannot set the pinned value in %s yet (0x%08lX, try %d)", w.folderPath.c_str(),
-                    (unsigned long)failure, w.writeFailures);
+        if (++w.writeFailures == 1 || w.writeFailures % 10 == 0) {
+            int items = -1;
+            w.view->ItemCount(SVGIO_ALLVIEW, &items);
+            LogLine(L"cannot set the pinned value in %s yet (0x%08lX, try %d, %d item(s) in the view)",
+                    w.folderPath.c_str(), (unsigned long)failure, w.writeFailures, items);
+        }
         Schedule(&w, w.writeFailures < 8 ? 250 : w.writeFailures < 30 ? 1000 : 10000, false);
         return;
     }
