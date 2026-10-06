@@ -1217,6 +1217,14 @@ int wmain(int argc, wchar_t** argv) {
     // Explorer can stay busy (icons, virus scan) and show no items for more than a minute.
     const std::wstring large = g_dir + L"\\large";
     PopulateLargeFolder(large);
+    // The same for the small folders used later: Windows Server 2025 can show a folder that was
+    // filled just before it is opened as empty for half a minute.
+    const std::wstring speed = g_dir + L"\\speed", sw = g_dir + L"\\switch", old = g_dir + L"\\oldgroup";
+    for (const auto& d : {speed, sw, old}) CreateDirectoryW(d.c_str(), nullptr);
+    for (const wchar_t* n : {L"\\s1.txt", L"\\s2.txt", L"\\s3.txt", L"\\s4.txt"}) TouchFile(speed + n, 2021);
+    for (const wchar_t* n : {L"\\k1.txt", L"\\k2.txt", L"\\k3.txt"}) TouchFile(sw + n, 2022);
+    TouchFile(old + L"\\g1.txt", 2020);
+    TouchFile(old + L"\\g2.txt", 2021);
 
     // --- resources
     Check(ExeString(IDS_MENU_PIN_FILE, kJapanese) == L"このファイルをピン止めする", L"Japanese string table");
@@ -1424,9 +1432,6 @@ int wmain(int argc, wchar_t** argv) {
 
     // --- how fast the pinned group shows up (printed as TIME lines)
     {
-        std::wstring speed = g_dir + L"\\speed";
-        CreateDirectoryW(speed.c_str(), nullptr);
-        for (const wchar_t* n : {L"\\s1.txt", L"\\s2.txt", L"\\s3.txt", L"\\s4.txt"}) TouchFile(speed + n, 2021);
         RunExe(L"pin \"" + speed + L"\\s2.txt\"");
         long worst = 0;
         for (int i = 0; i < 6; i++) {
@@ -1462,9 +1467,6 @@ int wmain(int argc, wchar_t** argv) {
 
     // --- the on/off button in the window (one switch for every window and file dialog)
     {
-        std::wstring sw = g_dir + L"\\switch";
-        CreateDirectoryW(sw.c_str(), nullptr);
-        for (const wchar_t* n : {L"\\k1.txt", L"\\k2.txt", L"\\k3.txt"}) TouchFile(sw + n, 2022);
         RunExe(L"pin \"" + sw + L"\\k2.txt\"");
         w.Navigate(sw);
         ExpectPinned(w, {L"k2"}, L"switch: pinned group before turning it off");
@@ -1560,10 +1562,6 @@ int wmain(int argc, wchar_t** argv) {
 
     // --- a folder Explorer saved with the grouping of version 1.0.x (old property key)
     {
-        std::wstring old = g_dir + L"\\oldgroup";
-        CreateDirectoryW(old.c_str(), nullptr);
-        TouchFile(old + L"\\g1.txt", 2020);
-        TouchFile(old + L"\\g2.txt", 2021);
         RunExe(L"pin \"" + old + L"\\g1.txt\"");
         w.Navigate(old);
         if (!ExpectPinned(w, {L"g1"}, L"old grouping: folder is grouped")) {
