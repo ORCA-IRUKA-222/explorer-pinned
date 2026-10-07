@@ -747,20 +747,38 @@ int CountLogLines(const wchar_t* text) {
 int Groupings() { return CountLogLines(L"] group ") + CountLogLines(L"] regroup "); }
 
 // ---------------------------------------------------------------- file dialogs
-// "ExplorerPinnedE2E host <folder>" shows an Open dialog on <folder> (the 32-bit build of
-// this program shows a dialog of a 32-bit program).
-int HostDialog(const std::wstring& folder) {
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    IFileOpenDialog* dialog = nullptr;
-    IShellItem* item = nullptr;
-    CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
-    SHCreateItemFromParsingName(folder.c_str(), nullptr, IID_PPV_ARGS(&item));
-    if (dialog && item) {
-        dialog->SetFolder(item);
-        dialog->Show(nullptr);
+// Keeps creating, showing and destroying a small window, like a busy program (a browser or an
+// Electron app): window events arrive all the time.
+DWORD WINAPI BusyThread(LPVOID) {
+    for (;;) {
+        HWND h = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"STATIC", L"", WS_POPUP, -32000, -32000, 1, 1,
+                                 nullptr, nullptr, nullptr, nullptr);
+        ShowWindow(h, SW_SHOWNOACTIVATE);
+        DestroyWindow(h);
+        MSG m;
+        while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&m);
+        Sleep(20);
     }
-    if (item) item->Release();
-    if (dialog) dialog->Release();
+}
+
+// "ExplorerPinnedE2E host <folder>" shows an Open dialog on <folder> (the 32-bit build of
+// this program shows a dialog of a 32-bit program). "host-busy" shows it twice, one after the
+// other, in a busy program.
+int HostDialog(const std::wstring& folder, bool busy) {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (busy) CloseHandle(CreateThread(nullptr, 0, BusyThread, nullptr, 0, nullptr));
+    for (int i = 0; i < (busy ? 2 : 1); i++) {
+        IFileOpenDialog* dialog = nullptr;
+        IShellItem* item = nullptr;
+        CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
+        SHCreateItemFromParsingName(folder.c_str(), nullptr, IID_PPV_ARGS(&item));
+        if (dialog && item) {
+            dialog->SetFolder(item);
+            dialog->Show(nullptr);
+        }
+        if (item) item->Release();
+        if (dialog) dialog->Release();
+    }
     CoUninitialize();
     return 0;
 }
@@ -1157,6 +1175,28 @@ void FileDialogTests(const std::wstring& binDir) {
         CloseDialog(dialog, pi);
     }
 
+    // A busy program (window events all the time, like a browser or an Electron app such as the
+    // desktop apps of chat services), and a second dialog in it after the first one closed
+    pi = StartProcess(L"\"" + self + L"\" host-busy \"" + folder + L"\"");
+    dialog = pi.hProcess ? WaitFileDialogOf(pi.dwProcessId) : nullptr;
+    Check(dialog != nullptr, L"file dialog of a busy program opens");
+    if (dialog) {
+        ExpectDialogPinned(dialog, {L"d2", L"subfolder_ep"}, L"file dialog of a busy program: pinned group on top");
+        PostMessageW(dialog, WM_COMMAND, IDCANCEL, 0);
+        HWND second = nullptr;
+        WaitFor([&] {
+            second = FindWindowOf([&](DWORD p) { return p == pi.dwProcessId; }, nullptr);
+            return second && second != dialog;
+        }, 20000);
+        Check(second && second != dialog, L"second file dialog of the busy program opens");
+        if (second && second != dialog) {
+            ExpectDialogPinned(second, {L"d2", L"subfolder_ep"}, L"second file dialog of a busy program: pinned group on top");
+            Check(WaitFor([&] { return ToggleShown(second); }, 5000), L"second file dialog of a busy program: on/off button is shown");
+            dialog = second;
+        }
+        CloseDialog(dialog, pi);
+    }
+
     // Web browsers (choosing a file to upload)
     wchar_t pf[MAX_PATH], pf86[MAX_PATH];
     ExpandEnvironmentStringsW(L"%ProgramFiles%", pf, MAX_PATH);
@@ -1187,7 +1227,8 @@ void FileDialogTests(const std::wstring& binDir) {
 
 int wmain(int argc, wchar_t** argv) {
     SetConsoleOutputCP(CP_UTF8);
-    if (argc >= 3 && wcscmp(argv[1], L"host") == 0) return HostDialog(argv[2]);
+    if (argc >= 3 && wcscmp(argv[1], L"host") == 0) return HostDialog(argv[2], false);
+    if (argc >= 3 && wcscmp(argv[1], L"host-busy") == 0) return HostDialog(argv[2], true);
     if (argc < 2) {
         Print(L"usage: ExplorerPinnedE2E <ExplorerPinned.exe> [screenshot directory]");
         return 100;

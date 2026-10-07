@@ -29,7 +29,8 @@ namespace {
 const CLSID kOverlayClsid = {0x432e90e6, 0x6bcf, 0x44fe, {0x9f, 0x87, 0x8b, 0xa1, 0x91, 0xf0, 0x48, 0x70}};
 
 constexpr UINT kGetShellBrowser = WM_USER + 7;  // WM_GETISHELLBROWSER, answered by shell browser windows
-// Dialogs are found through window events; the scan is only a fallback.
+// Dialogs are found through window events, and by a scan every second (for example a dialog
+// that was being set up while this DLL was loaded).
 constexpr DWORD kScanMs = 1000;
 // A new folder is grouped once Explorer reports it listed it (EnumDone), once its item count
 // stops changing, or at the latest after this.
@@ -548,7 +549,8 @@ BOOL CALLBACK ScanWindow(HWND hwnd, LPARAM) {
     return TRUE;
 }
 
-// A dialog was shown or a folder view created in it (a new dialog or a navigation).
+// A dialog was shown, or a folder view was created or shown in one (a new dialog or a
+// navigation). The dialog often shows up before its folder view does.
 void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
     if (!hwnd || idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
     if (event == EVENT_OBJECT_DESTROY) {
@@ -556,11 +558,11 @@ void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, L
         return;
     }
     HWND root = GetAncestor(hwnd, GA_ROOT);
-    if (event == EVENT_OBJECT_CREATE) {
+    if (root != hwnd) {
         wchar_t cls[32];
         if (!GetClassNameW(hwnd, cls, ARRAYSIZE(cls)) || wcscmp(cls, L"SHELLDLL_DefView") != 0) return;
-    } else if (root != hwnd) {
-        return;  // shown: only top-level windows matter
+    } else if (event != EVENT_OBJECT_SHOW) {
+        return;
     }
     if (root) Visit(root);
 }
@@ -594,8 +596,10 @@ DWORD WINAPI Worker(void*) {
     SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, nullptr, OnWinEvent, GetCurrentProcessId(), 0,
                     WINEVENT_OUTOFCONTEXT);
     EnumWindows(ScanWindow, 0);
+    DWORD lastScan = GetTickCount();
     for (;;) {
-        DWORD r = MsgWaitForMultipleObjects(2, events, FALSE, kScanMs, QS_ALLINPUT);
+        DWORD since = GetTickCount() - lastScan;
+        DWORD r = MsgWaitForMultipleObjects(2, events, FALSE, since >= kScanMs ? 0 : kScanMs - since, QS_ALLINPUT);
         if (r == WAIT_OBJECT_0 || r == WAIT_OBJECT_0 + 1) {
             WatchKey(keys[r - WAIT_OBJECT_0], events[r - WAIT_OBJECT_0]);
             g_settingOn = DialogsSettingOn();
@@ -603,8 +607,11 @@ DWORD WINAPI Worker(void*) {
         } else if (r == WAIT_OBJECT_0 + 2) {
             MSG msg;
             while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
-        } else {
-            // Fallback: dialogs that were open before this DLL was loaded, missed events.
+        }
+        // On time even while window events keep coming (a busy program such as a browser or an
+        // Electron app sends them all the time).
+        if (GetTickCount() - lastScan >= kScanMs) {
+            lastScan = GetTickCount();
             g_settingOn = DialogsSettingOn();
             EnumWindows(ScanWindow, 0);
         }

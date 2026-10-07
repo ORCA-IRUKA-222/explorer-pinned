@@ -108,6 +108,8 @@ Web サイトにファイルをアップロードするときの画面でも、�
 - 32 ビットのアプリにも対応しています。ARM 版 Windows では、ARM64 版と 32 ビット（x86）のアプリで表示されます
   （エミュレーションで動く x64 版のアプリでは表示されません）。
 - アプリが独自のファイル選択画面を使っている場合は表示されません。
+- インストール（または更新）する前から起動していたアプリでは、そのアプリを終了して起動し直すまで表示されません。
+  Windows はアプリが最初にファイルのアイコンを表示するときに DLL の一覧を読み込むためです（通知領域に常駐するアプリは、通知領域のアイコンから終了してください）。
 - この DLL はファイル選択画面を表示するすべてのアプリ（管理者として実行したアプリも含む）に読み込まれるため、
   管理者しか変更できない Program Files にインストールした場合だけ登録します。
 - コード署名をしていないため、セキュリティソフトによっては「他のアプリに読み込まれる DLL」として警告することがあります。
@@ -271,6 +273,8 @@ Pinned items are shown in a **"Pinned"** group at the top, whatever the sort ord
 - Install with `ExplorerPinned-Setup-<version>.exe` from [Releases](https://github.com/ORCA-IRUKA-222/explorer-pinned/releases)
   (administrator permission is needed once to register the "Pinned" label), or unzip the portable build and run `ExplorerPinned.exe`.
 - The UI is in Japanese or English: the language chosen in the installer, or the Windows display language for the portable build.
+- A program that was already running when Explorer Pinned was installed or updated shows the "Pinned" group in its file
+  dialogs only after it is restarted (Windows reads the list of icon overlay handlers once per program).
 - If the "Pinned" group does not show up, try "Re-apply to open windows" in the notification area menu. The agent writes
   a log to `%LOCALAPPDATA%\ExplorerPinned\agent.log` (at most about 1 MB; removed on uninstall), which helps when reporting an issue.
 - Limitations: the background process must be running; only one grouping can be active, so the default date groups
