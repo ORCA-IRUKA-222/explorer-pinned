@@ -13,11 +13,13 @@
 #include <shobjidl.h>
 
 #include <map>
+#include <memory>
 #include <set>
 
 #include "comutil.h"
 #include "pinstore.h"
 #include "dialogs.h"
+#include "toggle.h"
 #include "util.h"
 
 namespace ep {
@@ -27,8 +29,13 @@ namespace {
 const CLSID kOverlayClsid = {0x432e90e6, 0x6bcf, 0x44fe, {0x9f, 0x87, 0x8b, 0xa1, 0x91, 0xf0, 0x48, 0x70}};
 
 constexpr UINT kGetShellBrowser = WM_USER + 7;  // WM_GETISHELLBROWSER, answered by shell browser windows
-constexpr DWORD kPollMs = 700;
+// Dialogs are found through window events; the scan is only a fallback.
+constexpr DWORD kScanMs = 1000;
+// A new folder is grouped once Explorer reports it listed it (EnumDone), once its item count
+// stops changing, or at the latest after this.
 constexpr DWORD kNewViewDelayMs = 600;
+constexpr UINT kRecheckMs = 80;
+constexpr UINT_PTR kTimerId = 0xE9A1;  // on the dialog window; swallowed by the message hook
 constexpr int kMaxAttempts = 4;
 
 HMODULE g_module = nullptr;
@@ -111,6 +118,9 @@ PITEMID_CHILD ParseChild(IShellFolder* folder, const std::wstring& name) {
 struct Dialog {
     ComPtr<IUnknown> viewIdentity;
     DWORD seen = 0;
+    bool ready = false;     // the view has listed the folder
+    bool enumDone = false;  // Explorer reported the end of the listing
+    UINT lastCount = 0;
     std::wstring folderPath;
     NameSet applied[2];
     NameSet lastNames;
@@ -121,6 +131,11 @@ struct Dialog {
 };
 
 thread_local std::map<HWND, Dialog>* t_dialogs = nullptr;
+// Listing events of each dialog's current view (kept apart: Dialog is reset per view).
+thread_local std::map<HWND, std::unique_ptr<EventConnection>>* t_viewEvents = nullptr;
+
+// Looks at the dialog again after `ms` (a timer on the dialog's own thread).
+void Recheck(HWND dialog, UINT ms) { SetTimer(dialog, kTimerId, ms, nullptr); }
 
 size_t WriteKey(Dialog& d, IFolderView2* view, IShellFolder* folder, int k, const NameSet& names) {
     PROPVARIANT empty;
@@ -285,8 +300,36 @@ void WatchNavigation(HWND dialog) {
     LogLine(L"dialog: navigation events 0x%08lX", (unsigned long)hr);
 }
 
+// The on/off button of each dialog, over its folder view while the folder has pinned items.
+thread_local std::map<HWND, std::unique_ptr<ToggleButton>>* t_buttons = nullptr;
+
+void UpdateButton(HWND dialog, bool show, bool on) {
+    HWND defView = show && ToggleButtonEnabled() ? FindDefView(dialog) : nullptr;
+    if (!defView) {
+        if (t_buttons) {
+            auto it = t_buttons->find(dialog);
+            if (it != t_buttons->end()) it->second->Hide();
+        }
+        return;
+    }
+    if (!t_buttons) t_buttons = new std::map<HWND, std::unique_ptr<ToggleButton>>();
+    auto& button = (*t_buttons)[dialog];
+    if (!button) {
+        button = std::make_unique<ToggleButton>();
+        button->onClick = [dialog] {
+            bool turnOn = !PinsEnabled();
+            SetPinsEnabled(turnOn);
+            LogLine(L"dialog: pinned group turned %s with the button", turnOn ? L"on" : L"off");
+            PostMessageW(dialog, g_tickMessage, 0, 0);
+        };
+    }
+    button->Show(dialog, defView, on);
+}
+
 void ForgetDialog(HWND dialog) {
     if (t_dialogs) t_dialogs->erase(dialog);
+    if (t_viewEvents) t_viewEvents->erase(dialog);
+    if (t_buttons) t_buttons->erase(dialog);
     if (!t_watched) return;
     auto it = t_watched->find(dialog);
     if (it == t_watched->end()) return;
@@ -315,8 +358,9 @@ void ProcessDialog(HWND dialog) {
     DWORD now = GetTickCount();
 
     ComPtr<IUnknown> identity = Identity(view.Get());
-    if (identity.Get() != d.viewIdentity.Get()) {
-        // A new folder: Explorer fills the view and applies its saved view state first.
+    bool newView = identity.Get() != d.viewIdentity.Get();
+    if (newView) {
+        // A new folder: Explorer lists it and applies its saved view state first.
         d = Dialog();
         d.viewIdentity = identity;
         d.seen = now;
@@ -332,10 +376,28 @@ void ProcessDialog(HWND dialog) {
                 CoTaskMemFree(pidl);
             }
         }
+        // The view's automation object reports when the listing is done.
+        if (!t_viewEvents) t_viewEvents = new std::map<HWND, std::unique_ptr<EventConnection>>();
+        auto& events = (*t_viewEvents)[dialog];
+        events = std::make_unique<EventConnection>();
+        ComPtr<IShellView> sv = view.As<IShellView>();
+        ComPtr<IDispatch> automation;
+        if (sv && SUCCEEDED(sv->GetItemObject(SVGIO_BACKGROUND, IID_PPV_ARGS(automation.Put()))) && automation) {
+            events->Connect(automation.Get(), DIID_DShellFolderViewEvents, [dialog](DISPID id) {
+                if (id != 201 || !t_dialogs) return;  // DISPID_FILELISTENUMDONE
+                auto it = t_dialogs->find(dialog);
+                if (it != t_dialogs->end()) it->second.enumDone = true;
+                Recheck(dialog, 10);
+            });
+        }
+        int count = 0;
+        view->ItemCount(SVGIO_ALLVIEW, &count);
+        d.lastCount = (UINT)count;
+    }
+    if (d.folderPath.empty()) {
+        UpdateButton(dialog, false, true);
         return;
     }
-    if (d.folderPath.empty() || now - d.seen < kNewViewDelayMs) return;
-
     ComPtr<IShellFolder> folder;
     if (FAILED(view->GetFolder(IID_PPV_ARGS(folder.Put())))) return;
     NameSet names;
@@ -345,12 +407,31 @@ void ProcessDialog(HWND dialog) {
             CoTaskMemFree(child);
         }
     }
+    bool enabled = PinsEnabled();
+    UpdateButton(dialog, !names.empty(), enabled);
+    if (newView) {
+        Recheck(dialog, kRecheckMs);
+        return;
+    }
+    if (!d.ready) {
+        int count = 0;
+        view->ItemCount(SVGIO_ALLVIEW, &count);
+        if (d.enumDone || (count > 0 && (UINT)count == d.lastCount) || now - d.seen >= kNewViewDelayMs) {
+            d.ready = true;
+        } else {
+            d.lastCount = (UINT)count;
+            Recheck(dialog, kRecheckMs);
+            return;
+        }
+    }
+
     PROPERTYKEY groupKey = {};
     BOOL ascending = TRUE;
     if (FAILED(view->GetGroupBy(&groupKey, &ascending))) return;
     int current = KeyIndex(groupKey);
 
-    if (names.empty()) {
+    if (names.empty() || !enabled) {
+        // No pins here, or turned off with the on/off switch: the folder's own grouping.
         if (IsPinKey(groupKey)) {
             RestoreGrouping(d, view.Get());
             RegDeleteValueIn(HKEY_CURRENT_USER, kRegPreviousDialogGroupBy, d.folderPath.c_str());
@@ -377,11 +458,18 @@ void ProcessDialog(HWND dialog) {
         d.gaveUp = true;
         return;
     }
-    if (now - d.lastRegroup < 1000) return;
+    // At most about one regroup a second, except for a change of the pins (a user action).
+    if (!pinsChanged && now - d.lastRegroup < 1000) {
+        Recheck(dialog, 1000 - (now - d.lastRegroup));
+        return;
+    }
 
     int key = current < 0 ? 0 : 1 - current;
     if (current < 0 && !IsPinKey(groupKey)) SavePreviousGrouping(d.folderPath, groupKey, ascending);
-    if (!WriteKey(d, view.Get(), folder.Get(), key, names)) return;  // items not in the view yet
+    if (!WriteKey(d, view.Get(), folder.Get(), key, names)) {  // the items are not in the view yet
+        Recheck(dialog, 150);
+        return;
+    }
     d.lastRegroup = now;
     d.attempts++;
     d.grouped = true;
@@ -399,6 +487,12 @@ LRESULT CALLBACK GetMessageHook(int code, WPARAM wp, LPARAM lp) {
             HWND dialog = msg->hwnd;
             msg->message = WM_NULL;
             ProcessDialog(dialog);
+        } else if (msg->message == WM_TIMER && msg->wParam == kTimerId && t_dialogs && t_dialogs->count(msg->hwnd)) {
+            // Our recheck timer: never reaches the dialog's own window procedure.
+            HWND dialog = msg->hwnd;
+            KillTimer(dialog, kTimerId);
+            msg->message = WM_NULL;
+            ProcessDialog(dialog);
         } else if (IsCloseCommand(msg->message, msg->wParam)) {
             BeforeLeave(msg->hwnd);
         }
@@ -410,42 +504,110 @@ LRESULT CALLBACK GetMessageHook(int code, WPARAM wp, LPARAM lp) {
 LRESULT CALLBACK CallWndProcHook(int code, WPARAM wp, LPARAM lp) {
     const CWPSTRUCT* msg = reinterpret_cast<const CWPSTRUCT*>(lp);
     if (code == HC_ACTION) {
-        if (IsCloseCommand(msg->message, msg->wParam))
+        if (IsCloseCommand(msg->message, msg->wParam)) {
             BeforeLeave(msg->hwnd);
-        else if (msg->message == WM_NCDESTROY)
+        } else if (msg->message == WM_NCDESTROY) {
             ForgetDialog(msg->hwnd);
+        } else if (msg->message == WM_WINDOWPOSCHANGED && t_buttons && !t_buttons->empty()) {
+            // The dialog or its folder view moved or changed size: the button follows.
+            auto it = t_buttons->find(GetAncestor(msg->hwnd, GA_ROOT));
+            if (it != t_buttons->end() && it->second->Visible()) it->second->Place();
+        }
     }
     return CallNextHookEx(nullptr, code, wp, lp);
 }
 
-std::set<DWORD>* g_hookedThreads = nullptr;  // worker thread only
-bool g_settingOn = true;                     // worker thread only
+// ---- worker thread: finds file dialogs of this process and tells them about changes
+std::set<DWORD>* g_hookedThreads = nullptr;
+std::set<HWND>* g_knownDialogs = nullptr;
+bool g_settingOn = true;
 
-BOOL CALLBACK VisitWindow(HWND hwnd, LPARAM) {
-    DWORD pid = 0;
-    DWORD tid = GetWindowThreadProcessId(hwnd, &pid);
-    if (pid != GetCurrentProcessId() || !IsWindowVisible(hwnd)) return TRUE;
+bool IsFileDialog(HWND hwnd) {
     wchar_t cls[16];
-    if (!GetClassNameW(hwnd, cls, ARRAYSIZE(cls)) || wcscmp(cls, L"#32770") != 0) return TRUE;
-    if (!FindDefView(hwnd)) return TRUE;
+    return IsWindowVisible(hwnd) && GetClassNameW(hwnd, cls, ARRAYSIZE(cls)) && wcscmp(cls, L"#32770") == 0 &&
+           FindDefView(hwnd);
+}
+
+void Visit(HWND dialog) {
+    DWORD pid = 0;
+    DWORD tid = GetWindowThreadProcessId(dialog, &pid);
+    if (pid != GetCurrentProcessId() || !IsFileDialog(dialog)) return;
     if (!g_hookedThreads->count(tid)) {
-        if (!g_settingOn) return TRUE;
+        if (!g_settingOn) return;
         // A hook on the dialog's thread lets the work run there, where the view lives.
-        if (!SetWindowsHookExW(WH_GETMESSAGE, GetMessageHook, g_module, tid)) return TRUE;
+        if (!SetWindowsHookExW(WH_GETMESSAGE, GetMessageHook, g_module, tid)) return;
         SetWindowsHookExW(WH_CALLWNDPROC, CallWndProcHook, g_module, tid);
         g_hookedThreads->insert(tid);
     }
-    PostMessageW(hwnd, g_tickMessage, 0, 0);
+    g_knownDialogs->insert(dialog);
+    PostMessageW(dialog, g_tickMessage, 0, 0);
+}
+
+BOOL CALLBACK ScanWindow(HWND hwnd, LPARAM) {
+    Visit(hwnd);
     return TRUE;
+}
+
+// A dialog was shown or a folder view created in it (a new dialog or a navigation).
+void CALLBACK OnWinEvent(HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
+    if (!hwnd || idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
+    if (event == EVENT_OBJECT_DESTROY) {
+        g_knownDialogs->erase(hwnd);
+        return;
+    }
+    HWND root = GetAncestor(hwnd, GA_ROOT);
+    if (event == EVENT_OBJECT_CREATE) {
+        wchar_t cls[32];
+        if (!GetClassNameW(hwnd, cls, ARRAYSIZE(cls)) || wcscmp(cls, L"SHELLDLL_DefView") != 0) return;
+    } else if (root != hwnd) {
+        return;  // shown: only top-level windows matter
+    }
+    if (root) Visit(root);
+}
+
+// The pins or the settings changed: every dialog looks again at once.
+void TellDialogs() {
+    for (auto it = g_knownDialogs->begin(); it != g_knownDialogs->end();) {
+        if (!IsWindow(*it)) {
+            it = g_knownDialogs->erase(it);
+            continue;
+        }
+        PostMessageW(*it, g_tickMessage, 0, 0);
+        ++it;
+    }
+}
+
+void WatchKey(HKEY key, HANDLE event) {
+    if (key) RegNotifyChangeKeyValue(key, FALSE, REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET, event, TRUE);
 }
 
 DWORD WINAPI Worker(void*) {
     g_hookedThreads = new std::set<DWORD>();
+    g_knownDialogs = new std::set<HWND>();
+    g_settingOn = DialogsSettingOn();
+    HKEY keys[2] = {};
+    RegCreateKeyExW(HKEY_CURRENT_USER, kRegRoot, 0, nullptr, 0, KEY_NOTIFY | KEY_QUERY_VALUE, nullptr, &keys[0], nullptr);
+    RegCreateKeyExW(HKEY_CURRENT_USER, kRegPins, 0, nullptr, 0, KEY_NOTIFY | KEY_QUERY_VALUE, nullptr, &keys[1], nullptr);
+    HANDLE events[2] = {CreateEventW(nullptr, FALSE, FALSE, nullptr), CreateEventW(nullptr, FALSE, FALSE, nullptr)};
+    for (int i = 0; i < 2; i++) WatchKey(keys[i], events[i]);
+    // Out-of-context window events of this process arrive through this thread's message queue.
+    SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, nullptr, OnWinEvent, GetCurrentProcessId(), 0,
+                    WINEVENT_OUTOFCONTEXT);
+    EnumWindows(ScanWindow, 0);
     for (;;) {
-        Sleep(kPollMs);
-        // While turned off, only dialogs that were already handled are visited (to restore them).
-        g_settingOn = DialogsSettingOn();
-        EnumWindows(VisitWindow, 0);
+        DWORD r = MsgWaitForMultipleObjects(2, events, FALSE, kScanMs, QS_ALLINPUT);
+        if (r == WAIT_OBJECT_0 || r == WAIT_OBJECT_0 + 1) {
+            WatchKey(keys[r - WAIT_OBJECT_0], events[r - WAIT_OBJECT_0]);
+            g_settingOn = DialogsSettingOn();
+            TellDialogs();
+        } else if (r == WAIT_OBJECT_0 + 2) {
+            MSG msg;
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+        } else {
+            // Fallback: dialogs that were open before this DLL was loaded, missed events.
+            g_settingOn = DialogsSettingOn();
+            EnumWindows(ScanWindow, 0);
+        }
     }
 }
 

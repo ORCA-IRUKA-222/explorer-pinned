@@ -77,17 +77,28 @@ jobs:
           Get-Content "$env:LOCALAPPDATA\ExplorerPinned\agent.log" -Encoding utf8 -ErrorAction SilentlyContinue
           if (-not $finished) { Write-Error "E2E timed out"; exit 1 }
           exit $p.ExitCode
-      - name: Convert screenshot
+      - name: Convert screenshots
         if: always()
         shell: pwsh
         run: |
-          $bmp = "$PWD\screenshots\sorted-by-date.bmp"
-          if (Test-Path $bmp) {
-            Add-Type -AssemblyName System.Drawing
-            $img = [System.Drawing.Image]::FromFile($bmp)
-            $img.Save("$PWD\screenshots\sorted-by-date.png", [System.Drawing.Imaging.ImageFormat]::Png)
+          Add-Type -AssemblyName System.Drawing
+          Get-ChildItem "$PWD\screenshots\*.bmp" -ErrorAction SilentlyContinue | ForEach-Object {
+            $img = [System.Drawing.Image]::FromFile($_.FullName)
+            $img.Save([System.IO.Path]::ChangeExtension($_.FullName, ".png"), [System.Drawing.Imaging.ImageFormat]::Png)
             $img.Dispose()
-            Remove-Item $bmp
+            Remove-Item $_.FullName
+          }
+          # The corner with the on/off button, printed so that it can be looked at from the log.
+          foreach ($name in "explorer-button-on", "explorer-button-off", "dialog-button-on", "dialog-button-off") {
+            $file = "$PWD\screenshots\$name.png"
+            if (-not (Test-Path $file)) { continue }
+            $img = [System.Drawing.Bitmap]::FromFile($file)
+            $w = [Math]::Min(520, $img.Width); $h = [Math]::Min(170, $img.Height)
+            $crop = $img.Clone((New-Object System.Drawing.Rectangle ($img.Width - $w), ($img.Height - $h), $w, $h), $img.PixelFormat)
+            $ms = New-Object System.IO.MemoryStream
+            $crop.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+            Write-Host "SHOT $name $([Convert]::ToBase64String($ms.ToArray()))"
+            $crop.Dispose(); $img.Dispose()
           }
       - uses: actions/upload-artifact@v4
         if: always()

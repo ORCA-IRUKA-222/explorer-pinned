@@ -11,12 +11,14 @@
 #include <memory>
 #include <set>
 
+#include "buttons.h"
 #include "comutil.h"
 #include "dialogs.h"
 #include "displaycheck.h"
 #include "pinstore.h"
 #include "resource.h"
 #include "setup.h"
+#include "toggle.h"
 #include "util.h"
 #include "version.h"
 
@@ -39,6 +41,9 @@ constexpr UINT kPollIntervalMs = 2000;
 // So the agent changes the grouping only when the view has finished loading and has had no
 // load for kQuietMs (kIdleMs after Explorer dropped the values once).
 constexpr DWORD kQuietMs = 400;
+// Once Explorer reported that it listed the folder (EnumDone), the load is over: act almost
+// at once (the short wait only merges the events that arrive together).
+constexpr DWORD kFastQuietMs = 60;
 constexpr DWORD kIdleMs = 3000;
 constexpr DWORD kMaxLoadMs = 15000;  // a load whose end was not reported, or a view that keeps loading
 // Groupings applied to one view that did not hold before the agent stops trying and puts
@@ -51,6 +56,8 @@ constexpr UINT kCmdStartup = 3;
 constexpr UINT kCmdWebsite = 4;
 constexpr UINT kCmdExit = 5;
 constexpr UINT kCmdDialogs = 6;
+constexpr UINT kCmdEnabled = 7;
+constexpr UINT kCmdButton = 8;
 constexpr UINT kCmdOpenBase = 1000;   // + index into the pin list
 constexpr UINT kCmdUnpinBase = 3000;  // + index into the pin list
 constexpr size_t kMaxMenuPins = 100;
@@ -192,6 +199,9 @@ struct TrackedWindow {
     ComPtr<IShellFolder> folder;
     std::wstring folderPath;
     std::vector<BYTE> folderIdList;  // the ID list this window uses for the folder
+    HWND frame = nullptr;       // the Explorer window (shared by its tabs)
+    HWND viewWindow = nullptr;  // the folder view's window (SHELLDLL_DefView)
+    bool hasPins = false;       // the folder has pinned items (shows the on/off button)
     NameSet applied[2];       // names given the pinned value on each key in this view
     NameSet unwritable[2];    // pinned names the view refused a value for (e.g. hidden items)
     bool initialized = false;  // grouping was enforced once in this view
@@ -205,6 +215,7 @@ struct TrackedWindow {
     bool seen = false;
 
     bool loading = false;    // a navigation or our SetGroupBy is being loaded
+    bool enumDone = false;   // Explorer reported the end of the listing since the load started
     DWORD loadStart = 0;
     DWORD lastLoad = 0;      // last time a load started or finished
     DWORD waitSince = 0;     // first time processing was put off for a load
@@ -245,6 +256,9 @@ private:
 
     void ArmPinsWatch();
     void OnPinsChanged();
+    void ArmSettingsWatch();
+    void OnSettingsChanged();
+    void UpdateButtons();
 
     void AddTrayIcon();
     void RemoveTrayIcon();
@@ -268,9 +282,18 @@ private:
     std::vector<std::wstring> menuPins_;
     HKEY pinsKey_ = nullptr;
     HANDLE pinsEvent_ = nullptr;
+
+    // The on/off switch (HKCU\Software\ExplorerPinned: Enabled) and its buttons (Button).
+    bool enabled_ = true;
+    bool showButtons_ = true;
+    HKEY settingsKey_ = nullptr;
+    HANDLE settingsEvent_ = nullptr;
+    ExplorerButtons buttons_;
 };
 
 Agent* g_agent = nullptr;
+// HKCU\Software\ExplorerPinned: Trace = "1" also logs every navigation and view event.
+bool g_trace = false;
 
 // Version, Windows build and the state of the property schema, for diagnosing problems.
 void LogEnvironment(size_t pinCount) {
@@ -331,19 +354,37 @@ int Agent::Run() {
     pinsEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     pins_ = PinStore::LoadAll();
     ArmPinsWatch();
+    RegCreateKeyExW(HKEY_CURRENT_USER, kRegRoot, 0, nullptr, 0, KEY_NOTIFY | KEY_QUERY_VALUE, nullptr, &settingsKey_,
+                    nullptr);
+    settingsEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    enabled_ = PinsEnabled();
+    showButtons_ = ToggleButtonEnabled();
+    ArmSettingsWatch();
+    {
+        std::wstring trace;
+        g_trace = RegReadString(HKEY_CURRENT_USER, kRegRoot, L"Trace", &trace) && trace == L"1";
+    }
+    buttons_.Start();
 
     AddTrayIcon();
     SetTimer(hwnd_, kTimerPoll, kPollIntervalMs, nullptr);
     rescanPending_ = true;
     ArmWorkTimer();
     LogEnvironment(pins_.size());
+    if (!enabled_) LogLine(L"the pinned group is turned off");
 
+    HANDLE events[2];
+    DWORD eventCount = 0;
+    if (pinsEvent_) events[eventCount++] = pinsEvent_;
+    if (settingsEvent_) events[eventCount++] = settingsEvent_;
     MSG msg;
     for (;;) {
-        DWORD r = MsgWaitForMultipleObjectsEx(pinsEvent_ ? 1 : 0, &pinsEvent_, INFINITE, QS_ALLINPUT,
-                                              MWMO_INPUTAVAILABLE);
-        if (pinsEvent_ && r == WAIT_OBJECT_0) {
-            OnPinsChanged();
+        DWORD r = MsgWaitForMultipleObjectsEx(eventCount, events, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        if (r < WAIT_OBJECT_0 + eventCount) {
+            if (events[r - WAIT_OBJECT_0] == pinsEvent_)
+                OnPinsChanged();
+            else
+                OnSettingsChanged();
             continue;
         }
         bool quit = false;
@@ -373,12 +414,15 @@ int Agent::Run() {
             }
         }
     }
+    buttons_.Stop();
     windows_.clear();
     shellWindowsEvents_.Reset();
     shellWindows_.Reset();
     RemoveTrayIcon();
     if (pinsKey_) RegCloseKey(pinsKey_);
     if (pinsEvent_) CloseHandle(pinsEvent_);
+    if (settingsKey_) RegCloseKey(settingsKey_);
+    if (settingsEvent_) CloseHandle(settingsEvent_);
     DestroyWindow(hwnd_);
     g_agent = nullptr;
     LogLine(L"agent stopped");
@@ -478,6 +522,7 @@ void Agent::DoWork() {
         ProcessWindow(w);
     }
     busy_ = false;
+    UpdateButtons();
     ArmWorkTimer();
 }
 
@@ -538,13 +583,19 @@ void Agent::RescanWindows() {
                 // (Explorer does not raise BeforeNavigate2 for folder navigation.)
                 LeaveView(*raw);
             }
+            if (g_trace && (id == DISPID_NAVIGATECOMPLETE2 || id == DISPID_DOCUMENTCOMPLETE))
+                LogLine(L"trace: %s", id == DISPID_NAVIGATECOMPLETE2 ? L"NavigateComplete2" : L"DocumentComplete");
             if (id == DISPID_NAVIGATECOMPLETE2 || id == DISPID_DOCUMENTCOMPLETE) {
                 // A navigation starts loading the new view; the next DocumentComplete (or
                 // EnumDone) reports that the load is done.
                 raw->loading = id == DISPID_NAVIGATECOMPLETE2;
                 raw->lastLoad = GetTickCount();
-                if (raw->loading) raw->loadStart = raw->lastLoad;
-                Schedule(raw, kQuietMs, false);
+                if (raw->loading) {
+                    raw->loadStart = raw->lastLoad;
+                    raw->enumDone = false;
+                }
+                // Look at the new view right away: its events tell when the listing is done.
+                Schedule(raw, 0, false);
                 ArmWorkTimer();
             } else if (id == DISPID_ONQUIT) {
                 rescanPending_ = true;
@@ -573,6 +624,8 @@ bool Agent::AcquireView(TrackedWindow& w, bool* newSession) {
         w.folder.Reset();
         w.folderPath.clear();
         w.viewEvents.Reset();
+        w.viewWindow = nullptr;
+        w.hasPins = false;
         return false;
     }
     ComPtr<IUnknown> id = Identity(view.Get());
@@ -580,6 +633,7 @@ bool Agent::AcquireView(TrackedWindow& w, bool* newSession) {
 
     // New view: new navigation (values set on the old view are gone).
     *newSession = true;
+    if (g_trace) LogLine(L"trace: new view%s", w.loading ? L" (loading)" : L"");
     w.view = view;
     w.viewIdentity = id;
     w.folder.Reset();
@@ -593,7 +647,9 @@ bool Agent::AcquireView(TrackedWindow& w, bool* newSession) {
     w.leaving = false;
     w.waitSince = 0;
     w.attempts = 0;
+    // Regroups are only spaced out within one view: opening another folder is grouped at once.
     w.churn = 0;
+    w.lastRegroup = 0;
     w.writeFailures = 0;
     w.dropped = false;
     w.gaveUp = false;
@@ -615,16 +671,26 @@ bool Agent::AcquireView(TrackedWindow& w, bool* newSession) {
             CoTaskMemFree(pidl);
         }
     }
+    // For the on/off button; ProcessWindow checks that the pinned items exist.
+    SHANDLE_PTR frame = 0;
+    w.frame = SUCCEEDED(w.browser->get_HWND(&frame)) ? reinterpret_cast<HWND>(frame) : nullptr;
+    w.viewWindow = nullptr;
+    sv->GetWindow(&w.viewWindow);
+    w.hasPins = !w.folderPath.empty() && !PinStore::NamesInFolder(pins_, w.folderPath).empty();
     ComPtr<IDispatch> doc;
     TrackedWindow* raw = &w;
     if (SUCCEEDED(w.browser->get_Document(doc.Put())) && doc) {
         w.viewEvents.Connect(doc.Get(), DIID_DShellFolderViewEvents, [this, raw](DISPID id) {
             if (id == kDispSelectionChanged || id == kDispFocusChanged) return;
+            if (g_trace) LogLine(L"trace: view event %ld in %s", (long)id, raw->folderPath.c_str());
             if (id == kDispEnumDone) {
                 raw->loading = false;
+                raw->enumDone = true;
                 raw->lastLoad = GetTickCount();
+                Schedule(raw, kFastQuietMs, false);
+            } else {
+                Schedule(raw, kQuietMs, false);
             }
-            Schedule(raw, kQuietMs, false);
             ArmWorkTimer();
         });
     }
@@ -702,7 +768,7 @@ bool Agent::KeyMatches(TrackedWindow& w, int k, const NameSet& names) {
 // again. A view that never calms down is processed anyway after a while.
 bool Agent::Settling(TrackedWindow& w, DWORD* waitMs) {
     DWORD now = GetTickCount();
-    DWORD quiet = w.dropped ? kIdleMs : kQuietMs;
+    DWORD quiet = w.dropped ? kIdleMs : w.enumDone ? kFastQuietMs : kQuietMs;
     DWORD since = now - w.lastLoad;
     if ((!w.loading || now - w.loadStart >= kMaxLoadMs) && since >= quiet) {
         w.loading = false;
@@ -755,10 +821,12 @@ void Agent::ProcessWindow(TrackedWindow& w) {
         return;
     }
     int current = KeyIndex(groupKey);
+    w.hasPins = !names.empty();
 
-    if (names.empty()) {
+    if (names.empty() || !enabled_) {
+        // No pins here, or turned off with the on/off switch: the folder's own grouping.
         if (IsPinKey(groupKey)) RestoreGrouping(w, /*forget=*/true);
-        // Take over again as soon as a pinned item shows up in this view.
+        // Take over again as soon as a pinned item shows up in this view (or it is turned on).
         w.initialized = false;
         w.enforce = false;
         w.attempts = 0;
@@ -767,6 +835,7 @@ void Agent::ProcessWindow(TrackedWindow& w) {
         return;
     }
 
+    bool userChange = w.enforce;
     if (w.enforce) {
         // The pins changed (or "reapply"): start over, also in a view the agent gave up on.
         w.displayLogged = false;
@@ -816,11 +885,10 @@ void Agent::ProcessWindow(TrackedWindow& w) {
     // a minute) while that goes on, since every regroup makes Explorer reload the view.
     DWORD now = GetTickCount();
     DWORD gap = w.churn < 3 ? 1000 : std::min<DWORD>(30000, 1000u << std::min(w.churn - 2, 5));
-    if (now - w.lastRegroup < gap) {
+    if (!userChange && now - w.lastRegroup < gap) {
         Schedule(&w, gap - (now - w.lastRegroup), false);
         return;
     }
-    w.churn = w.lastRegroup && now - w.lastRegroup < gap + 10000 ? w.churn + 1 : 0;
 
     // Explorer only re-groups items when the group-by key changes: write the values to the
     // key that is not active and switch to it.
@@ -833,13 +901,19 @@ void Agent::ProcessWindow(TrackedWindow& w) {
         // show them (hidden items). Grouping now would only show "Unspecified": try again
         // every second for a while, then every ten seconds, without counting it as a
         // failed grouping.
-        if (++w.writeFailures == 1 || w.writeFailures % 10 == 0)
-            LogLine(L"cannot set the pinned value in %s yet (0x%08lX, try %d)", w.folderPath.c_str(),
-                    (unsigned long)failure, w.writeFailures);
-        Schedule(&w, w.writeFailures < 20 ? 1000 : 10000, false);
+        if (++w.writeFailures == 1 || w.writeFailures % 10 == 0) {
+            int items = -1;
+            w.view->ItemCount(SVGIO_ALLVIEW, &items);
+            LogLine(L"cannot set the pinned value in %s yet (0x%08lX, try %d, %d item(s) in the view)",
+                    w.folderPath.c_str(), (unsigned long)failure, w.writeFailures, items);
+        }
+        Schedule(&w, w.writeFailures < 8 ? 250 : w.writeFailures < 30 ? 1000 : 10000, false);
         return;
     }
+    if (w.writeFailures) LogLine(L"set the pinned value in %s after %d tries", w.folderPath.c_str(), w.writeFailures + 1);
     w.writeFailures = 0;
+    // Only regroups count (not the tries above, in which nothing changed).
+    w.churn = w.lastRegroup && now - w.lastRegroup < gap + 10000 ? w.churn + 1 : 0;
     w.lastRegroup = now;
     w.attempts++;
     w.dropped = false;
@@ -849,6 +923,7 @@ void Agent::ProcessWindow(TrackedWindow& w) {
         MarkGrouped(w.folderPath, reinterpret_cast<PCIDLIST_ABSOLUTE>(w.folderIdList.data()));
     // Explorer reloads the view for the new grouping; check the result once that is done.
     w.loading = true;
+    w.enumDone = false;
     w.loadStart = now;
     w.lastLoad = now;
     hr = w.view->SetGroupBy(kPinStateKeys[key], TRUE);
@@ -865,6 +940,7 @@ void Agent::RestoreGrouping(TrackedWindow& w, bool forget) {
     ReadPreviousGroupBy(w.folderPath, &key, &ascending);
     if (forget) RegDeleteValueIn(HKEY_CURRENT_USER, kRegPreviousGroupBy, w.folderPath.c_str());
     w.loading = true;  // Explorer reloads the view for this grouping too
+    w.enumDone = false;
     w.loadStart = w.lastLoad = GetTickCount();
     w.view->SetGroupBy(key, ascending);
     ClearGrouped(w.folderPath);
@@ -906,17 +982,50 @@ void Agent::OnPinsChanged() {
     ArmPinsWatch();
     std::vector<std::wstring> old = std::move(pins_);
     pins_ = PinStore::LoadAll();
-    // Several "pin" processes may run at once (multiple selection); whichever wrote the
-    // menu conditions last may have missed a pin, so rewrite them from the final list.
-    UpdateContextMenu(pins_);
+    bool changed = false;
     for (auto& w : windows_) {
         if (w->folderPath.empty()) continue;
         auto before = PinStore::NamesInFolder(old, w->folderPath);
         auto after = PinStore::NamesInFolder(pins_, w->folderPath);
         NameSet a(before.begin(), before.end()), b(after.begin(), after.end());
-        if (a != b) Schedule(w.get(), 0, true);
+        if (a != b) {
+            Schedule(w.get(), 0, true);
+            changed = true;
+        }
     }
+    // The views first (what the user is looking at), then the menus.
+    if (changed) DoWork();
+    // Several "pin" processes may run at once (multiple selection); whichever wrote the
+    // menu conditions last may have missed a pin, so rewrite them from the final list.
+    UpdateContextMenu(pins_);
     ArmWorkTimer();
+}
+
+void Agent::ArmSettingsWatch() {
+    if (settingsKey_ && settingsEvent_)
+        RegNotifyChangeKeyValue(settingsKey_, FALSE, REG_NOTIFY_CHANGE_LAST_SET, settingsEvent_, TRUE);
+}
+
+// The on/off switch was used (a button, the notification area menu or the command line).
+void Agent::OnSettingsChanged() {
+    ArmSettingsWatch();
+    bool enabled = PinsEnabled();
+    showButtons_ = ToggleButtonEnabled();
+    if (enabled != enabled_) {
+        enabled_ = enabled;
+        LogLine(enabled ? L"the pinned group is turned on" : L"the pinned group is turned off");
+        for (auto& w : windows_) Schedule(w.get(), 0, true);
+        DoWork();
+    }
+    UpdateButtons();
+    ArmWorkTimer();
+}
+
+void Agent::UpdateButtons() {
+    ExplorerButtons::Frames frames;
+    for (auto& w : windows_)
+        if (w->frame && w->viewWindow) frames[w->frame].push_back({w->viewWindow, w->hasPins});
+    buttons_.Update(frames, enabled_, showButtons_);
 }
 
 void Agent::AddTrayIcon() {
@@ -962,6 +1071,9 @@ void Agent::ShowTrayMenu() {
         for (size_t p = 0; (p = label.find(L'&', p)) != std::wstring::npos; p += 2) label.insert(p, 1, L'&');
         AppendMenuW(pinsMenu, MF_POPUP | (PathExists(menuPins_[i]) ? 0 : MF_GRAYED), (UINT_PTR)item, label.c_str());
     }
+    AppendMenuW(menu, MF_STRING | (enabled_ ? MF_CHECKED : 0), kCmdEnabled, LoadStr(IDS_TRAY_ENABLED).c_str());
+    AppendMenuW(menu, MF_STRING | (showButtons_ ? MF_CHECKED : 0), kCmdButton, LoadStr(IDS_TRAY_BUTTON).c_str());
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)pinsMenu, LoadStr(IDS_TRAY_PINNED_ITEMS).c_str());
     AppendMenuW(menu, MF_STRING, kCmdReapply, LoadStr(IDS_TRAY_REAPPLY).c_str());
     AppendMenuW(menu, MF_STRING, kCmdCleanup, LoadStr(IDS_TRAY_CLEANUP).c_str());
@@ -1015,6 +1127,12 @@ void Agent::OnCommand(UINT id) {
         }
         case kCmdStartup:
             SetStartupEnabled(!IsStartupEnabled());
+            break;
+        case kCmdEnabled:
+            SetPinsEnabled(!enabled_);  // windows follow through the registry watch
+            break;
+        case kCmdButton:
+            SetToggleButtonEnabled(!showButtons_);
             break;
         case kCmdDialogs:
             // Open dialogs follow within a second.

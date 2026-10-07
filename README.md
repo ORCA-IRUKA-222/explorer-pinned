@@ -18,6 +18,7 @@ English summary is [below](#english).
 - 右クリック →「**ピン止めを外す**」で解除
 - ダウンロードに限らず、どのフォルダーでも使えます
 - **ファイルを開く・保存する画面や、ブラウザーでファイルをアップロードするときの画面** でも一番上に表示（インストーラー版、[詳しく](#ファイル選択画面開く保存アップロード)）
+- ウィンドウの「**ピン止め オン / オフ**」ボタンで、いつでも普段の表示に戻せます（ピン止めは残ります、[詳しく](#オンオフ-ボタン)）
 - エクスプローラー本体は書き換えません（エクスプローラーのウィンドウは Windows が公開している COM の API だけで操作します）
 - ファイル自体には何も書き込みません（名前も更新日時も変わりません）
 - 日本語と英語に対応（インストーラーで選んだ言語。ポータブル版は Windows の表示言語）
@@ -76,6 +77,21 @@ English summary is [below](#english).
 - 一時的に別のグループ化（例: 種類）を選ぶと、そのウィンドウではそのまま維持されます。フォルダーを開き直すと「ピン止め」グループに戻ります。
 - フォルダー内のピン止めをすべて外すと、元のグループ化（例: ダウンロードの「更新日時」グループ）に戻ります。
 
+### オン/オフ ボタン
+
+ピン止めした項目があるフォルダーでは、ウィンドウに小さな「**📌 ピン止め オン**」ボタンが表示されます。
+
+- **エクスプローラー:** ウィンドウ下端のステータスバーの右側（ステータスバーを非表示にしている場合は一覧の右下）
+- **ファイル選択画面:** ファイル一覧の右下（インストーラー版）
+
+クリックすると「ピン止め オフ」になり、**開いているすべてのエクスプローラーとファイル選択画面がまとめて** 普段の表示
+（元のグループ化）に戻ります。ピン止めした項目の一覧は残っているので、もう一度クリックすればすぐに元どおり一番上に表示されます。
+オフの間にピン止めした項目も、オンに戻したときに表示されます。
+
+- 通知領域のアイコン →「ピン止めグループを表示する」や、コマンドライン（`ExplorerPinned.exe off` / `on`）でも切り替えられます。
+- ボタンが邪魔な場合は、通知領域のアイコン →「ウィンドウにオン/オフ ボタンを表示」のチェックを外すと非表示にできます。
+- ピン止めした項目がないフォルダーにはボタンは表示されません。
+
 ### ファイル選択画面（開く・保存・アップロード）
 
 インストーラー版では、アプリの「ファイルを開く」「名前を付けて保存」の画面や、Chrome・Edge・Firefox などで
@@ -86,8 +102,9 @@ Web サイトにファイルをアップロードするときの画面でも、�
   元のグループ化に戻します。ファイルにもアプリにも何も書き込みません。インターネットへの通信もしません。
   （Windows に「アイコンのオーバーレイ」用として登録しますが、アイコンには何も表示せず、
   Windows のオーバーレイの枠（15 個まで）も使いません。）
-- **オフにするには:** 通知領域のアイコン →「ファイル選択画面（開く・保存・アップロード）でも表示」のチェックを外します。
-  開いているファイル選択画面にも 1 秒ほどで反映されます。DLL 自体を取り除くにはアンインストールしてください。
+- **オフにするには:** 一時的にオフにするだけなら、画面の「ピン止め オン」ボタンを押します（エクスプローラーもまとめてオフになります）。
+  ファイル選択画面だけ常にオフにするには、通知領域のアイコン →「ファイル選択画面（開く・保存・アップロード）でも表示」のチェックを外します。
+  どちらも開いているファイル選択画面にすぐ反映されます。DLL 自体を取り除くにはアンインストールしてください。
 - 32 ビットのアプリにも対応しています。ARM 版 Windows では、ARM64 版と 32 ビット（x86）のアプリで表示されます
   （エミュレーションで動く x64 版のアプリでは表示されません）。
 - アプリが独自のファイル選択画面を使っている場合は表示されません。
@@ -100,6 +117,8 @@ Web サイトにファイルをアップロードするときの画面でも、�
 
 | メニュー | 内容 |
 | --- | --- |
+| ピン止めグループを表示する | ピン止めグループ表示のオン/オフ（ウィンドウのボタンと同じ。ピン止めは残ります） |
+| ウィンドウにオン/オフ ボタンを表示 | エクスプローラーとファイル選択画面のオン/オフ ボタンの表示/非表示 |
 | ピン止め中の項目 | ピン止めの一覧。各項目から「エクスプローラーで表示」「ピン止めを外す」ができます |
 | 開いているウィンドウに再適用 | 表示がずれたときに、開いているすべてのウィンドウへ再適用します |
 | 存在しない項目のピン止めを整理 | 削除済みの項目のピン止めを一覧から消します |
@@ -127,7 +146,6 @@ Web サイトにファイルをアップロードするときの画面でも、�
 - **ピン止めはパスで記録します。** ピン止めした項目の名前を変えたり別のフォルダーへ移動したりすると、ピン止めは外れます。
   削除した項目と同じ名前の項目が後から作られると、再びピン止めされた状態になります。
 - 「PC」「ホーム」「ライブラリ」、検索結果などの仮想フォルダーでは使えません。
-- ファイル選択画面では、ピン止めの変更が反映されるまで 1 秒ほどかかります。
 - ピン止めしていない項目が入る「未指定」グループの名前は変更できません（Windows の仕様）。
 - 同じフォルダーを表示していても、隠しファイルとして非表示になっている項目はピン止めグループに出ません。
 - エクスプローラーの `IFolderView2::SetViewProperty` という API を使っています。現在の Windows 10 / 11 で動作しますが、
@@ -157,6 +175,7 @@ ExplorerPinned.exe [コマンド] [パス...]
   toggle <パス>...    ピン止め/解除を切り替え
   list                ピン止め中の項目を表示
   status              登録・実行の状態を表示
+  on | off            ピン止めグループの表示をオン/オフ（すべてのウィンドウとファイル選択画面。ピン止めは残ります）
   reapply             開いているウィンドウに再適用
   setup               右クリックメニュー・「ピン止め」の名前・自動起動を登録
                       (--no-startup: 自動起動を登録しない / --no-agent: 常駐を開始しない / --quiet)
@@ -189,6 +208,13 @@ ExplorerPinned.exe [コマンド] [パス...]
   `WM_GETISHELLBROWSER` → `IShellBrowser::QueryActiveShellView` → `IFolderView2` と取得して、エクスプローラーと同じ方法でグループ化します。
   画面はフォルダーごとにグループ化を保存するため、閉じる操作（OK / キャンセル / 閉じる）と
   `IExplorerBrowserEvents::OnNavigationPending`（別のフォルダーへの移動）の前に元のグループ化に戻します。
+  ファイル選択画面はウィンドウのイベント（`SetWinEventHook`）で見つけ、ピン止めの変更はレジストリの変更通知で受け取ります。
+- 表示の速さ: エクスプローラーがフォルダーを読み込み終えた通知（`DShellFolderViewEvents` の EnumDone）を受けたら、
+  すぐにグループ化します。ピン止めの変更はレジストリの変更通知（`RegNotifyChangeKeyValue`）で受け取り、すぐに反映します。
+- オン/オフ: `HKCU\Software\ExplorerPinned` の `Enabled`（`0` でオフ）と `Button`（`0` でボタンを非表示）。
+  エクスプローラーのボタンは常駐プロセスが、そのウィンドウを所有者にした小さなウィンドウとして表示します
+  （所有されたウィンドウは入力をエクスプローラーと共有するため、何も待たない専用のスレッドで動かします）。
+  ファイル選択画面のボタンは DLL が画面のスレッドで表示します。
 
 ### ビルド
 
@@ -235,6 +261,11 @@ Pinned items are shown in a **"Pinned"** group at the top, whatever the sort ord
   handler that shows no overlay and uses no overlay slot) into programs that show a file dialog. It only changes the
   grouping of the dialog's file list and puts the original grouping back before the dialog closes or leaves the folder.
   It can be turned off in the notification area menu ("Also in file dialogs"). The portable build does not include it.
+- An **on/off button** ("Pins on" / "Pins off") appears in folders that have pinned items: in Explorer's status bar
+  and in the bottom-right corner of file dialogs. One click shows the usual grouping again in every Explorer window and
+  file dialog at once (pins are kept); click again to bring the "Pinned" group back. Also available as
+  "Show the pinned group" in the notification area menu and as `ExplorerPinned.exe off` / `on`. The button itself can be
+  hidden with "Show the on/off button in windows".
 - A small background process (notification area icon) applies the "Pinned" grouping through public Shell COM APIs
   (`IFolderView2::SetViewProperty` + `SetGroupBy`). Unpinned items appear in Explorer's built-in "Unspecified" group.
 - Install with `ExplorerPinned-Setup-<version>.exe` from [Releases](https://github.com/ORCA-IRUKA-222/explorer-pinned/releases)

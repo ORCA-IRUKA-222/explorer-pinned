@@ -8,6 +8,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 set(EP_SOURCES
     src/agent.cpp
+    src/buttons.cpp
     src/comutil.cpp
     src/console.cpp
     src/dialogs.cpp
@@ -15,6 +16,7 @@ set(EP_SOURCES
     src/main.cpp
     src/pinstore.cpp
     src/setup.cpp
+    src/toggle.cpp
     src/util.cpp
     src/ExplorerPinned.rc
     src/app.manifest
@@ -22,23 +24,26 @@ set(EP_SOURCES
 
 add_executable(ExplorerPinned WIN32 ${EP_SOURCES})
 target_compile_definitions(ExplorerPinned PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
-target_link_libraries(ExplorerPinned PRIVATE ole32 oleaut32 shell32 shlwapi propsys uuid comctl32 user32 advapi32)
+target_link_libraries(ExplorerPinned PRIVATE ole32 oleaut32 shell32 shlwapi propsys uuid comctl32 user32 advapi32 gdiplus)
 if(MSVC)
     target_compile_options(ExplorerPinned PRIVATE /W4 /permissive- /utf-8 /EHsc)
 endif()
 
 # Loaded into programs that show a file dialog (registered as an icon overlay handler) to
 # show the pinned group in Open/Save dialogs too.
-add_library(ExplorerPinnedShell SHARED src/shellext.cpp src/comutil.cpp src/dialogs.cpp src/pinstore.cpp src/util.cpp
-    src/shellext.def src/shellext.rc)
+add_library(ExplorerPinnedShell SHARED src/shellext.cpp src/comutil.cpp src/dialogs.cpp src/pinstore.cpp src/toggle.cpp
+    src/util.cpp src/shellext.def src/shellext.rc)
 if(CMAKE_SIZEOF_VOID_P EQUAL 4)
     # For 32-bit programs on 64-bit Windows; installed next to the 64-bit DLL.
     set_target_properties(ExplorerPinnedShell PROPERTIES OUTPUT_NAME ExplorerPinnedShell32)
 endif()
 target_compile_definitions(ExplorerPinnedShell PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
-target_link_libraries(ExplorerPinnedShell PRIVATE ole32 oleaut32 shell32 shlwapi propsys uuid user32 advapi32)
+target_link_libraries(ExplorerPinnedShell PRIVATE ole32 oleaut32 shell32 shlwapi propsys uuid user32 advapi32 gdiplus)
 if(MSVC)
     target_compile_options(ExplorerPinnedShell PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    # GDI+ draws the on/off button; most programs that load the DLL never show it.
+    target_link_libraries(ExplorerPinnedShell PRIVATE delayimp)
+    target_link_options(ExplorerPinnedShell PRIVATE /DELAYLOAD:gdiplus.dll)
 endif()
 
 option(EP_BUILD_TESTS "Build the end-to-end test program" ON)
