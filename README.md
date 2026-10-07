@@ -243,6 +243,22 @@ build\Release\ExplorerPinnedE2E.exe build\Release\ExplorerPinned.exe
 GitHub Actions（`.github/workflows/build.yml`）では、push のたびにビルドとこのテストを Windows Server 2022 / 2025 で実行し、
 インストーラーと zip を作成します。Releases への公開は、`src/version.h` のバージョンを上げてから
 Actions の「Build」→「Run workflow」で `release` にチェックを入れて実行します（`v1.2.3` のようなタグの push でも公開されます）。
+コード署名（SignPath）の設定とリリース時の承認の流れは [docs/code-signing.md](docs/code-signing.md) にあります。
+
+## コード署名ポリシー
+
+Windows 用のプログラム（`ExplorerPinned-Setup-<バージョン>.exe`、`ExplorerPinned.exe`、`ExplorerPinnedShell.dll`、
+`ExplorerPinnedShell32.dll`）は、SignPath Foundation の証明書で署名します（**申請中**。承認後のリリースから署名されます。
+それまでのリリースは署名されていません）。
+
+Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
+
+- 署名するのは、このリポジトリのソースコードから GitHub Actions でビルドしたファイルだけです。
+- コミッター・レビュアー: [ORCA-IRUKA-222](https://github.com/ORCA-IRUKA-222)
+- 承認者（署名を承認する人）: [ORCA-IRUKA-222](https://github.com/ORCA-IRUKA-222)
+
+**プライバシーポリシー:** このプログラムは、利用者（またはインストール・操作する人）が明示的に求めた場合を除き、
+ネットワーク上のほかのシステムに情報を送信しません。
 
 ## ライセンス
 
@@ -280,5 +296,18 @@ Pinned items are shown in a **"Pinned"** group at the top, whatever the sort ord
 - Limitations: the background process must be running; only one grouping can be active, so the default date groups
   of Downloads are replaced while pins exist in that folder; pins are stored by path (renaming/moving an item unpins it);
   `IFolderView2::SetViewProperty` is marked deprecated in the Windows SDK, so a future Windows update could break it.
+
+### Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/)
+(pending approval; releases are signed once it is approved, earlier releases are unsigned).
+The setup program, `ExplorerPinned.exe`, `ExplorerPinnedShell.dll` and `ExplorerPinnedShell32.dll` are signed, and only
+when they were built by GitHub Actions from the source code in this repository.
+
+- Committers and reviewers: [ORCA-IRUKA-222](https://github.com/ORCA-IRUKA-222)
+- Approvers: [ORCA-IRUKA-222](https://github.com/ORCA-IRUKA-222)
+
+Privacy policy: This program will not transfer any information to other networked systems unless specifically
+requested by the user or the person installing or operating it.
 
 Licensed under the [MIT License](LICENSE).
