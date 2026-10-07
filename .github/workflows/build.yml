@@ -243,6 +243,8 @@ jobs:
   installer-test:
     name: Installer test
     needs: package
+    # Explicit: by default a job is skipped when a job before it (here "Sign binaries") was skipped.
+    if: ${{ !cancelled() && needs.package.result == 'success' }}
     runs-on: windows-2025
     timeout-minutes: 15
     steps:
