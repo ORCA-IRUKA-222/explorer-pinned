@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SignPath artifact configuration "binaries": the program files of a release, before they are
+     packed into the installer and the zips. The build gives them unique names (see the
+     "Sign binaries" job in .github/workflows/build.yml). -->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <zip-file>
+    <pe-file path="ExplorerPinned.x64.exe">
+      <authenticode-sign />
+    </pe-file>
+    <pe-file path="ExplorerPinned.arm64.exe">
+      <authenticode-sign />
+    </pe-file>
+    <pe-file path="ExplorerPinnedShell.x64.dll">
+      <authenticode-sign />
+    </pe-file>
+    <pe-file path="ExplorerPinnedShell.arm64.dll">
+      <authenticode-sign />
+    </pe-file>
+    <pe-file path="ExplorerPinnedShell32.x86.dll">
+      <authenticode-sign />
+    </pe-file>
+  </zip-file>
+</artifact-configuration>

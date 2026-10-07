@@ -15,6 +15,15 @@ on:
         description: "Commit for the release tag (default: the commit being built)"
         type: string
         default: ""
+      sign:
+        description: "Sign with SignPath even without a release (to try the signing setup)"
+        type: boolean
+        default: false
+      signing_policy:
+        description: "SignPath signing policy"
+        type: choice
+        options: [release-signing, test-signing]
+        default: release-signing
 
 permissions:
   contents: read
@@ -107,9 +116,76 @@ jobs:
           path: screenshots
           if-no-files-found: ignore
 
+  # Code signing through SignPath (free for open source, certificate by SignPath Foundation).
+  # Runs for releases once the repository variable SIGNPATH_ORGANIZATION_ID and the secret
+  # SIGNPATH_API_TOKEN are set (see docs/code-signing.md); until then releases are unsigned.
+  # Each signing request waits for the approval in SignPath.
+  sign-binaries:
+    name: Sign binaries
+    needs: build
+    if: >-
+      vars.SIGNPATH_ORGANIZATION_ID != '' &&
+      (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && (inputs.release || inputs.sign)))
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-x64
+          path: bin/x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-arm64
+          path: bin/arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-x86
+          path: bin/x86
+      - name: Collect the program files
+        # Unique names, matching .signpath/artifact-configurations/binaries.xml
+        run: |
+          mkdir unsigned
+          cp bin/x64/ExplorerPinned.exe unsigned/ExplorerPinned.x64.exe
+          cp bin/arm64/ExplorerPinned.exe unsigned/ExplorerPinned.arm64.exe
+          cp bin/x64/ExplorerPinnedShell.dll unsigned/ExplorerPinnedShell.x64.dll
+          cp bin/arm64/ExplorerPinnedShell.dll unsigned/ExplorerPinnedShell.arm64.dll
+          cp bin/x86/ExplorerPinnedShell32.dll unsigned/ExplorerPinnedShell32.x86.dll
+      - uses: actions/upload-artifact@v4
+        id: unsigned
+        with:
+          name: unsigned-binaries
+          path: unsigned
+          if-no-files-found: error
+      - uses: signpath/github-action-submit-signing-request@v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'explorer-pinned' }}
+          signing-policy-slug: ${{ inputs.signing_policy || 'release-signing' }}
+          artifact-configuration-slug: binaries
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 10200
+          output-artifact-directory: signed
+      - name: Put the signed files back in place
+        run: |
+          mkdir -p out/x64 out/arm64 out/x86
+          mv signed/ExplorerPinned.x64.exe out/x64/ExplorerPinned.exe
+          mv signed/ExplorerPinned.arm64.exe out/arm64/ExplorerPinned.exe
+          mv signed/ExplorerPinnedShell.x64.dll out/x64/ExplorerPinnedShell.dll
+          mv signed/ExplorerPinnedShell.arm64.dll out/arm64/ExplorerPinnedShell.dll
+          mv signed/ExplorerPinnedShell32.x86.dll out/x86/ExplorerPinnedShell32.dll
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-signed
+          path: out
+          if-no-files-found: error
+
   package:
     name: Package
-    needs: build
+    needs: [build, sign-binaries]
+    # Also when signing is not set up (skipped); never with binaries that failed to be signed.
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.sign-binaries.result != 'failure' }}
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -125,6 +201,11 @@ jobs:
         with:
           name: bin-x86
           path: dist/x86
+      - uses: actions/download-artifact@v4
+        if: needs.sign-binaries.result == 'success'
+        with:
+          name: bin-signed
+          path: dist
       - name: Read version
         id: version
         shell: pwsh
@@ -162,6 +243,8 @@ jobs:
   installer-test:
     name: Installer test
     needs: package
+    # Explicit: by default a job is skipped when a job before it (here "Sign binaries") was skipped.
+    if: ${{ !cancelled() && needs.package.result == 'success' }}
     runs-on: windows-2025
     timeout-minutes: 15
     steps:
@@ -231,10 +314,59 @@ jobs:
           if (Test-Path "HKLM:\SOFTWARE\Classes\CLSID\{432E90E6-6BCF-44FE-9F87-8BA191F04870}") { throw "DLL class left behind" }
           Write-Host "installer test passed"
 
+  sign-installer:
+    name: Sign installer
+    needs: [sign-binaries, package]
+    if: ${{ !cancelled() && needs.sign-binaries.result == 'success' && needs.package.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: packages
+      - name: Collect the installer
+        # A fixed name, matching .signpath/artifact-configurations/installer.xml
+        run: |
+          mkdir unsigned
+          cp packages/ExplorerPinned-Setup-*.exe unsigned/ExplorerPinned-Setup.exe
+      - uses: actions/upload-artifact@v4
+        id: unsigned
+        with:
+          name: unsigned-installer
+          path: unsigned
+          if-no-files-found: error
+      - uses: signpath/github-action-submit-signing-request@v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'explorer-pinned' }}
+          signing-policy-slug: ${{ inputs.signing_policy || 'release-signing' }}
+          artifact-configuration-slug: installer
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 10200
+          output-artifact-directory: signed
+      - name: Replace the installer with the signed one
+        run: |
+          setup=$(ls packages/ExplorerPinned-Setup-*.exe)
+          mv signed/ExplorerPinned-Setup.exe "$setup"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-signed
+          path: packages
+          if-no-files-found: error
+
   release:
     name: Release
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release)
-    needs: [e2e, package, installer-test]
+    needs: [e2e, package, installer-test, sign-installer]
+    # Signed when signing is set up; unsigned otherwise. A signing that failed (or was
+    # declined) stops the release.
+    if: >-
+      ${{ !cancelled() &&
+      (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release)) &&
+      needs.e2e.result == 'success' && needs.package.result == 'success' && needs.installer-test.result == 'success' &&
+      (needs.sign-installer.result == 'success' || (needs.sign-installer.result == 'skipped' && vars.SIGNPATH_ORGANIZATION_ID == '')) }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -242,7 +374,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: packages
+          name: ${{ needs.sign-installer.result == 'success' && 'packages-signed' || 'packages' }}
           path: packages
       - name: Create release
         env:
