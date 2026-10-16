@@ -19,7 +19,9 @@ struct Request {
 
 // Group name -> topmost position and number of items Explorer has created elements for
 // (those on screen and near it).
-std::wstring DescribeGroups(HWND window) {
+// `firstGroup` receives the topmost group, not counting list items outside any group (other
+// lists of the window, or items read while Explorer was still drawing).
+std::wstring DescribeGroups(HWND window, std::wstring* firstGroup) {
     IUIAutomation* uia = nullptr;
     if (FAILED(CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&uia))))
         return L"(UI Automation unavailable)";
@@ -65,8 +67,10 @@ std::wstring DescribeGroups(HWND window) {
         std::vector<std::pair<int, std::wstring>> order;
         for (const auto& g : groups) order.push_back({g.second.top, g.first});
         std::sort(order.begin(), order.end());
-        for (const auto& o : order)
+        for (const auto& o : order) {
             result += L" [" + o.second + L"] " + std::to_wstring(groups[o.second].count);
+            if (firstGroup->empty() && o.second != L"(no group)") *firstGroup = o.second;
+        }
         if (result.empty()) result = L" (no items)";
     } else {
         result = L" (not available)";
@@ -83,9 +87,9 @@ DWORD WINAPI CheckThread(void* param) {
     Request* request = static_cast<Request*>(param);
     Sleep(1500);  // let Explorer draw the new grouping
     if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
-        std::wstring groups = DescribeGroups(request->window);
-        std::wstring expected = L"[" + LoadStr(IDS_PROP_PINNED) + L"]";
-        bool shown = groups.compare(0, expected.size() + 1, L" " + expected) == 0;
+        std::wstring first;
+        std::wstring groups = DescribeGroups(request->window, &first);
+        bool shown = first == LoadStr(IDS_PROP_PINNED);
         LogLine(L"display %s:%s%s", request->folder.c_str(), groups.c_str(),
                 shown ? L"" : L"  <- the pinned group is not shown");
         CoUninitialize();

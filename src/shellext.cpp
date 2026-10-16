@@ -132,6 +132,7 @@ struct Dialog {
     int attempts = 0;
     bool gaveUp = false;
     DWORD gaveUpTick = 0;
+    DWORD retryAt = 0;  // the grouping did not hold: try again once the view has calmed down
     // Date groups below the pinned group (dategroups.h).
     PROPERTYKEY dateKey = {};
     bool dated[2] = {};
@@ -496,10 +497,12 @@ void ProcessDialog(HWND dialog) {
     if (pinsChanged) {
         d.attempts = 0;
         d.gaveUp = false;
+        d.retryAt = 0;
     }
     bool pinsHeld = current >= 0 && ascending && KeyMatches(d, view.Get(), folder.Get(), current, names);
     if (pinsHeld && DatesMatch(d, view.Get(), folder.Get(), current, names)) {
         d.attempts = 0;
+        d.retryAt = 0;
         return;
     }
     // Only the date groups are out of date (items added or changed, a new day): regroup, but
@@ -510,8 +513,27 @@ void ProcessDialog(HWND dialog) {
         d.attempts = 0;
         d.grouped = false;
     }
-    // A grouping the user picked in this dialog is kept until the pins change.
-    if ((current < 0 && d.grouped && !pinsChanged) || d.gaveUp) return;
+    if (d.gaveUp) return;
+    if (current < 0 && d.grouped && !pinsChanged) {
+        // A grouping the user picked in this dialog is kept until the pins change. But the
+        // dialog itself can put the folder's saved grouping back (for example the date groups
+        // of Downloads): that is a grouping that did not hold.
+        PROPERTYKEY original;
+        BOOL originalAscending;
+        ReadPreviousGrouping(d.folderPath, &original, &originalAscending);
+        if (!IsEqualPropertyKey(groupKey, original)) return;
+        if (d.attempts == 0) d.attempts = 1;
+        LogLine(L"dialog: the folder's own grouping came back in %s", d.folderPath.c_str());
+    }
+    if (!datesOnly && d.attempts > 0 && !d.retryAt) {
+        // The grouping applied last did not hold (the view was reloaded): wait until it is quiet.
+        d.retryAt = now + 1500;
+        LogLine(L"dialog: grouping did not hold in %s (attempt %d); waiting", d.folderPath.c_str(), d.attempts);
+    }
+    if (d.retryAt && (int)(d.retryAt - now) > 0) {
+        Recheck(dialog, d.retryAt - now);
+        return;
+    }
     if (!datesOnly && d.attempts >= kMaxAttempts) {
         LogLine(L"dialog: grouping does not hold in %s; giving up for now", d.folderPath.c_str());
         if (IsPinKey(groupKey)) RestoreGrouping(d, view.Get());
@@ -533,6 +555,7 @@ void ProcessDialog(HWND dialog) {
         return;
     }
     d.lastRegroup = now;
+    d.retryAt = 0;
     if (!datesOnly) d.attempts++;
     d.grouped = true;
     bool dates = !IsEqualGUID(d.dateKey.fmtid, GUID_NULL);

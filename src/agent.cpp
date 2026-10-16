@@ -964,9 +964,19 @@ void Agent::ProcessWindow(TrackedWindow& w) {
         w.attempts = 0;
         w.dropped = false;
     }
-    // Respect a grouping the user picked in this view; take over again on a new view or a
-    // pin change.
-    if ((current < 0 && w.initialized && !w.enforce) || w.gaveUp) return;
+    if (w.gaveUp) return;
+    if (current < 0 && w.initialized && !w.enforce) {
+        // Respect a grouping the user picked in this view (take over again on a new view or a
+        // pin change). But Explorer itself can put the folder's own grouping back, for example
+        // the date groups of Downloads after it reloaded the folder: that is a grouping that did
+        // not hold.
+        PROPERTYKEY original;
+        BOOL originalAscending;
+        ReadPreviousGroupBy(w.folderPath, &original, &originalAscending);
+        if (!IsEqualPropertyKey(groupKey, original)) return;
+        if (w.attempts == 0) w.attempts = 1;
+        LogLine(L"the folder's own grouping came back in %s", w.folderPath.c_str());
+    }
 
     if (!datesOnly && w.attempts > 0 && !w.dropped) {
         // The grouping applied last did not hold: Explorer reloaded the view and dropped the
