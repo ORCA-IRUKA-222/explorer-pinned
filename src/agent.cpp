@@ -13,6 +13,7 @@
 
 #include "buttons.h"
 #include "comutil.h"
+#include "dategroups.h"
 #include "dialogs.h"
 #include "displaycheck.h"
 #include "pinstore.h"
@@ -28,10 +29,12 @@ namespace {
 // DShellFolderViewEvents
 constexpr DISPID kDispSelectionChanged = 200;
 constexpr DISPID kDispEnumDone = 201;  // DISPID_FILELISTENUMDONE (also after a refresh or a regroup)
+constexpr DISPID kDispContentsChanged = 207;  // items were added, removed or changed
 constexpr DISPID kDispFocusChanged = 208;
 
 constexpr UINT_PTR kTimerWork = 1;
 constexpr UINT_PTR kTimerPoll = 2;
+constexpr UINT_PTR kTimerRenames = 3;
 constexpr UINT kPollIntervalMs = 2000;
 
 // Explorer loads a view after a navigation and reloads it after every SetGroupBy; in a large
@@ -47,8 +50,13 @@ constexpr DWORD kFastQuietMs = 60;
 constexpr DWORD kIdleMs = 3000;
 constexpr DWORD kMaxLoadMs = 15000;  // a load whose end was not reported, or a view that keeps loading
 // Groupings applied to one view that did not hold before the agent stops trying and puts
-// the original grouping back (instead of reloading the view endlessly).
+// the original grouping back (instead of reloading the view endlessly), and when it tries again.
 constexpr int kMaxAttempts = 4;
+constexpr DWORD kRetryAfterGiveUpMs = 60000;
+// A pinned item that was renamed or moved keeps its pin when the old name is still gone after
+// this long (programs that save by renaming the original away and back keep the pin as it is).
+constexpr DWORD kRenameSettleMs = 1500;
+constexpr UINT kMsgShellChange = WM_APP + 4;
 
 constexpr UINT kCmdReapply = 1;
 constexpr UINT kCmdCleanup = 2;
@@ -58,6 +66,7 @@ constexpr UINT kCmdExit = 5;
 constexpr UINT kCmdDialogs = 6;
 constexpr UINT kCmdEnabled = 7;
 constexpr UINT kCmdButton = 8;
+constexpr UINT kCmdDateGroups = 9;
 constexpr UINT kCmdOpenBase = 1000;   // + index into the pin list
 constexpr UINT kCmdUnpinBase = 3000;  // + index into the pin list
 constexpr size_t kMaxMenuPins = 100;
@@ -223,8 +232,18 @@ struct TrackedWindow {
     int churn = 0;           // regroups in a row that came soon after the previous one
     int writeFailures = 0;   // tries in a row in which the view took no pinned value
     bool dropped = false;    // Explorer dropped the values of the grouping applied last
-    bool gaveUp = false;     // the grouping did not hold; left alone until the pins change
+    bool gaveUp = false;     // the grouping did not hold; left alone for a while
+    DWORD gaveUpTick = 0;
     bool displayLogged = false;  // what Explorer shows was written to the log
+
+    // Date groups below the pinned group (dategroups.h).
+    ComPtr<IShellFolder> localFolder;  // the folder in this process: reads the items' names and dates
+    PROPERTYKEY dateKey = {};   // the date the other items are grouped by (GUID_NULL: none)
+    bool dateKeyKnown = false;  // dateKey was worked out for this view
+    bool dated[2] = {};         // date group values were written on each key
+    DWORD datesDay = 0;         // the day they were written for
+    bool checkDates = false;    // items changed: see whether the date groups still match
+    bool sorted = false;        // sorted by that date (newest first) in this view
 };
 
 class Agent {
@@ -250,6 +269,8 @@ private:
     PITEMID_CHILD ParseChild(TrackedWindow& w, const std::wstring& name);
     size_t WriteKey(TrackedWindow& w, int keyIndex, const NameSet& names, HRESULT* failure);
     bool KeyMatches(TrackedWindow& w, int keyIndex, const NameSet& names);
+    DateGroupValues DateValues(TrackedWindow& w, const NameSet& names);
+    bool DatesMatch(TrackedWindow& w, int keyIndex, const NameSet& names);
     void RestoreGrouping(TrackedWindow& w, bool forget);
     void LeaveView(TrackedWindow& w);
     void RestoreAll();
@@ -259,6 +280,10 @@ private:
     void ArmSettingsWatch();
     void OnSettingsChanged();
     void UpdateButtons();
+
+    void WatchRenames();
+    void OnShellChange(WPARAM wp, LPARAM lp);
+    void FollowRenames();
 
     void AddTrayIcon();
     void RemoveTrayIcon();
@@ -289,6 +314,17 @@ private:
     HKEY settingsKey_ = nullptr;
     HANDLE settingsEvent_ = nullptr;
     ExplorerButtons buttons_;
+    bool dateGroups_ = true;
+
+    // Renamed or moved pinned items (followed through shell change notifications on the
+    // folders that contain pins).
+    struct Rename {
+        std::wstring from, to;
+        DWORD tick;
+    };
+    std::vector<Rename> renames_;
+    std::vector<ULONG> renameWatches_;
+    std::vector<std::wstring> watchedFolders_;
 };
 
 Agent* g_agent = nullptr;
@@ -359,12 +395,14 @@ int Agent::Run() {
     settingsEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     enabled_ = PinsEnabled();
     showButtons_ = ToggleButtonEnabled();
+    dateGroups_ = DateGroupsSettingOn();
     ArmSettingsWatch();
     {
         std::wstring trace;
         g_trace = RegReadString(HKEY_CURRENT_USER, kRegRoot, L"Trace", &trace) && trace == L"1";
     }
     buttons_.Start();
+    WatchRenames();
 
     AddTrayIcon();
     SetTimer(hwnd_, kTimerPoll, kPollIntervalMs, nullptr);
@@ -415,6 +453,7 @@ int Agent::Run() {
         }
     }
     buttons_.Stop();
+    for (ULONG id : renameWatches_) SHChangeNotifyDeregister(id);
     windows_.clear();
     shellWindowsEvents_.Reset();
     shellWindows_.Reset();
@@ -437,8 +476,14 @@ LRESULT Agent::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
                 for (auto& w : windows_) Schedule(w.get(), 0, false);
             } else if (wp == kTimerWork) {
                 KillTimer(hwnd_, kTimerWork);
+            } else if (wp == kTimerRenames) {
+                FollowRenames();
+                return 0;
             }
             DoWork();
+            return 0;
+        case kMsgShellChange:
+            OnShellChange(wp, lp);
             return 0;
         case kMsgReapply:
             pins_ = PinStore::LoadAll();
@@ -654,6 +699,11 @@ bool Agent::AcquireView(TrackedWindow& w, bool* newSession) {
     w.dropped = false;
     w.gaveUp = false;
     w.displayLogged = false;
+    w.localFolder.Reset();
+    w.dateKeyKnown = false;
+    w.dated[0] = w.dated[1] = false;
+    w.checkDates = false;
+    w.sorted = false;
     // A view found without seeing its navigation (e.g. when the agent starts) may still be
     // loading; give it a moment.
     if (!w.loading) w.lastLoad = GetTickCount();
@@ -671,6 +721,11 @@ bool Agent::AcquireView(TrackedWindow& w, bool* newSession) {
             CoTaskMemFree(pidl);
         }
     }
+    // The same folder in this process, to read the items' names and dates without a call into
+    // Explorer for each.
+    if (!w.folderIdList.empty())
+        SHBindToObject(nullptr, reinterpret_cast<PCIDLIST_ABSOLUTE>(w.folderIdList.data()), nullptr,
+                       IID_PPV_ARGS(w.localFolder.Put()));
     // For the on/off button; ProcessWindow checks that the pinned items exist.
     SHANDLE_PTR frame = 0;
     w.frame = SUCCEEDED(w.browser->get_HWND(&frame)) ? reinterpret_cast<HWND>(frame) : nullptr;
@@ -683,6 +738,7 @@ bool Agent::AcquireView(TrackedWindow& w, bool* newSession) {
         w.viewEvents.Connect(doc.Get(), DIID_DShellFolderViewEvents, [this, raw](DISPID id) {
             if (id == kDispSelectionChanged || id == kDispFocusChanged) return;
             if (g_trace) LogLine(L"trace: view event %ld in %s", (long)id, raw->folderPath.c_str());
+            if (id == kDispContentsChanged) raw->checkDates = true;
             if (id == kDispEnumDone) {
                 raw->loading = false;
                 raw->enumDone = true;
@@ -739,7 +795,36 @@ size_t Agent::WriteKey(TrackedWindow& w, int k, const NameSet& names, HRESULT* f
             CoTaskMemFree(child);
         }
     }
+    // The other items: their date group, or no value (any written before is cleared).
+    bool dates = !IsEqualGUID(w.dateKey.fmtid, GUID_NULL);
+    if (!w.applied[k].empty() && (dates || w.dated[k])) {
+        DateValues(w, names).Write(key);
+        w.dated[k] = dates;
+        SYSTEMTIME now;
+        GetLocalTime(&now);
+        w.datesDay = DayNumber(now);
+        w.checkDates = false;
+    }
     return w.applied[k].size();
+}
+
+DateGroupValues Agent::DateValues(TrackedWindow& w, const NameSet& names) {
+    return DateGroupValues{w.view.Get(), w.localFolder ? w.localFolder.Get() : w.folder.Get(), w.dateKey,
+                           [&names](const std::wstring& name) { return names.count(name) > 0; }};
+}
+
+// True when the date groups (or their absence) are as they should be on the active key.
+// Reading every item's value is only done after Explorer reported changed items.
+bool Agent::DatesMatch(TrackedWindow& w, int k, const NameSet& names) {
+    if (IsEqualGUID(w.dateKey.fmtid, GUID_NULL)) return !w.dated[k];
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    if (!w.dated[k] || w.datesDay != DayNumber(now)) return false;
+    if (!w.checkDates) return true;
+    w.checkDates = false;
+    // Out of date until they are written again (the regroup may have to wait a little).
+    if (!DateValues(w, names).Match(kPinStateKeys[k])) w.dated[k] = false;
+    return w.dated[k];
 }
 
 // True when the active key already shows exactly the pinned items. Values disappear
@@ -835,6 +920,17 @@ void Agent::ProcessWindow(TrackedWindow& w) {
         return;
     }
 
+    if (!w.dateKeyKnown) {
+        // A folder grouped by date (such as Downloads) keeps its date groups below the pins.
+        PROPERTYKEY original = groupKey;
+        if (IsPinKey(groupKey)) {
+            BOOL asc;
+            ReadPreviousGroupBy(w.folderPath, &original, &asc);
+        }
+        w.dateKey = dateGroups_ && IsGroupingByDate(original) ? original : PROPERTYKEY{GUID_NULL, 0};
+        w.dateKeyKnown = true;
+    }
+
     bool userChange = w.enforce;
     if (w.enforce) {
         // The pins changed (or "reapply"): start over, also in a view the agent gave up on.
@@ -844,7 +940,8 @@ void Agent::ProcessWindow(TrackedWindow& w) {
         w.dropped = false;
         w.gaveUp = false;
     }
-    if (current >= 0 && ascending && KeyMatches(w, current, names)) {
+    bool pinsHeld = current >= 0 && ascending && KeyMatches(w, current, names);
+    if (pinsHeld && DatesMatch(w, current, names)) {
         w.attempts = 0;
         w.dropped = false;
         w.initialized = true;
@@ -858,11 +955,20 @@ void Agent::ProcessWindow(TrackedWindow& w) {
         }
         return;
     }
+    // The pinned group is in place but the date groups are not: items were added or changed,
+    // or a day went by. Regroup, but this is not a grouping that failed to hold.
+    bool datesOnly = pinsHeld;
+    if (w.gaveUp && GetTickCount() - w.gaveUpTick >= kRetryAfterGiveUpMs) {
+        LogLine(L"trying %s again", w.folderPath.c_str());
+        w.gaveUp = false;
+        w.attempts = 0;
+        w.dropped = false;
+    }
     // Respect a grouping the user picked in this view; take over again on a new view or a
     // pin change.
     if ((current < 0 && w.initialized && !w.enforce) || w.gaveUp) return;
 
-    if (w.attempts > 0 && !w.dropped) {
+    if (!datesOnly && w.attempts > 0 && !w.dropped) {
         // The grouping applied last did not hold: Explorer reloaded the view and dropped the
         // values (or put the saved grouping back). Try again once the view has been idle.
         w.dropped = true;
@@ -871,13 +977,16 @@ void Agent::ProcessWindow(TrackedWindow& w) {
         Schedule(&w, kIdleMs, false);
         return;
     }
-    if (w.attempts >= kMaxAttempts) {
+    if (!datesOnly && w.attempts >= kMaxAttempts) {
         // Stop instead of reloading the view forever, and don't leave every item in the
-        // "Unspecified" group.
-        LogLine(L"grouping does not hold in %s after %d attempts; giving up", w.folderPath.c_str(), w.attempts);
+        // "Unspecified" group. Try again in a minute (the view may have calmed down).
+        LogLine(L"grouping does not hold in %s after %d attempts; giving up for now", w.folderPath.c_str(), w.attempts);
         if (IsPinKey(groupKey)) RestoreGrouping(w, /*forget=*/false);
         w.gaveUp = true;
+        w.gaveUpTick = GetTickCount();
+        w.initialized = false;
         w.enforce = false;
+        Schedule(&w, kRetryAfterGiveUpMs, false);
         return;
     }
     // A pinned item that keeps changing (e.g. a file that is being written) loses its value
@@ -915,20 +1024,30 @@ void Agent::ProcessWindow(TrackedWindow& w) {
     // Only regroups count (not the tries above, in which nothing changed).
     w.churn = w.lastRegroup && now - w.lastRegroup < gap + 10000 ? w.churn + 1 : 0;
     w.lastRegroup = now;
-    w.attempts++;
+    if (!datesOnly) w.attempts++;
     w.dropped = false;
     w.initialized = true;
     w.enforce = false;
     if (current < 0 && !w.folderIdList.empty())
         MarkGrouped(w.folderPath, reinterpret_cast<PCIDLIST_ABSOLUTE>(w.folderIdList.data()));
+    bool dates = !IsEqualGUID(w.dateKey.fmtid, GUID_NULL);
+    if (dates && !w.sorted) {
+        // Newest first within the date groups (once per view: the user may sort otherwise).
+        w.sorted = true;
+        SORTCOLUMN first = {};
+        if (FAILED(w.view->GetSortColumns(&first, 1)) || !IsEqualPropertyKey(first.propkey, w.dateKey)) {
+            SORTCOLUMN byDate = {w.dateKey, SORT_DESCENDING};
+            w.view->SetSortColumns(&byDate, 1);
+        }
+    }
     // Explorer reloads the view for the new grouping; check the result once that is done.
     w.loading = true;
     w.enumDone = false;
     w.loadStart = now;
     w.lastLoad = now;
     hr = w.view->SetGroupBy(kPinStateKeys[key], TRUE);
-    LogLine(L"%s %s (%zu of %zu pinned, attempt %d, 0x%08lX)", current < 0 ? L"group" : L"regroup", w.folderPath.c_str(),
-            written, names.size(), w.attempts, (unsigned long)hr);
+    LogLine(L"%s %s (%zu of %zu pinned%s, attempt %d, 0x%08lX)", current < 0 ? L"group" : L"regroup", w.folderPath.c_str(),
+            written, names.size(), dates ? L", date groups" : L"", w.attempts, (unsigned long)hr);
     Schedule(&w, kQuietMs, false);
 }
 
@@ -998,7 +1117,95 @@ void Agent::OnPinsChanged() {
     // Several "pin" processes may run at once (multiple selection); whichever wrote the
     // menu conditions last may have missed a pin, so rewrite them from the final list.
     UpdateContextMenu(pins_);
+    WatchRenames();
     ArmWorkTimer();
+}
+
+// Pinned items are stored by path; when one is renamed or moved (within a drive), the pin
+// moves with it. Shell change notifications report renames in the folders that contain pins,
+// whether made in Explorer or by another program.
+void Agent::WatchRenames() {
+    std::vector<std::wstring> folders;
+    for (const auto& p : pins_) {
+        std::wstring parent = ParentPath(p);
+        if (parent.empty() || !PathExists(parent)) continue;
+        if (std::none_of(folders.begin(), folders.end(), [&](const std::wstring& f) { return PathEqualsI(f, parent); }))
+            folders.push_back(parent);
+    }
+    std::sort(folders.begin(), folders.end(), LessI());
+    if (folders == watchedFolders_) return;
+    for (ULONG id : renameWatches_) SHChangeNotifyDeregister(id);
+    renameWatches_.clear();
+    watchedFolders_ = folders;
+    for (const auto& folder : folders) {
+        PIDLIST_ABSOLUTE pidl = nullptr;
+        if (FAILED(SHParseDisplayName(folder.c_str(), nullptr, &pidl, 0, nullptr))) continue;
+        SHChangeNotifyEntry entry = {pidl, FALSE};
+        ULONG id = SHChangeNotifyRegister(hwnd_, SHCNRF_ShellLevel | SHCNRF_InterruptLevel | SHCNRF_NewDelivery,
+                                          SHCNE_RENAMEITEM | SHCNE_RENAMEFOLDER, kMsgShellChange, 1, &entry);
+        if (id) renameWatches_.push_back(id);
+        CoTaskMemFree(pidl);
+    }
+}
+
+void Agent::OnShellChange(WPARAM wp, LPARAM lp) {
+    PIDLIST_ABSOLUTE* pidls = nullptr;
+    LONG event = 0;
+    HANDLE lock = SHChangeNotification_Lock(reinterpret_cast<HANDLE>(wp), (DWORD)lp, &pidls, &event);
+    if (!lock) return;
+    std::wstring from, to;
+    if ((event & (SHCNE_RENAMEITEM | SHCNE_RENAMEFOLDER)) && pidls && pidls[0] && pidls[1]) {
+        PWSTR a = nullptr, b = nullptr;
+        if (SUCCEEDED(SHGetNameFromIDList(pidls[0], SIGDN_FILESYSPATH, &a)) &&
+            SUCCEEDED(SHGetNameFromIDList(pidls[1], SIGDN_FILESYSPATH, &b))) {
+            from = NormalizePath(a);
+            to = NormalizePath(b);
+        }
+        CoTaskMemFree(a);
+        CoTaskMemFree(b);
+    }
+    SHChangeNotification_Unlock(lock);
+    if (from.empty() || to.empty() || PathEqualsI(from, to)) return;
+    // A pinned item, or a folder that contains pinned items.
+    std::wstring prefix = from + L"\\";
+    bool affected = std::any_of(pins_.begin(), pins_.end(), [&](const std::wstring& p) {
+        return PathEqualsI(p, from) ||
+               (p.size() > prefix.size() && CompareStringOrdinal(p.c_str(), (int)prefix.size(), prefix.c_str(),
+                                                                 (int)prefix.size(), TRUE) == CSTR_EQUAL);
+    });
+    if (!affected) return;
+    renames_.push_back({from, to, GetTickCount()});
+    SetTimer(hwnd_, kTimerRenames, kRenameSettleMs, nullptr);
+}
+
+void Agent::FollowRenames() {
+    KillTimer(hwnd_, kTimerRenames);
+    DWORD now = GetTickCount();
+    std::vector<Rename> later;
+    for (const auto& r : renames_) {
+        if (now - r.tick < kRenameSettleMs) {
+            later.push_back(r);
+            continue;
+        }
+        // Saved by renaming the original away and a new file back: the pin stays.
+        if (PathExists(r.from) || !PathExists(r.to)) continue;
+        std::wstring prefix = r.from + L"\\";
+        for (const auto& p : PinStore::LoadAll()) {
+            std::wstring moved;
+            if (PathEqualsI(p, r.from))
+                moved = r.to;
+            else if (p.size() > prefix.size() && CompareStringOrdinal(p.c_str(), (int)prefix.size(), prefix.c_str(),
+                                                                       (int)prefix.size(), TRUE) == CSTR_EQUAL)
+                moved = r.to + p.substr(r.from.size());
+            if (moved.empty()) continue;
+            PinStore::Add(moved);
+            PinStore::Remove(p);
+            LogLine(L"pin follows %s -> %s", p.c_str(), moved.c_str());
+        }
+    }
+    renames_ = later;
+    if (!renames_.empty()) SetTimer(hwnd_, kTimerRenames, kRenameSettleMs, nullptr);
+    // The pins key changed: OnPinsChanged updates the windows and the menus.
 }
 
 void Agent::ArmSettingsWatch() {
@@ -1011,6 +1218,16 @@ void Agent::OnSettingsChanged() {
     ArmSettingsWatch();
     bool enabled = PinsEnabled();
     showButtons_ = ToggleButtonEnabled();
+    bool dateGroups = DateGroupsSettingOn();
+    if (dateGroups != dateGroups_) {
+        dateGroups_ = dateGroups;
+        LogLine(dateGroups ? L"date groups turned on" : L"date groups turned off");
+        for (auto& w : windows_) {
+            w->dateKeyKnown = false;
+            Schedule(w.get(), 0, true);
+        }
+        if (enabled == enabled_) DoWork();
+    }
     if (enabled != enabled_) {
         enabled_ = enabled;
         LogLine(enabled ? L"the pinned group is turned on" : L"the pinned group is turned off");
@@ -1073,6 +1290,7 @@ void Agent::ShowTrayMenu() {
     }
     AppendMenuW(menu, MF_STRING | (enabled_ ? MF_CHECKED : 0), kCmdEnabled, LoadStr(IDS_TRAY_ENABLED).c_str());
     AppendMenuW(menu, MF_STRING | (showButtons_ ? MF_CHECKED : 0), kCmdButton, LoadStr(IDS_TRAY_BUTTON).c_str());
+    AppendMenuW(menu, MF_STRING | (dateGroups_ ? MF_CHECKED : 0), kCmdDateGroups, LoadStr(IDS_TRAY_DATEGROUPS).c_str());
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)pinsMenu, LoadStr(IDS_TRAY_PINNED_ITEMS).c_str());
     AppendMenuW(menu, MF_STRING, kCmdReapply, LoadStr(IDS_TRAY_REAPPLY).c_str());
@@ -1133,6 +1351,9 @@ void Agent::OnCommand(UINT id) {
             break;
         case kCmdButton:
             SetToggleButtonEnabled(!showButtons_);
+            break;
+        case kCmdDateGroups:
+            SetDateGroupsSetting(!dateGroups_);
             break;
         case kCmdDialogs:
             // Open dialogs follow within a second.

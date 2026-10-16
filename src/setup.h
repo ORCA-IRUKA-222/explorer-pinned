@@ -18,6 +18,8 @@ void SetStartupEnabled(bool enabled);
 // Property description that gives the "Pinned" group its label.
 // Registration writes to HKLM and therefore needs administrator rights.
 bool IsSchemaRegistered();
+// Registered, with the labels of this version (the date groups).
+bool IsSchemaCurrent();
 HRESULT RegisterSchema();    // also removes earlier registrations of this program
 HRESULT UnregisterSchema();
 std::wstring SchemaPath();   // %ProgramData%\ExplorerPinned\ExplorerPinnedGroup.propdesc

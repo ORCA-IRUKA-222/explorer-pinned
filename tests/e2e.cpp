@@ -174,6 +174,7 @@ std::wstring Join(const std::vector<std::wstring>& v) {
 struct Groups {
     std::vector<std::wstring> order;                         // group names, top to bottom
     std::map<std::wstring, std::set<std::wstring>> members;  // group -> item names
+    std::map<std::wstring, std::vector<std::wstring>> listed;  // group -> item names in reading order
     std::wstring Describe() const {
         std::wstring s;
         for (auto& g : order) {
@@ -208,6 +209,7 @@ DWORD WINAPI UiaThread(LPVOID) {
         int len = 0;
         if (arr) arr->get_Length(&len);
         std::map<std::wstring, int> top;
+        std::map<std::wstring, std::vector<std::pair<std::pair<int, int>, std::wstring>>> placed;
         for (int i = 0; i < len; i++) {
             IUIAutomationElement* el = nullptr;
             arr->GetElement(i, &el);
@@ -225,6 +227,7 @@ DWORD WINAPI UiaThread(LPVOID) {
             std::wstring g = groupName ? groupName : L"(none)";
             if (!top.count(g) || r.top < top[g]) top[g] = r.top;
             result.members[g].insert(name ? name : L"");
+            placed[g].push_back({{r.top, r.left}, name ? name : L""});
             SysFreeString(name);
             SysFreeString(groupName);
             if (parent) parent->Release();
@@ -234,6 +237,10 @@ DWORD WINAPI UiaThread(LPVOID) {
         for (auto& t : top) order.push_back({t.second, t.first});
         std::sort(order.begin(), order.end());
         for (auto& o : order) result.order.push_back(o.second);
+        for (auto& p : placed) {
+            std::sort(p.second.begin(), p.second.end());
+            for (auto& item : p.second) result.listed[p.first].push_back(item.second);
+        }
         if (arr) arr->Release();
         if (walker) walker->Release();
         cond->Release();
@@ -628,6 +635,25 @@ bool ClickToggleWithMouse(HWND owner) {
     return SendInput(2, in, sizeof(INPUT)) == 2;
 }
 
+// A file modified now.
+void TouchFileNow(const std::wstring& path) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w;
+    WriteFile(h, "test", 4, &w, nullptr);
+    CloseHandle(h);
+}
+
+bool IsTodayLabel(const std::wstring& name) { return name == L"今日" || name == L"Today"; }
+bool IsLongAgoLabel(const std::wstring& name) { return name == L"かなり前" || name == L"A long time ago"; }
+
+// The pinned group, then today's items (newest first), then the old ones.
+bool ShowsDateGroups(const Groups& g, const std::set<std::wstring>& pinned, const std::vector<std::wstring>& today,
+                     const std::set<std::wstring>& old) {
+    return g.order.size() == 3 && IsPinnedLabel(g.order[0]) && g.First() == pinned && IsTodayLabel(g.order[1]) &&
+           g.listed.at(g.order[1]) == today && IsLongAgoLabel(g.order[2]) && g.members.at(g.order[2]) == old;
+}
+
 bool IsPinnedInRegistry(const std::wstring& path) {
     HKEY k;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegPins, 0, KEY_QUERY_VALUE, &k) != ERROR_SUCCESS) return false;
@@ -761,20 +787,58 @@ DWORD WINAPI BusyThread(LPVOID) {
     }
 }
 
+// Groups the folder of the dialog by date modified when it is shown, as Windows does for the
+// Downloads folder (the dialog saves that for the folder when it closes).
+class GroupByDateEvents : public IFileDialogEvents {
+public:
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (riid == IID_IUnknown || riid == IID_IFileDialogEvents) {
+            *ppv = static_cast<IFileDialogEvents*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return 2; }
+    STDMETHODIMP_(ULONG) Release() override { return 1; }
+    STDMETHODIMP OnFileOk(IFileDialog*) override { return S_OK; }
+    STDMETHODIMP OnFolderChanging(IFileDialog*, IShellItem*) override { return S_OK; }
+    STDMETHODIMP OnFolderChange(IFileDialog* dialog) override {
+        IServiceProvider* sp = nullptr;
+        IFolderView2* view = nullptr;
+        if (SUCCEEDED(dialog->QueryInterface(IID_PPV_ARGS(&sp))) &&
+            SUCCEEDED(sp->QueryService(SID_SFolderView, IID_PPV_ARGS(&view)))) {
+            view->SetGroupBy(kDateModified, FALSE);
+            view->Release();
+        }
+        if (sp) sp->Release();
+        return S_OK;
+    }
+    STDMETHODIMP OnSelectionChange(IFileDialog*) override { return S_OK; }
+    STDMETHODIMP OnShareViolation(IFileDialog*, IShellItem*, FDE_SHAREVIOLATION_RESPONSE*) override { return S_OK; }
+    STDMETHODIMP OnTypeChange(IFileDialog*) override { return S_OK; }
+    STDMETHODIMP OnOverwrite(IFileDialog*, IShellItem*, FDE_OVERWRITE_RESPONSE*) override { return S_OK; }
+};
+
 // "ExplorerPinnedE2E host <folder>" shows an Open dialog on <folder> (the 32-bit build of
 // this program shows a dialog of a 32-bit program). "host-busy" shows it twice, one after the
-// other, in a busy program.
-int HostDialog(const std::wstring& folder, bool busy) {
+// other, in a busy program. "host-dates" groups the folder by date in the dialog.
+int HostDialog(const std::wstring& folder, bool busy, bool groupByDate = false) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (busy) CloseHandle(CreateThread(nullptr, 0, BusyThread, nullptr, 0, nullptr));
+    GroupByDateEvents events;
     for (int i = 0; i < (busy ? 2 : 1); i++) {
         IFileOpenDialog* dialog = nullptr;
         IShellItem* item = nullptr;
         CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
         SHCreateItemFromParsingName(folder.c_str(), nullptr, IID_PPV_ARGS(&item));
         if (dialog && item) {
+            DWORD cookie = 0;
+            if (groupByDate) dialog->Advise(&events, &cookie);
             dialog->SetFolder(item);
             dialog->Show(nullptr);
+            if (cookie) dialog->Unadvise(cookie);
         }
         if (item) item->Release();
         if (dialog) dialog->Release();
@@ -1165,6 +1229,46 @@ void FileDialogTests(const std::wstring& binDir) {
     }
     RegWriteString(HKEY_CURRENT_USER, kRegRoot, L"Enabled", L"1");
 
+    // A folder grouped by date in the dialog (like Downloads): date groups below the pinned
+    // group, newest first. A first dialog without the DLL groups the folder by date and saves it.
+    {
+        std::wstring dialogDates = g_dir + L"\\dialogdates";
+        pi = StartProcess(L"\"" + self + L"\" host-dates \"" + dialogDates + L"\"", /*dialogSupport=*/false);
+        dialog = pi.hProcess ? WaitFileDialogOf(pi.dwProcessId) : nullptr;
+        Groups last;
+        bool byDate = dialog && WaitFor(
+                                    [&] {
+                                        last = ReadGroups(dialog);
+                                        return std::any_of(last.order.begin(), last.order.end(), IsTodayLabel) ||
+                                               std::any_of(last.order.begin(), last.order.end(),
+                                                           [](const std::wstring& n) { return n.find(L"Today") != std::wstring::npos; });
+                                    },
+                                    8000);
+        Print(L"dialog grouped by date without the DLL: " + last.Describe());
+        if (dialog) CloseDialog(dialog, pi);
+        (void)byDate;
+        RunExe(L"pin \"" + dialogDates + L"\\pin.txt\"");
+        pi = StartProcess(L"\"" + self + L"\" host \"" + dialogDates + L"\"");
+        dialog = pi.hProcess ? WaitFileDialogOf(pi.dwProcessId) : nullptr;
+        bool ok = dialog && WaitFor(
+                                [&] {
+                                    last = ReadGroups(dialog);
+                                    return ShowsDateGroups(last, {L"pin"}, {L"z_second", L"a_first"}, {L"old"});
+                                },
+                                15000);
+        Check(ok, L"file dialog: date groups below the pinned group, newest first", last.Describe());
+        if (!ok) {
+            for (auto& g : last.listed) Print(L"  " + g.first + L": " + Join(g.second));
+        }
+        if (dialog) {
+            SetForegroundWindow(dialog);
+            Pump(500);
+            SaveScreenArea(dialog, L"dialog-date-groups");
+            CloseDialog(dialog, pi);
+        }
+        RunExe(L"unpin \"" + dialogDates + L"\\pin.txt\"");
+    }
+
     // A 32-bit program
     std::wstring host32 = binDir + L"\\x86\\ExplorerPinnedE2E.exe";
     pi = StartProcess(L"\"" + host32 + L"\" host \"" + folder + L"\"");
@@ -1229,6 +1333,7 @@ int wmain(int argc, wchar_t** argv) {
     SetConsoleOutputCP(CP_UTF8);
     if (argc >= 3 && wcscmp(argv[1], L"host") == 0) return HostDialog(argv[2], false);
     if (argc >= 3 && wcscmp(argv[1], L"host-busy") == 0) return HostDialog(argv[2], true);
+    if (argc >= 3 && wcscmp(argv[1], L"host-dates") == 0) return HostDialog(argv[2], false, true);
     if (argc < 2) {
         Print(L"usage: ExplorerPinnedE2E <ExplorerPinned.exe> [screenshot directory]");
         return 100;
@@ -1261,7 +1366,20 @@ int wmain(int argc, wchar_t** argv) {
     // The same for the small folders used later: Windows Server 2025 can show a folder that was
     // filled just before it is opened as empty for half a minute.
     const std::wstring speed = g_dir + L"\\speed", sw = g_dir + L"\\switch", old = g_dir + L"\\oldgroup";
-    for (const auto& d : {speed, sw, old}) CreateDirectoryW(d.c_str(), nullptr);
+    const std::wstring dated = g_dir + L"\\dated", renames = g_dir + L"\\renames", dialogDates = g_dir + L"\\dialogdates";
+    for (const auto& d : {speed, sw, old, dated, renames, dialogDates}) CreateDirectoryW(d.c_str(), nullptr);
+    // Date groups: two items of today (a_first is older than z_second), an old one and the pinned one.
+    for (const auto& d : {dated, dialogDates}) {
+        TouchFile(d + L"\\old.txt", 2019);
+        TouchFile(d + L"\\pin.txt", 2021);
+        TouchFileNow(d + L"\\a_first.txt");
+    }
+    Sleep(2100);  // file times on some file systems have a resolution of two seconds
+    for (const auto& d : {dated, dialogDates}) TouchFileNow(d + L"\\z_second.txt");
+    TouchFile(renames + L"\\r1.txt", 2020);
+    TouchFile(renames + L"\\keep.txt", 2021);
+    TouchFile(renames + L"\\other.txt", 2022);
+    CreateDirectoryW((renames + L"\\pf").c_str(), nullptr);
     for (const wchar_t* n : {L"\\s1.txt", L"\\s2.txt", L"\\s3.txt", L"\\s4.txt"}) TouchFile(speed + n, 2021);
     for (const wchar_t* n : {L"\\k1.txt", L"\\k2.txt", L"\\k3.txt"}) TouchFile(sw + n, 2022);
     TouchFile(old + L"\\g1.txt", 2020);
@@ -1576,6 +1694,97 @@ int wmain(int argc, wchar_t** argv) {
         SetWindowPos(w.hwnd, nullptr, wr.left, wr.top, wr.right - wr.left, wr.bottom - wr.top, SWP_NOZORDER | SWP_NOACTIVATE);
 
         RunExe(L"unpin \"" + sw + L"\\k2.txt\" \"" + sw + L"\\k3.txt\"");
+        w.Navigate(g_dir);
+    }
+
+    // --- a folder grouped by date (like Downloads) keeps date groups below the pinned group,
+    // newest first
+    {
+        w.Navigate(dated);
+        w.Refresh();
+        w.view->SetGroupBy(kDateModified, FALSE);
+        SORTCOLUMN byName = {kItemNameDisplay, SORT_ASCENDING};
+        w.view->SetSortColumns(&byName, 1);
+        Pump(1500);
+        RunExe(L"pin \"" + dated + L"\\pin.txt\"");
+        Groups last;
+        bool ok = WaitFor(
+            [&] {
+                last = ReadGroups(w.hwnd);
+                return ShowsDateGroups(last, {L"pin"}, {L"z_second", L"a_first"}, {L"old"});
+            },
+            15000);
+        Check(ok, L"date groups below the pinned group, newest first", last.Describe());
+        if (!ok) {
+            for (auto& g : last.listed) Print(L"  " + g.first + L": " + Join(g.second));
+        }
+        SORTCOLUMN sort = {};
+        w.Refresh();
+        w.view->GetSortColumns(&sort, 1);
+        Check(IsEqualPropertyKey(sort.propkey, kDateModified) && sort.direction == SORT_DESCENDING,
+              L"date groups: sorted by date modified, newest first");
+        if (!g_shots.empty()) {
+            SetForegroundWindow(w.hwnd);
+            Pump(800);
+            SaveScreenArea(w.hwnd, L"date-groups");
+        }
+        // A new file joins today's group.
+        TouchFileNow(dated + L"\\new.txt");
+        ok = WaitFor(
+            [&] {
+                last = ReadGroups(w.hwnd);
+                return last.order.size() == 3 && IsTodayLabel(last.order[1]) && last.members.at(last.order[1]).count(L"new");
+            },
+            15000);
+        Check(ok, L"date groups: a new file shows up in today's group", last.Describe());
+        // Turned off in the notification area menu: the other items are "Unspecified".
+        RegWriteString(HKEY_CURRENT_USER, kRegRoot, L"DateGroups", L"0");
+        ok = WaitFor(
+            [&] {
+                last = ReadGroups(w.hwnd);
+                return last.order.size() == 2 && IsPinnedLabel(last.order[0]) && !IsTodayLabel(last.order[1]) &&
+                       !IsLongAgoLabel(last.order[1]);
+            },
+            15000);
+        Check(ok, L"date groups can be turned off", last.Describe());
+        RegWriteString(HKEY_CURRENT_USER, kRegRoot, L"DateGroups", L"1");
+        ok = WaitFor(
+            [&] {
+                last = ReadGroups(w.hwnd);
+                return last.order.size() == 3 && IsTodayLabel(last.order[1]);
+            },
+            15000);
+        Check(ok, L"date groups come back when turned on", last.Describe());
+        RunExe(L"unpin \"" + dated + L"\\pin.txt\"");
+        Check(WaitFor([&] { return IsEqualPropertyKey(w.GroupBy(), kDateModified); }, 15000),
+              L"date groups: the folder's own date grouping comes back after unpinning");
+        w.Navigate(g_dir);
+    }
+
+    // --- a pin follows its item when it is renamed or moved
+    {
+        RunExe(L"pin \"" + renames + L"\\r1.txt\" \"" + renames + L"\\keep.txt\" \"" + renames + L"\\pf\"");
+        w.Navigate(renames);
+        ExpectPinned(w, {L"r1", L"keep", L"pf"}, L"renames: pinned group");
+        DWORD t = GetTickCount();
+        MoveFileW((renames + L"\\r1.txt").c_str(), (renames + L"\\r1-renamed.txt").c_str());
+        bool followed = WaitFor(
+            [&] { return IsPinnedInRegistry(renames + L"\\r1-renamed.txt") && !IsPinnedInRegistry(renames + L"\\r1.txt"); },
+            15000);
+        Timing(L"pin follows a rename", followed ? (long)(GetTickCount() - t) : -1);
+        Check(followed, L"renaming a pinned file keeps it pinned");
+        ExpectPinned(w, {L"r1-renamed", L"keep", L"pf"}, L"renames: the renamed file stays in the pinned group");
+        MoveFileW((renames + L"\\pf").c_str(), (renames + L"\\pf2").c_str());
+        Check(WaitFor([&] { return IsPinnedInRegistry(renames + L"\\pf2") && !IsPinnedInRegistry(renames + L"\\pf"); }, 15000),
+              L"renaming a pinned folder keeps it pinned");
+        // Saved by renaming the original away and writing a new file (as some editors do).
+        MoveFileW((renames + L"\\keep.txt").c_str(), (renames + L"\\keep.txt.bak").c_str());
+        TouchFile(renames + L"\\keep.txt", 2023);
+        DeleteFileW((renames + L"\\keep.txt.bak").c_str());
+        Pump(5000);
+        Check(IsPinnedInRegistry(renames + L"\\keep.txt") && !IsPinnedInRegistry(renames + L"\\keep.txt.bak"),
+              L"saving by renaming the original away keeps the pin on the file");
+        RunExe(L"unpin \"" + renames + L"\\r1-renamed.txt\" \"" + renames + L"\\keep.txt\" \"" + renames + L"\\pf2\"");
         w.Navigate(g_dir);
     }
 
