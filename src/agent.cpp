@@ -1009,6 +1009,23 @@ void Agent::ProcessWindow(TrackedWindow& w) {
         return;
     }
 
+    bool dates = !IsEqualGUID(w.dateKey.fmtid, GUID_NULL);
+    if (dates && !w.sorted) {
+        // Newest first within the date groups (once per view: the user may sort otherwise).
+        // Sorted first, and grouped once that is done: a grouping changed while Explorer is
+        // still sorting can leave the window showing the old groups.
+        w.sorted = true;
+        SORTCOLUMN first = {};
+        if (FAILED(w.view->GetSortColumns(&first, 1)) || !IsEqualPropertyKey(first.propkey, w.dateKey)) {
+            SORTCOLUMN byDate = {w.dateKey, SORT_DESCENDING};
+            w.view->SetSortColumns(&byDate, 1);
+            w.enumDone = false;
+            w.lastLoad = GetTickCount();
+            Schedule(&w, kQuietMs, false);
+            return;
+        }
+    }
+
     // Explorer only re-groups items when the group-by key changes: write the values to the
     // key that is not active and switch to it.
     int key = current < 0 ? 0 : 1 - current;
@@ -1040,16 +1057,6 @@ void Agent::ProcessWindow(TrackedWindow& w) {
     w.enforce = false;
     if (current < 0 && !w.folderIdList.empty())
         MarkGrouped(w.folderPath, reinterpret_cast<PCIDLIST_ABSOLUTE>(w.folderIdList.data()));
-    bool dates = !IsEqualGUID(w.dateKey.fmtid, GUID_NULL);
-    if (dates && !w.sorted) {
-        // Newest first within the date groups (once per view: the user may sort otherwise).
-        w.sorted = true;
-        SORTCOLUMN first = {};
-        if (FAILED(w.view->GetSortColumns(&first, 1)) || !IsEqualPropertyKey(first.propkey, w.dateKey)) {
-            SORTCOLUMN byDate = {w.dateKey, SORT_DESCENDING};
-            w.view->SetSortColumns(&byDate, 1);
-        }
-    }
     // Explorer reloads the view for the new grouping; check the result once that is done.
     w.loading = true;
     w.enumDone = false;

@@ -548,6 +548,21 @@ void ProcessDialog(HWND dialog) {
         return;
     }
 
+    bool dates = !IsEqualGUID(d.dateKey.fmtid, GUID_NULL);
+    if (dates && !d.sorted) {
+        // Newest first within the date groups (once per folder: the user may sort otherwise).
+        // Sorted first, and grouped once that is done: a grouping changed while the view is
+        // still sorting can leave it showing the old groups.
+        d.sorted = true;
+        SORTCOLUMN first = {};
+        if (FAILED(view->GetSortColumns(&first, 1)) || !IsEqualPropertyKey(first.propkey, d.dateKey)) {
+            SORTCOLUMN byDate = {d.dateKey, SORT_DESCENDING};
+            view->SetSortColumns(&byDate, 1);
+            Recheck(dialog, 400);
+            return;
+        }
+    }
+
     int key = current < 0 ? 0 : 1 - current;
     if (current < 0 && !IsPinKey(groupKey)) SavePreviousGrouping(d.folderPath, groupKey, ascending);
     if (!WriteKey(d, view.Get(), folder.Get(), key, names)) {  // the items are not in the view yet
@@ -558,16 +573,6 @@ void ProcessDialog(HWND dialog) {
     d.retryAt = 0;
     if (!datesOnly) d.attempts++;
     d.grouped = true;
-    bool dates = !IsEqualGUID(d.dateKey.fmtid, GUID_NULL);
-    if (dates && !d.sorted) {
-        // Newest first within the date groups (once per folder: the user may sort otherwise).
-        d.sorted = true;
-        SORTCOLUMN first = {};
-        if (FAILED(view->GetSortColumns(&first, 1)) || !IsEqualPropertyKey(first.propkey, d.dateKey)) {
-            SORTCOLUMN byDate = {d.dateKey, SORT_DESCENDING};
-            view->SetSortColumns(&byDate, 1);
-        }
-    }
     HRESULT hr = view->SetGroupBy(kPinStateKeys[key], TRUE);
     LogLine(L"dialog: group %s (%zu pinned%s, attempt %d, 0x%08lX)", d.folderPath.c_str(), names.size(),
             dates ? L", date groups" : L"", d.attempts, (unsigned long)hr);
