@@ -11,6 +11,7 @@ set(EP_SOURCES
     src/buttons.cpp
     src/comutil.cpp
     src/console.cpp
+    src/dategroups.cpp
     src/dialogs.cpp
     src/displaycheck.cpp
     src/main.cpp
@@ -31,7 +32,7 @@ endif()
 
 # Loaded into programs that show a file dialog (registered as an icon overlay handler) to
 # show the pinned group in Open/Save dialogs too.
-add_library(ExplorerPinnedShell SHARED src/shellext.cpp src/comutil.cpp src/dialogs.cpp src/pinstore.cpp src/toggle.cpp
+add_library(ExplorerPinnedShell SHARED src/shellext.cpp src/comutil.cpp src/dategroups.cpp src/dialogs.cpp src/pinstore.cpp src/toggle.cpp
     src/util.cpp src/shellext.def src/shellext.rc)
 if(CMAKE_SIZEOF_VOID_P EQUAL 4)
     # For 32-bit programs on 64-bit Windows; installed next to the 64-bit DLL.

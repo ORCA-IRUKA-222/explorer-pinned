@@ -6,8 +6,8 @@ namespace ep {
 
 // Right-click menu entries (per user, HKCU\Software\Classes).
 // The "Pin"/"Unpin" entries are shown only where they apply by keeping their
-// AppliesTo conditions in sync with the pin list.
-void UpdateContextMenu(const std::vector<std::wstring>& pins);
+// AppliesTo conditions in sync with the pin list (read from the registry).
+void UpdateContextMenu();
 void RemoveContextMenu();
 bool IsContextMenuRegistered();
 
@@ -18,6 +18,8 @@ void SetStartupEnabled(bool enabled);
 // Property description that gives the "Pinned" group its label.
 // Registration writes to HKLM and therefore needs administrator rights.
 bool IsSchemaRegistered();
+// Registered, with the labels of this version (the date groups).
+bool IsSchemaCurrent();
 HRESULT RegisterSchema();    // also removes earlier registrations of this program
 HRESULT UnregisterSchema();
 std::wstring SchemaPath();   // %ProgramData%\ExplorerPinned\ExplorerPinnedGroup.propdesc

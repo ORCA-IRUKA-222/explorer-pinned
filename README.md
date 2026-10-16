@@ -71,11 +71,39 @@ English summary is [below](#english).
 - ピン止めした項目があるフォルダーを開くと、エクスプローラーの「グループ化」が自動で「ピン止め」になり、
   ピン止めした項目が一番上の「ピン止め」グループにまとまります。
 - それ以外の項目は「未指定」グループに入ります（このグループ名は Windows が決めているため変更できません）。
+  ただし、ダウンロードのように**日付でグループ分けされているフォルダー**では、ピン止めグループの下も
+  「今日」「昨日」「今週の前半」「先週」…「かなり前」の日付グループのままで、新しい順に並びます（[詳しく](#日付グループ)）。
 - 項目が多いフォルダーやネットワーク上のフォルダーでは、エクスプローラーがフォルダーを読み込み終わってから
   ピン止めグループになるため、表示まで数秒かかることがあります。
 - 並べ替え（名前・更新日時・種類・サイズなど）は普段どおり自由に変えられます。どの並べ替えでもピン止めグループが一番上です。
 - 一時的に別のグループ化（例: 種類）を選ぶと、そのウィンドウではそのまま維持されます。フォルダーを開き直すと「ピン止め」グループに戻ります。
 - フォルダー内のピン止めをすべて外すと、元のグループ化（例: ダウンロードの「更新日時」グループ）に戻ります。
+
+### 日付グループ
+
+ダウンロードフォルダーのように、もともと更新日時（または作成日時・アクセス日時）でグループ分けされているフォルダーでは、
+ピン止めした項目の下を「未指定」の 1 グループにせず、エクスプローラーと同じ日付のグループに分けます。
+
+```text
+∨ ピン止め
+    企画書テンプレート
+∨ 今日
+    （今日の項目が新しい順に）
+∨ 昨日
+∨ 先週
+  …
+∨ かなり前
+```
+
+- 各グループの中は、その日付の新しい順に並べます（そのフォルダーを開いたときに 1 回。あとから並べ替えを変えることもできます）。
+- 新しくダウンロードしたファイルは数秒以内に「今日」に入ります。日付が変わると、グループも自動で変わります。
+- エクスプローラーとファイル選択画面（アップロード画面など）の両方で同じように表示されます。
+- 「未指定」の 1 グループにまとめたい場合は、通知領域のアイコン →「ピン止め以外を日付でグループ分け」のチェックを外します。
+
+### 名前の変更・移動
+
+ピン止めした項目の名前を変えたり、同じドライブ内の別のフォルダーへ移動したりしても、ピン止めはそのまま付いていきます
+（常駐中に行った変更が対象です）。ピン止めしたフォルダーの名前を変えた場合も同じです。
 
 ### オン/オフ ボタン
 
@@ -121,6 +149,7 @@ Web サイトにファイルをアップロードするときの画面でも、�
 | --- | --- |
 | ピン止めグループを表示する | ピン止めグループ表示のオン/オフ（ウィンドウのボタンと同じ。ピン止めは残ります） |
 | ウィンドウにオン/オフ ボタンを表示 | エクスプローラーとファイル選択画面のオン/オフ ボタンの表示/非表示 |
+| ピン止め以外を日付でグループ分け（ダウンロードなど） | 日付でグループ分けされているフォルダーで、ピン止め以外を「今日」「昨日」…に分けるかどうか |
 | ピン止め中の項目 | ピン止めの一覧。各項目から「エクスプローラーで表示」「ピン止めを外す」ができます |
 | 開いているウィンドウに再適用 | 表示がずれたときに、開いているすべてのウィンドウへ再適用します |
 | 存在しない項目のピン止めを整理 | 削除済みの項目のピン止めを一覧から消します |
@@ -143,10 +172,10 @@ Web サイトにファイルをアップロードするときの画面でも、�
 - **常駐プロセスが必要です。** 「ピン止め」グループは常駐中のプロセスがエクスプローラーに指示して表示しています。
   終了中はピン止めグループが表示されません。終了するときは、ピン止めグループにしていたフォルダーのグループ化を元に戻します
   （開いていないフォルダーは裏でいったん開いて戻すため、Windows 11 では最小化されたウィンドウが一瞬表示されます）。
-- **グループ化は 1 種類だけです。** ピン止めグループを表示している間は、ダウンロードフォルダー標準の
-  「今日」「昨日」といった日付のグループは表示されません（並べ替えは日付順にできます）。
-- **ピン止めはパスで記録します。** ピン止めした項目の名前を変えたり別のフォルダーへ移動したりすると、ピン止めは外れます。
-  削除した項目と同じ名前の項目が後から作られると、再びピン止めされた状態になります。
+- **ピン止め以外のグループは日付だけです。** ピン止めグループを表示している間、ピン止め以外の項目は日付のグループ
+  （日付でグループ分けされているフォルダーの場合）か「未指定」になります。種類やサイズなどでのグループ分けとは併用できません。
+- **ピン止めはパスで記録します。** 名前の変更と同じドライブ内の移動には付いていきますが、常駐していない間の変更や、
+  別のドライブへの移動ではピン止めが外れます。削除した項目と同じ名前の項目が後から作られると、再びピン止めされた状態になります。
 - 「PC」「ホーム」「ライブラリ」、検索結果などの仮想フォルダーでは使えません。
 - ピン止めしていない項目が入る「未指定」グループの名前は変更できません（Windows の仕様）。
 - 同じフォルダーを表示していても、隠しファイルとして非表示になっている項目はピン止めグループに出ません。
@@ -213,6 +242,12 @@ ExplorerPinned.exe [コマンド] [パス...]
   ファイル選択画面はウィンドウのイベント（`SetWinEventHook`）で見つけ、ピン止めの変更はレジストリの変更通知で受け取ります。
 - 表示の速さ: エクスプローラーがフォルダーを読み込み終えた通知（`DShellFolderViewEvents` の EnumDone）を受けたら、
   すぐにグループ化します。ピン止めの変更はレジストリの変更通知（`RegNotifyChangeKeyValue`）で受け取り、すぐに反映します。
+- 日付グループ: 日付でグループ分けされていたフォルダーでは、ピン止め以外の項目にも同じプロパティで日付の区分
+  （1 = 今日 … 8 = かなり前。ラベルはプロパティの説明に登録）を設定し、ピン止め（0）と一緒にグループ化します。
+  項目の名前と日付は、常駐プロセス側で同じフォルダーを開いて ID リストから読みます（エクスプローラーへの問い合わせを減らすため）。
+  エクスプローラーが項目の追加・変更を通知したとき（`DShellFolderViewEvents` の ContentsChanged）と日付が変わったときに確かめ直します。
+- 名前の変更・移動: ピン止めした項目があるフォルダーを `SHChangeNotifyRegister` で監視し、名前の変更通知を受けたら、
+  1.5 秒後に元の名前がなくなっていればピン止めを新しいパスに移します（元のファイルを一時的に別名にして保存するアプリでは移しません）。
 - オン/オフ: `HKCU\Software\ExplorerPinned` の `Enabled`（`0` でオフ）と `Button`（`0` でボタンを非表示）。
   エクスプローラーのボタンは常駐プロセスが、そのウィンドウを所有者にした小さなウィンドウとして表示します
   （所有されたウィンドウは入力をエクスプローラーと共有するため、何も待たない専用のスレッドで動かします）。
@@ -285,7 +320,10 @@ Pinned items are shown in a **"Pinned"** group at the top, whatever the sort ord
   "Show the pinned group" in the notification area menu and as `ExplorerPinned.exe off` / `on`. The button itself can be
   hidden with "Show the on/off button in windows".
 - A small background process (notification area icon) applies the "Pinned" grouping through public Shell COM APIs
-  (`IFolderView2::SetViewProperty` + `SetGroupBy`). Unpinned items appear in Explorer's built-in "Unspecified" group.
+  (`IFolderView2::SetViewProperty` + `SetGroupBy`). Unpinned items appear in Explorer's built-in "Unspecified" group,
+  except in folders grouped by date (such as Downloads): there they keep date groups ("Today", "Yesterday", ...,
+  "A long time ago") below the pinned group, newest first (can be turned off in the notification area menu).
+- Pins follow their items when they are renamed or moved within a drive (while the background process runs).
 - Install with `ExplorerPinned-Setup-<version>.exe` from [Releases](https://github.com/ORCA-IRUKA-222/explorer-pinned/releases)
   (administrator permission is needed once to register the "Pinned" label), or unzip the portable build and run `ExplorerPinned.exe`.
 - The UI is in Japanese or English: the language chosen in the installer, or the Windows display language for the portable build.
@@ -293,8 +331,8 @@ Pinned items are shown in a **"Pinned"** group at the top, whatever the sort ord
   dialogs only after it is restarted (Windows reads the list of icon overlay handlers once per program).
 - If the "Pinned" group does not show up, try "Re-apply to open windows" in the notification area menu. The agent writes
   a log to `%LOCALAPPDATA%\ExplorerPinned\agent.log` (at most about 1 MB; removed on uninstall), which helps when reporting an issue.
-- Limitations: the background process must be running; only one grouping can be active, so the default date groups
-  of Downloads are replaced while pins exist in that folder; pins are stored by path (renaming/moving an item unpins it);
+- Limitations: the background process must be running; besides the pinned group, only date groups are possible (no
+  grouping by type, size, ...); pins are stored by path (moving an item to another drive unpins it);
   `IFolderView2::SetViewProperty` is marked deprecated in the Windows SDK, so a future Windows update could break it.
 
 ### Code signing policy

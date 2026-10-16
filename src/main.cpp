@@ -8,6 +8,7 @@
 
 #include "agent.h"
 #include "console.h"
+#include "dategroups.h"
 #include "dialogs.h"
 #include "pinstore.h"
 #include "resource.h"
@@ -69,7 +70,7 @@ int ChangePins(const std::vector<std::wstring>& paths, const std::wstring& mode)
             PinStore::Remove(path);
         ConsoleWrite((pin ? L"pinned: " : L"unpinned: ") + path + L"\n");
     }
-    UpdateContextMenu(PinStore::LoadAll());
+    UpdateContextMenu();
     EnsureAgentRunning();
     return failures ? kError : kOk;
 }
@@ -107,6 +108,7 @@ int Status() {
     if (!dll32.empty()) s += L"  " + dll32 + L"\n";
     s += L"pinned group: " + std::wstring(PinsEnabled() ? L"on" : L"off") +
          (ToggleButtonEnabled() ? L"" : L" (no on/off button)") + L"\n";
+    s += L"date groups: " + std::wstring(DateGroupsSettingOn() ? L"on" : L"off") + L"\n";
     s += L"agent: " + std::wstring(FindAgentWindow() ? L"running" : L"not running") + L"\n";
     s += L"pins: " + std::to_wstring(PinStore::LoadAll().size()) + L"\n";
     ConsoleWrite(s);
@@ -152,13 +154,13 @@ int RegisterDialogsCommand() {
 
 // Registers the property schema, elevating when necessary.
 bool EnsureSchema() {
-    if (IsSchemaRegistered()) return true;
+    if (IsSchemaCurrent()) return true;
     if (IsElevated()) return SUCCEEDED(RegisterSchema());
     // The elevated process may run as another account; pass on this user's language.
     std::wstring lang = PRIMARYLANGID(UiLanguage()) == LANG_JAPANESE ? L"ja" : L"en";
     if (RunElevated(L"register-schema --lang " + lang) != 0) return false;
     PSRefreshPropertySchema();
-    return IsSchemaRegistered();
+    return IsSchemaCurrent();
 }
 
 // `language` is the value of --lang, if given: it becomes the user's language setting so that
@@ -167,7 +169,7 @@ int Setup(bool startup, bool startAgent, bool quiet, const std::wstring& languag
     if (!language.empty())
         RegWriteString(HKEY_CURRENT_USER, kRegRoot, L"Language", PRIMARYLANGID(UiLanguage()) == LANG_JAPANESE ? L"ja" : L"en");
     bool schemaOk = EnsureSchema();
-    UpdateContextMenu(PinStore::LoadAll());
+    UpdateContextMenu();
     if (startup) SetStartupEnabled(true);
     if (startAgent) EnsureAgentRunning();
     if (!quiet) ShowInfo(LoadStr(schemaOk ? IDS_MSG_SETUP_DONE : IDS_MSG_SCHEMA_FAILED),
@@ -200,7 +202,7 @@ int DefaultStart() {
         ShowInfo(LoadStr(IDS_MSG_ALREADY_RUNNING));
         return kOk;
     }
-    if (!IsSchemaRegistered() || !IsContextMenuRegistered()) {
+    if (!IsSchemaCurrent() || !IsContextMenuRegistered()) {
         if (MessageBoxW(nullptr, LoadStr(IDS_MSG_SETUP_PROMPT).c_str(), LoadStr(IDS_APP_NAME).c_str(),
                         MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
             return kOk;

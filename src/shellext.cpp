@@ -17,6 +17,7 @@
 #include <set>
 
 #include "comutil.h"
+#include "dategroups.h"
 #include "pinstore.h"
 #include "dialogs.h"
 #include "toggle.h"
@@ -38,6 +39,7 @@ constexpr DWORD kNewViewDelayMs = 600;
 constexpr UINT kRecheckMs = 80;
 constexpr UINT_PTR kTimerId = 0xE9A1;  // on the dialog window; swallowed by the message hook
 constexpr int kMaxAttempts = 4;
+constexpr DWORD kRetryAfterGiveUpMs = 60000;
 
 HMODULE g_module = nullptr;
 LONG g_objects = 0;
@@ -129,6 +131,14 @@ struct Dialog {
     DWORD lastRegroup = 0;
     int attempts = 0;
     bool gaveUp = false;
+    DWORD gaveUpTick = 0;
+    DWORD retryAt = 0;  // the grouping did not hold: try again once the view has calmed down
+    // Date groups below the pinned group (dategroups.h).
+    PROPERTYKEY dateKey = {};
+    bool dated[2] = {};
+    DWORD datesDay = 0;
+    bool checkDates = false;  // items changed: see whether the date groups still match
+    bool sorted = false;
 };
 
 thread_local std::map<HWND, Dialog>* t_dialogs = nullptr;
@@ -137,6 +147,10 @@ thread_local std::map<HWND, std::unique_ptr<EventConnection>>* t_viewEvents = nu
 
 // Looks at the dialog again after `ms` (a timer on the dialog's own thread).
 void Recheck(HWND dialog, UINT ms) { SetTimer(dialog, kTimerId, ms, nullptr); }
+
+DateGroupValues DateValues(Dialog& d, IFolderView2* view, IShellFolder* folder, const NameSet& names) {
+    return DateGroupValues{view, folder, d.dateKey, [&names](const std::wstring& name) { return names.count(name) > 0; }};
+}
 
 size_t WriteKey(Dialog& d, IFolderView2* view, IShellFolder* folder, int k, const NameSet& names) {
     PROPVARIANT empty;
@@ -157,7 +171,28 @@ size_t WriteKey(Dialog& d, IFolderView2* view, IShellFolder* folder, int k, cons
             CoTaskMemFree(child);
         }
     }
+    // The other items: their date group, or no value (any written before is cleared).
+    bool dates = !IsEqualGUID(d.dateKey.fmtid, GUID_NULL);
+    if (!d.applied[k].empty() && (dates || d.dated[k])) {
+        DateValues(d, view, folder, names).Write(kPinStateKeys[k]);
+        d.dated[k] = dates;
+        SYSTEMTIME now;
+        GetLocalTime(&now);
+        d.datesDay = DayNumber(now);
+        d.checkDates = false;
+    }
     return d.applied[k].size();
+}
+
+bool DatesMatch(Dialog& d, IFolderView2* view, IShellFolder* folder, int k, const NameSet& names) {
+    if (IsEqualGUID(d.dateKey.fmtid, GUID_NULL)) return !d.dated[k];
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    if (!d.dated[k] || d.datesDay != DayNumber(now)) return false;
+    if (!d.checkDates) return true;
+    d.checkDates = false;
+    if (!DateValues(d, view, folder, names).Match(kPinStateKeys[k])) d.dated[k] = false;
+    return d.dated[k];
 }
 
 bool KeyMatches(Dialog& d, IFolderView2* view, IShellFolder* folder, int k, const NameSet& names) {
@@ -385,10 +420,16 @@ void ProcessDialog(HWND dialog) {
         ComPtr<IDispatch> automation;
         if (sv && SUCCEEDED(sv->GetItemObject(SVGIO_BACKGROUND, IID_PPV_ARGS(automation.Put()))) && automation) {
             events->Connect(automation.Get(), DIID_DShellFolderViewEvents, [dialog](DISPID id) {
-                if (id != 201 || !t_dialogs) return;  // DISPID_FILELISTENUMDONE
+                if (!t_dialogs) return;
                 auto it = t_dialogs->find(dialog);
-                if (it != t_dialogs->end()) it->second.enumDone = true;
-                Recheck(dialog, 10);
+                if (it == t_dialogs->end()) return;
+                if (id == 201) {  // DISPID_FILELISTENUMDONE
+                    it->second.enumDone = true;
+                    Recheck(dialog, 10);
+                } else if (id == 207) {  // DISPID_CONTENTSCHANGED: items added, removed or changed
+                    it->second.checkDates = true;
+                    Recheck(dialog, 400);
+                }
             });
         }
         int count = 0;
@@ -441,28 +482,85 @@ void ProcessDialog(HWND dialog) {
         d.lastNames.clear();
         return;
     }
+    {
+        // A folder grouped by date (such as Downloads) keeps its date groups below the pins.
+        // (Worked out each time: the setting can change while the dialog is open.)
+        PROPERTYKEY original = groupKey;
+        if (IsPinKey(groupKey)) {
+            BOOL asc;
+            ReadPreviousGrouping(d.folderPath, &original, &asc);
+        }
+        d.dateKey = DateGroupsSettingOn() && IsGroupingByDate(original) ? original : PROPERTYKEY{GUID_NULL, 0};
+    }
     bool pinsChanged = names != d.lastNames;
     d.lastNames = names;
     if (pinsChanged) {
         d.attempts = 0;
         d.gaveUp = false;
+        d.retryAt = 0;
     }
-    if (current >= 0 && ascending && KeyMatches(d, view.Get(), folder.Get(), current, names)) {
+    bool pinsHeld = current >= 0 && ascending && KeyMatches(d, view.Get(), folder.Get(), current, names);
+    if (pinsHeld && DatesMatch(d, view.Get(), folder.Get(), current, names)) {
         d.attempts = 0;
+        d.retryAt = 0;
         return;
     }
-    // A grouping the user picked in this dialog is kept until the pins change.
-    if ((current < 0 && d.grouped && !pinsChanged) || d.gaveUp) return;
-    if (d.attempts >= kMaxAttempts) {
-        LogLine(L"dialog: grouping does not hold in %s; giving up", d.folderPath.c_str());
+    // Only the date groups are out of date (items added or changed, a new day): regroup, but
+    // this is not a grouping that failed to hold.
+    bool datesOnly = pinsHeld;
+    if (d.gaveUp && now - d.gaveUpTick >= kRetryAfterGiveUpMs) {
+        d.gaveUp = false;
+        d.attempts = 0;
+        d.grouped = false;
+    }
+    if (d.gaveUp) return;
+    if (current < 0 && d.grouped && !pinsChanged) {
+        // A grouping the user picked in this dialog is kept until the pins change. But the
+        // dialog itself can put the folder's saved grouping back (for example the date groups
+        // of Downloads): that is a grouping that did not hold.
+        PROPERTYKEY original;
+        BOOL originalAscending;
+        ReadPreviousGrouping(d.folderPath, &original, &originalAscending);
+        if (!IsEqualPropertyKey(groupKey, original)) return;
+        if (d.attempts == 0) d.attempts = 1;
+        LogLine(L"dialog: the folder's own grouping came back in %s", d.folderPath.c_str());
+    }
+    if (!datesOnly && d.attempts > 0 && !d.retryAt) {
+        // The grouping applied last did not hold (the view was reloaded): wait until it is quiet.
+        d.retryAt = now + 1500;
+        LogLine(L"dialog: grouping did not hold in %s (attempt %d); waiting", d.folderPath.c_str(), d.attempts);
+    }
+    if (d.retryAt && (int)(d.retryAt - now) > 0) {
+        Recheck(dialog, d.retryAt - now);
+        return;
+    }
+    if (!datesOnly && d.attempts >= kMaxAttempts) {
+        LogLine(L"dialog: grouping does not hold in %s; giving up for now", d.folderPath.c_str());
         if (IsPinKey(groupKey)) RestoreGrouping(d, view.Get());
         d.gaveUp = true;
+        d.gaveUpTick = now;
+        Recheck(dialog, kRetryAfterGiveUpMs);
         return;
     }
     // At most about one regroup a second, except for a change of the pins (a user action).
     if (!pinsChanged && now - d.lastRegroup < 1000) {
         Recheck(dialog, 1000 - (now - d.lastRegroup));
         return;
+    }
+
+    bool dates = !IsEqualGUID(d.dateKey.fmtid, GUID_NULL);
+    if (dates && !d.sorted) {
+        // Newest first within the date groups (once per folder: the user may sort otherwise).
+        // Sorted first, and grouped once that is done: a grouping changed while the view is
+        // still sorting can leave it showing the old groups.
+        d.sorted = true;
+        SORTCOLUMN first = {};
+        if (FAILED(view->GetSortColumns(&first, 1)) || !IsEqualPropertyKey(first.propkey, d.dateKey)) {
+            SORTCOLUMN byDate = {d.dateKey, SORT_DESCENDING};
+            view->SetSortColumns(&byDate, 1);
+            Recheck(dialog, 400);
+            return;
+        }
     }
 
     int key = current < 0 ? 0 : 1 - current;
@@ -472,11 +570,12 @@ void ProcessDialog(HWND dialog) {
         return;
     }
     d.lastRegroup = now;
-    d.attempts++;
+    d.retryAt = 0;
+    if (!datesOnly) d.attempts++;
     d.grouped = true;
     HRESULT hr = view->SetGroupBy(kPinStateKeys[key], TRUE);
-    LogLine(L"dialog: group %s (%zu pinned, attempt %d, 0x%08lX)", d.folderPath.c_str(), names.size(), d.attempts,
-            (unsigned long)hr);
+    LogLine(L"dialog: group %s (%zu pinned%s, attempt %d, 0x%08lX)", d.folderPath.c_str(), names.size(),
+            dates ? L", date groups" : L"", d.attempts, (unsigned long)hr);
 }
 
 // ---------------------------------------------------------------- dialog discovery
@@ -519,7 +618,9 @@ LRESULT CALLBACK CallWndProcHook(int code, WPARAM wp, LPARAM lp) {
 }
 
 // ---- worker thread: finds file dialogs of this process and tells them about changes
-std::set<DWORD>* g_hookedThreads = nullptr;
+// Hooked threads and when each started: Windows reuses the IDs of threads that ended (programs
+// such as browsers show each file dialog on a new thread).
+std::map<DWORD, ULONGLONG>* g_hookedThreads = nullptr;
 std::set<HWND>* g_knownDialogs = nullptr;
 bool g_settingOn = true;
 
@@ -529,16 +630,29 @@ bool IsFileDialog(HWND hwnd) {
            FindDefView(hwnd);
 }
 
+ULONGLONG ThreadStart(DWORD tid) {
+    ULONGLONG start = 0;
+    if (HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid)) {
+        FILETIME created, exited, kernel, user;
+        if (GetThreadTimes(h, &created, &exited, &kernel, &user))
+            start = (ULONGLONG)created.dwHighDateTime << 32 | created.dwLowDateTime;
+        CloseHandle(h);
+    }
+    return start;
+}
+
 void Visit(HWND dialog) {
     DWORD pid = 0;
     DWORD tid = GetWindowThreadProcessId(dialog, &pid);
     if (pid != GetCurrentProcessId() || !IsFileDialog(dialog)) return;
-    if (!g_hookedThreads->count(tid)) {
+    ULONGLONG start = ThreadStart(tid);
+    auto hooked = g_hookedThreads->find(tid);
+    if (hooked == g_hookedThreads->end() || hooked->second != start) {
         if (!g_settingOn) return;
         // A hook on the dialog's thread lets the work run there, where the view lives.
         if (!SetWindowsHookExW(WH_GETMESSAGE, GetMessageHook, g_module, tid)) return;
         SetWindowsHookExW(WH_CALLWNDPROC, CallWndProcHook, g_module, tid);
-        g_hookedThreads->insert(tid);
+        (*g_hookedThreads)[tid] = start;
     }
     g_knownDialogs->insert(dialog);
     PostMessageW(dialog, g_tickMessage, 0, 0);
@@ -584,7 +698,7 @@ void WatchKey(HKEY key, HANDLE event) {
 }
 
 DWORD WINAPI Worker(void*) {
-    g_hookedThreads = new std::set<DWORD>();
+    g_hookedThreads = new std::map<DWORD, ULONGLONG>();
     g_knownDialogs = new std::set<HWND>();
     g_settingOn = DialogsSettingOn();
     HKEY keys[2] = {};

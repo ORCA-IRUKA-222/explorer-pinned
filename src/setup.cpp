@@ -1,8 +1,11 @@
 #include "setup.h"
 
+#include <propvarutil.h>
 #include <shellapi.h>
 #include <shlobj.h>
 
+#include "dategroups.h"
+#include "pinstore.h"
 #include "resource.h"
 #include "util.h"
 
@@ -86,7 +89,12 @@ std::wstring SchemaXml(const wchar_t* formatId, const PROPERTYKEY (&keys)[2], co
             L"      <labelInfo label=\"" + label + L"\"/>\r\n"
             L"      <displayInfo displayType=\"Enumerated\" defaultColumnWidth=\"12\">\r\n"
             L"        <enumeratedList>\r\n"
-            L"          <enum name=\"Pinned\" value=\"" + std::to_wstring(kPinnedValue) + L"\" text=\"" + pinned + L"\"/>\r\n"
+            L"          <enum name=\"Pinned\" value=\"" + std::to_wstring(kPinnedValue) + L"\" text=\"" + pinned + L"\"/>\r\n";
+        // The date groups that follow the pinned group in folders grouped by date.
+        for (UINT g = 0; g < kDateGroupCount; g++)
+            xml += L"          <enum name=\"Date" + std::to_wstring(g) + L"\" value=\"" + std::to_wstring(kDateGroupFirst + g) +
+                   L"\" text=\"" + XmlEscape(LoadStr(IDS_GROUP_DATE_FIRST + g)) + L"\"/>\r\n";
+        xml +=
             L"        </enumeratedList>\r\n"
             L"      </displayInfo>\r\n"
             L"    </propertyDescription>\r\n";
@@ -108,8 +116,13 @@ bool WriteUtf16File(const std::wstring& path, const std::wstring& text) {
 
 }  // namespace
 
-void UpdateContextMenu(const std::vector<std::wstring>& pins) {
-    std::wstring cond = PathCondition(pins);
+// Several processes rewrite the conditions at once (one "pin" process per selected item, and
+// the agent). Each reads the pins while it holds the mutex, after its own change, so the last
+// one to write has seen every change.
+void UpdateContextMenu() {
+    HANDLE mutex = CreateMutexW(nullptr, FALSE, kMenuMutexName);
+    DWORD wait = mutex ? WaitForSingleObject(mutex, 5000) : WAIT_FAILED;
+    std::wstring cond = PathCondition(PinStore::LoadAll());
     for (const wchar_t* cls : kClasses) {
         UINT pinLabel = wcscmp(cls, L"Directory") == 0 ? IDS_MENU_PIN_FOLDER : IDS_MENU_PIN_FILE;
         WriteVerb(cls, kVerbPin, pinLabel, L"pin", cond.empty() ? std::wstring() : L"NOT (" + cond + L")");
@@ -118,6 +131,8 @@ void UpdateContextMenu(const std::vector<std::wstring>& pins) {
         else
             WriteVerb(cls, kVerbUnpin, IDS_MENU_UNPIN, L"unpin", cond);
     }
+    if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) ReleaseMutex(mutex);
+    if (mutex) CloseHandle(mutex);
 }
 
 void RemoveContextMenu() {
@@ -153,6 +168,22 @@ bool IsSchemaRegistered() {
         desc->Release();
     }
     return true;
+}
+
+// Registered by this version: the date group labels are there too (older versions had only
+// the "Pinned" label; Explorer would show the date groups as numbers).
+bool IsSchemaCurrent() {
+    if (!IsSchemaRegistered()) return false;
+    IPropertyDescription* desc = nullptr;
+    if (FAILED(PSGetPropertyDescription(kPinStateKeys[0], IID_PPV_ARGS(&desc)))) return false;
+    PROPVARIANT value;
+    InitPropVariantFromUInt32(kDateGroupFirst, &value);
+    PWSTR text = nullptr;
+    bool labeled = SUCCEEDED(desc->FormatForDisplay(value, PDFF_DEFAULT, &text)) && text &&
+                   wcscmp(text, std::to_wstring(kDateGroupFirst).c_str()) != 0;
+    CoTaskMemFree(text);
+    desc->Release();
+    return labeled;
 }
 
 std::wstring SchemaPath() { return SchemaDirectory() + L"\\" + kSchemaFileName; }

@@ -22,6 +22,18 @@
 #define IDS_TRAY_DIALOGS 129
 #define IDS_TRAY_ENABLED 137
 #define IDS_TRAY_BUTTON 138
+#define IDS_TRAY_DATEGROUPS 139
+
+// Labels of the date groups below the pinned group (values kDateGroupFirst...)
+#define IDS_GROUP_DATE_FIRST 140
+#define IDS_GROUP_TODAY 140
+#define IDS_GROUP_YESTERDAY 141
+#define IDS_GROUP_THIS_WEEK 142
+#define IDS_GROUP_LAST_WEEK 143
+#define IDS_GROUP_THIS_MONTH 144
+#define IDS_GROUP_LAST_MONTH 145
+#define IDS_GROUP_THIS_YEAR 146
+#define IDS_GROUP_LONG_AGO 147
 
 #define IDS_MSG_SETUP_PROMPT 130
 #define IDS_MSG_SCHEMA_FAILED 131
