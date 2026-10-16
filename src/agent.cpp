@@ -1131,9 +1131,8 @@ void Agent::OnPinsChanged() {
     }
     // The views first (what the user is looking at), then the menus.
     if (changed) DoWork();
-    // Several "pin" processes may run at once (multiple selection); whichever wrote the
-    // menu conditions last may have missed a pin, so rewrite them from the final list.
-    UpdateContextMenu(pins_);
+    // Pins changed here (renames followed) or by any other means get the right menus too.
+    UpdateContextMenu();
     WatchRenames();
     ArmWorkTimer();
 }
@@ -1334,7 +1333,7 @@ void Agent::OnCommand(UINT id) {
         size_t i = id - kCmdUnpinBase;
         if (i < menuPins_.size()) {
             PinStore::Remove(menuPins_[i]);
-            UpdateContextMenu(PinStore::LoadAll());
+            UpdateContextMenu();
         }
         return;
     }
@@ -1355,7 +1354,7 @@ void Agent::OnCommand(UINT id) {
             break;
         case kCmdCleanup: {
             int removed = PinStore::RemoveMissing();
-            UpdateContextMenu(PinStore::LoadAll());
+            UpdateContextMenu();
             MessageBoxW(hwnd_, FormatStr(IDS_MSG_CLEANUP_DONE, std::to_wstring(removed)).c_str(),
                         LoadStr(IDS_APP_NAME).c_str(), MB_OK | MB_ICONINFORMATION);
             break;

@@ -70,7 +70,7 @@ int ChangePins(const std::vector<std::wstring>& paths, const std::wstring& mode)
             PinStore::Remove(path);
         ConsoleWrite((pin ? L"pinned: " : L"unpinned: ") + path + L"\n");
     }
-    UpdateContextMenu(PinStore::LoadAll());
+    UpdateContextMenu();
     EnsureAgentRunning();
     return failures ? kError : kOk;
 }
@@ -169,7 +169,7 @@ int Setup(bool startup, bool startAgent, bool quiet, const std::wstring& languag
     if (!language.empty())
         RegWriteString(HKEY_CURRENT_USER, kRegRoot, L"Language", PRIMARYLANGID(UiLanguage()) == LANG_JAPANESE ? L"ja" : L"en");
     bool schemaOk = EnsureSchema();
-    UpdateContextMenu(PinStore::LoadAll());
+    UpdateContextMenu();
     if (startup) SetStartupEnabled(true);
     if (startAgent) EnsureAgentRunning();
     if (!quiet) ShowInfo(LoadStr(schemaOk ? IDS_MSG_SETUP_DONE : IDS_MSG_SCHEMA_FAILED),

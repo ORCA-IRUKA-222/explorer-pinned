@@ -6,8 +6,8 @@ namespace ep {
 
 // Right-click menu entries (per user, HKCU\Software\Classes).
 // The "Pin"/"Unpin" entries are shown only where they apply by keeping their
-// AppliesTo conditions in sync with the pin list.
-void UpdateContextMenu(const std::vector<std::wstring>& pins);
+// AppliesTo conditions in sync with the pin list (read from the registry).
+void UpdateContextMenu();
 void RemoveContextMenu();
 bool IsContextMenuRegistered();
 

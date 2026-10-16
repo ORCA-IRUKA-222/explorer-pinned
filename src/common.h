@@ -67,6 +67,8 @@ inline constexpr wchar_t kRegRun[] = L"Software\\Microsoft\\Windows\\CurrentVers
 inline constexpr wchar_t kRunValueName[] = L"ExplorerPinned";
 
 inline constexpr wchar_t kAgentMutexName[] = L"Local\\ExplorerPinned.Agent";
+// Held while the menu conditions are rewritten from the pin list.
+inline constexpr wchar_t kMenuMutexName[] = L"Local\\ExplorerPinned.Menu";
 inline constexpr wchar_t kAgentWindowClass[] = L"ExplorerPinned.AgentWindow";
 
 inline constexpr wchar_t kProjectUrl[] = L"https://github.com/ORCA-IRUKA-222/explorer-pinned";

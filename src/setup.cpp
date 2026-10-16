@@ -5,6 +5,7 @@
 #include <shlobj.h>
 
 #include "dategroups.h"
+#include "pinstore.h"
 #include "resource.h"
 #include "util.h"
 
@@ -115,8 +116,13 @@ bool WriteUtf16File(const std::wstring& path, const std::wstring& text) {
 
 }  // namespace
 
-void UpdateContextMenu(const std::vector<std::wstring>& pins) {
-    std::wstring cond = PathCondition(pins);
+// Several processes rewrite the conditions at once (one "pin" process per selected item, and
+// the agent). Each reads the pins while it holds the mutex, after its own change, so the last
+// one to write has seen every change.
+void UpdateContextMenu() {
+    HANDLE mutex = CreateMutexW(nullptr, FALSE, kMenuMutexName);
+    DWORD wait = mutex ? WaitForSingleObject(mutex, 5000) : WAIT_FAILED;
+    std::wstring cond = PathCondition(PinStore::LoadAll());
     for (const wchar_t* cls : kClasses) {
         UINT pinLabel = wcscmp(cls, L"Directory") == 0 ? IDS_MENU_PIN_FOLDER : IDS_MENU_PIN_FILE;
         WriteVerb(cls, kVerbPin, pinLabel, L"pin", cond.empty() ? std::wstring() : L"NOT (" + cond + L")");
@@ -125,6 +131,8 @@ void UpdateContextMenu(const std::vector<std::wstring>& pins) {
         else
             WriteVerb(cls, kVerbUnpin, IDS_MENU_UNPIN, L"unpin", cond);
     }
+    if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) ReleaseMutex(mutex);
+    if (mutex) CloseHandle(mutex);
 }
 
 void RemoveContextMenu() {
