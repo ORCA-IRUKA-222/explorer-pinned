@@ -37,6 +37,17 @@ const PROPERTYKEY kItemNameDisplay = {{0xB725F130, 0x47EF, 0x101A, {0xA5, 0xF1, 
 const PROPERTYKEY kItemTypeText = {{0xB725F130, 0x47EF, 0x101A, {0xA5, 0xF1, 0x02, 0x60, 0x8C, 0x9E, 0xEB, 0xAC}}, 4};
 const PROPERTYKEY kDateModified = {{0xB725F130, 0x47EF, 0x101A, {0xA5, 0xF1, 0x02, 0x60, 0x8C, 0x9E, 0xEB, 0xAC}}, 14};
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4996)  // SetViewProperty: see src/agent.cpp
+#endif
+HRESULT SetViewValue(IFolderView2* view, PCUITEMID_CHILD child, const PROPERTYKEY& key, const PROPVARIANT& value) {
+    return view->SetViewProperty(child, key, value);
+}
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+
 int g_failures = 0;
 std::wstring g_exe;
 std::wstring g_dir;
@@ -1367,7 +1378,8 @@ int wmain(int argc, wchar_t** argv) {
     // filled just before it is opened as empty for half a minute.
     const std::wstring speed = g_dir + L"\\speed", sw = g_dir + L"\\switch", old = g_dir + L"\\oldgroup";
     const std::wstring dated = g_dir + L"\\dated", renames = g_dir + L"\\renames", dialogDates = g_dir + L"\\dialogdates";
-    for (const auto& d : {speed, sw, old, dated, renames, dialogDates}) CreateDirectoryW(d.c_str(), nullptr);
+    const std::wstring shownDir = g_dir + L"\\shown";
+    for (const auto& d : {speed, sw, old, dated, renames, dialogDates, shownDir}) CreateDirectoryW(d.c_str(), nullptr);
     // Date groups: two items of today (a_first is older than z_second), an old one and the pinned one.
     for (const auto& d : {dated, dialogDates}) {
         TouchFile(d + L"\\old.txt", 2019);
@@ -1382,6 +1394,7 @@ int wmain(int argc, wchar_t** argv) {
     CreateDirectoryW((renames + L"\\pf").c_str(), nullptr);
     for (const wchar_t* n : {L"\\s1.txt", L"\\s2.txt", L"\\s3.txt", L"\\s4.txt"}) TouchFile(speed + n, 2021);
     for (const wchar_t* n : {L"\\k1.txt", L"\\k2.txt", L"\\k3.txt"}) TouchFile(sw + n, 2022);
+    for (const wchar_t* n : {L"\\u1.txt", L"\\u2.txt", L"\\u3.txt"}) TouchFile(shownDir + n, 2022);
     TouchFile(old + L"\\g1.txt", 2020);
     TouchFile(old + L"\\g2.txt", 2021);
 
@@ -1781,6 +1794,50 @@ int wmain(int argc, wchar_t** argv) {
         RunExe(L"unpin \"" + dated + L"\\pin.txt\"");
         Check(WaitFor([&] { return IsEqualPropertyKey(w.GroupBy(), kDateModified); }, 15000),
               L"date groups: the folder's own date grouping comes back after unpinning");
+        w.Navigate(g_dir);
+    }
+
+    // --- Explorer shows every item as "Unspecified" while the view reports the pinned grouping
+    // and the values (seen in a user's Downloads folder): the agent sees what is shown and
+    // groups the folder again.
+    {
+        RunExe(L"pin \"" + shownDir + L"\\u1.txt\"");
+        w.Navigate(shownDir);
+        if (ExpectPinned(w, {L"u1"}, L"display check: pinned group")) {
+            // Grouped by the other key while no item has a value on it, then the pinned item
+            // gets its value: Explorer does not move items when only a value changes.
+            w.Refresh();
+            PROPERTYKEY key = {};
+            BOOL ascending = TRUE;
+            w.view->GetGroupBy(&key, &ascending);
+            const PROPERTYKEY& other = IsEqualPropertyKey(key, kPinStateKeys[0]) ? kPinStateKeys[1] : kPinStateKeys[0];
+            PROPVARIANT empty, pinned;
+            PropVariantInit(&empty);
+            InitPropVariantFromUInt32(0, &pinned);
+            int count = 0;
+            w.view->ItemCount(SVGIO_ALLVIEW, &count);
+            for (int i = 0; i < count; i++) {
+                PITEMID_CHILD child = nullptr;
+                if (SUCCEEDED(w.view->Item(i, &child)) && child) {
+                    SetViewValue(w.view, child, other, empty);
+                    CoTaskMemFree(child);
+                }
+            }
+            w.view->SetGroupBy(other, TRUE);
+            IShellFolder* folder = nullptr;
+            PIDLIST_RELATIVE child = nullptr;
+            wchar_t name[] = L"u1.txt";
+            if (SUCCEEDED(w.view->GetFolder(IID_PPV_ARGS(&folder))) &&
+                SUCCEEDED(folder->ParseDisplayName(nullptr, nullptr, name, nullptr, &child, nullptr))) {
+                SetViewValue(w.view, static_cast<PCUITEMID_CHILD>(child), other, pinned);
+                CoTaskMemFree(child);
+            }
+            if (folder) folder->Release();
+            Pump(1000);
+            Print(L"INFO display with the value set after the grouping: " + ReadGroups(w.hwnd).Describe());
+            ExpectPinned(w, {L"u1"}, L"the pinned group is shown again when Explorer shows only \"Unspecified\"");
+        }
+        RunExe(L"unpin \"" + shownDir + L"\\u1.txt\"");
         w.Navigate(g_dir);
     }
 
