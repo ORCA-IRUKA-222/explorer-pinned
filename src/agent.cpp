@@ -31,6 +31,7 @@ constexpr DISPID kDispSelectionChanged = 200;
 constexpr DISPID kDispEnumDone = 201;  // DISPID_FILELISTENUMDONE (also after a refresh or a regroup)
 constexpr DISPID kDispContentsChanged = 207;  // items were added, removed or changed
 constexpr DISPID kDispFocusChanged = 208;
+constexpr DISPID kDispSortDone = 214;
 
 constexpr UINT_PTR kTimerWork = 1;
 constexpr UINT_PTR kTimerPoll = 2;
@@ -49,6 +50,7 @@ constexpr DWORD kQuietMs = 400;
 constexpr DWORD kFastQuietMs = 60;
 constexpr DWORD kIdleMs = 3000;
 constexpr DWORD kMaxLoadMs = 15000;  // a load whose end was not reported, or a view that keeps loading
+constexpr DWORD kMaxSortMs = 3000;   // a sort whose end was not reported
 // Groupings applied to one view that did not hold before the agent stops trying and puts
 // the original grouping back (instead of reloading the view endlessly), and when it tries again.
 constexpr int kMaxAttempts = 4;
@@ -57,6 +59,14 @@ constexpr DWORD kRetryAfterGiveUpMs = 60000;
 // this long (programs that save by renaming the original away and back keep the pin as it is).
 constexpr DWORD kRenameSettleMs = 1500;
 constexpr UINT kMsgShellChange = WM_APP + 4;
+constexpr UINT kMsgDisplayChecked = WM_APP + 5;  // displaycheck.h
+// Explorer can go on showing the old groups, or every item as "Unspecified", while the view
+// reports the pinned grouping and the values. What it shows is read some time after each
+// grouping; when two reads in a row miss the pinned group, the folder is grouped again (at
+// most this many times per view).
+constexpr DWORD kDisplayCheckMs = 1500;
+constexpr DWORD kDisplayRecheckMs = 2000;
+constexpr int kMaxDisplayFixes = 2;
 
 constexpr UINT kCmdReapply = 1;
 constexpr UINT kCmdCleanup = 2;
@@ -234,7 +244,13 @@ struct TrackedWindow {
     bool dropped = false;    // Explorer dropped the values of the grouping applied last
     bool gaveUp = false;     // the grouping did not hold; left alone for a while
     DWORD gaveUpTick = 0;
-    bool displayLogged = false;  // what Explorer shows was written to the log
+    // What Explorer shows (see kMsgDisplayChecked).
+    bool displayChecked = false;  // the grouping in place was checked, or is being checked
+    WPARAM displayCookie = 0;     // the check in progress (0: none)
+    DWORD displayLoad = 0;        // lastLoad when it started: a load since then voids it
+    bool displaySuspect = false;  // the last check did not find the pinned group
+    bool displayWrong = false;    // nor did the one before: group again
+    int displayFixes = 0;         // groupings applied again for that in this view
 
     // Date groups below the pinned group (dategroups.h).
     ComPtr<IShellFolder> localFolder;  // the folder in this process: reads the items' names and dates
@@ -244,6 +260,7 @@ struct TrackedWindow {
     DWORD datesDay = 0;         // the day they were written for
     bool checkDates = false;    // items changed: see whether the date groups still match
     bool sorted = false;        // sorted by that date (newest first) in this view
+    bool sorting = false;       // that sort is not done yet
 };
 
 class Agent {
@@ -264,6 +281,8 @@ private:
     TrackedWindow* FindTracked(IUnknown* identity);
 
     void ProcessWindow(TrackedWindow& w);
+    void CheckDisplay(TrackedWindow& w, DWORD delayMs);
+    void OnDisplayChecked(WPARAM cookie, Display state);
     bool AcquireView(TrackedWindow& w, bool* newSession);
     bool Settling(TrackedWindow& w, DWORD* waitMs);
     PITEMID_CHILD ParseChild(TrackedWindow& w, const std::wstring& name);
@@ -302,6 +321,7 @@ private:
     EventConnection shellWindowsEvents_;
     std::vector<std::unique_ptr<TrackedWindow>> windows_;
     bool rescanPending_ = true;
+    WPARAM lastDisplayCookie_ = 0;
 
     std::vector<std::wstring> pins_;
     std::vector<std::wstring> menuPins_;
@@ -484,6 +504,9 @@ LRESULT Agent::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case kMsgShellChange:
             OnShellChange(wp, lp);
+            return 0;
+        case kMsgDisplayChecked:
+            OnDisplayChecked(wp, (Display)lp);
             return 0;
         case kMsgReapply:
             pins_ = PinStore::LoadAll();
@@ -698,12 +721,17 @@ bool Agent::AcquireView(TrackedWindow& w, bool* newSession) {
     w.writeFailures = 0;
     w.dropped = false;
     w.gaveUp = false;
-    w.displayLogged = false;
+    w.displayChecked = false;
+    w.displayCookie = 0;
+    w.displaySuspect = false;
+    w.displayWrong = false;
+    w.displayFixes = 0;
     w.localFolder.Reset();
     w.dateKeyKnown = false;
     w.dated[0] = w.dated[1] = false;
     w.checkDates = false;
     w.sorted = false;
+    w.sorting = false;
     // A view found without seeing its navigation (e.g. when the agent starts) may still be
     // loading; give it a moment.
     if (!w.loading) w.lastLoad = GetTickCount();
@@ -739,7 +767,15 @@ bool Agent::AcquireView(TrackedWindow& w, bool* newSession) {
             if (id == kDispSelectionChanged || id == kDispFocusChanged) return;
             if (g_trace) LogLine(L"trace: view event %ld in %s", (long)id, raw->folderPath.c_str());
             if (id == kDispContentsChanged) raw->checkDates = true;
+            if (id == kDispSortDone && raw->sorting) {
+                raw->sorting = false;
+                raw->loading = false;
+                raw->lastLoad = GetTickCount();
+            }
             if (id == kDispEnumDone) {
+                // A new listing (a refresh, or Explorer reloading the folder): look at what it
+                // shows once the grouping is in place again.
+                raw->displayChecked = false;
                 raw->loading = false;
                 raw->enumDone = true;
                 raw->lastLoad = GetTickCount();
@@ -855,14 +891,16 @@ bool Agent::Settling(TrackedWindow& w, DWORD* waitMs) {
     DWORD now = GetTickCount();
     DWORD quiet = w.dropped ? kIdleMs : w.enumDone ? kFastQuietMs : kQuietMs;
     DWORD since = now - w.lastLoad;
-    if ((!w.loading || now - w.loadStart >= kMaxLoadMs) && since >= quiet) {
+    if ((!w.loading || now - w.loadStart >= (w.sorting ? kMaxSortMs : kMaxLoadMs)) && since >= quiet) {
         w.loading = false;
+        w.sorting = false;
         w.waitSince = 0;
         return false;
     }
     if (!w.waitSince) w.waitSince = now;
     if (now - w.waitSince >= kMaxLoadMs) {
         w.loading = false;
+        w.sorting = false;
         w.waitSince = 0;
         return false;
     }
@@ -934,29 +972,34 @@ void Agent::ProcessWindow(TrackedWindow& w) {
     bool userChange = w.enforce;
     if (w.enforce) {
         // The pins changed (or "reapply"): start over, also in a view the agent gave up on.
-        w.displayLogged = false;
+        w.displayChecked = false;
+        w.displayFixes = 0;
         w.attempts = 0;
         w.churn = 0;
         w.dropped = false;
         w.gaveUp = false;
     }
+    // Explorer does not show the grouping the view reports: apply it again.
+    bool redisplay = w.displayWrong && current >= 0;
+    w.displayWrong = false;
     bool pinsHeld = current >= 0 && ascending && KeyMatches(w, current, names);
-    if (pinsHeld && DatesMatch(w, current, names)) {
+    if (pinsHeld && !redisplay && DatesMatch(w, current, names)) {
         w.attempts = 0;
         w.dropped = false;
         w.initialized = true;
         w.enforce = false;
-        if (!w.displayLogged) {
-            // Record what Explorer actually shows (the values can be in place while Explorer
-            // still lists every item as "Unspecified", e.g. when the schema is not usable).
-            w.displayLogged = true;
-            SHANDLE_PTR hwnd = 0;
-            if (SUCCEEDED(w.browser->get_HWND(&hwnd)) && hwnd) LogDisplayedGroups(reinterpret_cast<HWND>(hwnd), w.folderPath);
+        // See what Explorer actually shows (the values can be in place while it lists every
+        // item as "Unspecified", or still shows the groups it had).
+        if (!w.displayChecked) {
+            w.displayChecked = true;
+            w.displaySuspect = false;
+            CheckDisplay(w, kDisplayCheckMs);
         }
         return;
     }
-    // The pinned group is in place but the date groups are not: items were added or changed,
-    // or a day went by. Regroup, but this is not a grouping that failed to hold.
+    // The pinned group is in place but the date groups are not (items were added or changed,
+    // or a day went by), or Explorer does not show it. Regroup, but this is not a grouping
+    // that failed to hold.
     bool datesOnly = pinsHeld;
     if (w.gaveUp && GetTickCount() - w.gaveUpTick >= kRetryAfterGiveUpMs) {
         LogLine(L"trying %s again", w.folderPath.c_str());
@@ -1012,15 +1055,17 @@ void Agent::ProcessWindow(TrackedWindow& w) {
     bool dates = !IsEqualGUID(w.dateKey.fmtid, GUID_NULL);
     if (dates && !w.sorted) {
         // Newest first within the date groups (once per view: the user may sort otherwise).
-        // Sorted first, and grouped once that is done: a grouping changed while Explorer is
-        // still sorting can leave the window showing the old groups.
+        // Sorted first, and grouped once Explorer reports the sort done: a grouping changed
+        // while Explorer is still sorting can leave the window showing the old groups.
         w.sorted = true;
         SORTCOLUMN first = {};
         if (FAILED(w.view->GetSortColumns(&first, 1)) || !IsEqualPropertyKey(first.propkey, w.dateKey)) {
             SORTCOLUMN byDate = {w.dateKey, SORT_DESCENDING};
-            w.view->SetSortColumns(&byDate, 1);
+            w.sorting = true;
+            w.loading = true;
             w.enumDone = false;
-            w.lastLoad = GetTickCount();
+            w.loadStart = w.lastLoad = GetTickCount();
+            w.view->SetSortColumns(&byDate, 1);
             Schedule(&w, kQuietMs, false);
             return;
         }
@@ -1053,6 +1098,7 @@ void Agent::ProcessWindow(TrackedWindow& w) {
     w.lastRegroup = now;
     if (!datesOnly) w.attempts++;
     w.dropped = false;
+    w.displayChecked = false;
     w.initialized = true;
     w.enforce = false;
     if (current < 0 && !w.folderIdList.empty())
@@ -1063,9 +1109,51 @@ void Agent::ProcessWindow(TrackedWindow& w) {
     w.loadStart = now;
     w.lastLoad = now;
     hr = w.view->SetGroupBy(kPinStateKeys[key], TRUE);
-    LogLine(L"%s %s (%zu of %zu pinned%s, attempt %d, 0x%08lX)", current < 0 ? L"group" : L"regroup", w.folderPath.c_str(),
-            written, names.size(), dates ? L", date groups" : L"", w.attempts, (unsigned long)hr);
+    LogLine(L"%s %s (%zu of %zu pinned%s%s, attempt %d, 0x%08lX)", current < 0 ? L"group" : L"regroup",
+            w.folderPath.c_str(), written, names.size(), dates ? L", date groups" : L"",
+            redisplay ? L", not shown" : L"", w.attempts, (unsigned long)hr);
     Schedule(&w, kQuietMs, false);
+}
+
+void Agent::CheckDisplay(TrackedWindow& w, DWORD delayMs) {
+    // The folder view's own window: the Explorer window also has the other tabs.
+    HWND window = w.viewWindow ? w.viewWindow : w.frame;
+    if (!window) return;
+    w.displayCookie = ++lastDisplayCookie_;
+    w.displayLoad = w.lastLoad;
+    CheckDisplayedGroups({window, w.folderPath, delayMs, hwnd_, kMsgDisplayChecked, w.displayCookie});
+}
+
+void Agent::OnDisplayChecked(WPARAM cookie, Display state) {
+    auto it = std::find_if(windows_.begin(), windows_.end(), [&](const auto& w) { return w->displayCookie == cookie; });
+    if (it == windows_.end()) return;  // the window or its view is gone, or a newer check runs
+    TrackedWindow& w = **it;
+    w.displayCookie = 0;
+    if (w.loading || w.lastLoad != w.displayLoad) {
+        // Explorer loaded the view again meanwhile; check once the grouping is in place again.
+        w.displayChecked = false;
+        w.displaySuspect = false;
+        return;
+    }
+    if (state != Display::NotShown) {
+        w.displaySuspect = false;
+        return;
+    }
+    if (!w.displaySuspect) {
+        // Explorer may still be drawing: look again a little later.
+        w.displaySuspect = true;
+        CheckDisplay(w, kDisplayRecheckMs);
+        return;
+    }
+    w.displaySuspect = false;
+    if (w.displayFixes >= kMaxDisplayFixes) {
+        LogLine(L"the pinned group is still not shown in %s", w.folderPath.c_str());
+        return;
+    }
+    w.displayFixes++;
+    w.displayWrong = true;
+    Schedule(&w, 0, false);
+    ArmWorkTimer();
 }
 
 // Puts back the grouping the folder had before. `forget` drops the saved grouping (the

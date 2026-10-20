@@ -1755,6 +1755,29 @@ int wmain(int argc, wchar_t** argv) {
             },
             15000);
         Check(ok, L"date groups come back when turned on", last.Describe());
+        // Explorer can go on showing other groups (or every item as "Unspecified") while the
+        // view reports the pinned grouping, e.g. after the sort and the grouping changed one
+        // right after the other. The agent sees what is shown and groups the folder again.
+        {
+            w.Refresh();
+            PROPERTYKEY key = {};
+            BOOL ascending = TRUE;
+            w.view->GetGroupBy(&key, &ascending);
+            SORTCOLUMN byName = {kItemNameDisplay, SORT_ASCENDING};
+            w.view->SetSortColumns(&byName, 1);
+            w.view->SetGroupBy(kItemTypeText, TRUE);
+            w.view->SetGroupBy(key, ascending);
+            Pump(1000);
+            last = ReadGroups(w.hwnd);
+            Print(L"INFO display right after the sort and the groupings: " + last.Describe());
+            ok = WaitFor(
+                [&] {
+                    last = ReadGroups(w.hwnd);
+                    return last.order.size() == 3 && IsPinnedLabel(last.order[0]) && last.First() == std::set<std::wstring>{L"pin"};
+                },
+                15000);
+            Check(ok, L"the pinned group is shown after the sort and the grouping changed at once", last.Describe());
+        }
         RunExe(L"unpin \"" + dated + L"\\pin.txt\"");
         Check(WaitFor([&] { return IsEqualPropertyKey(w.GroupBy(), kDateModified); }, 15000),
               L"date groups: the folder's own date grouping comes back after unpinning");
