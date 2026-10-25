@@ -57,6 +57,11 @@ constexpr DWORD kRetryAfterGiveUpMs = 60000;
 // this long (programs that save by renaming the original away and back keep the pin as it is).
 constexpr DWORD kRenameSettleMs = 1500;
 constexpr UINT kMsgShellChange = WM_APP + 4;
+constexpr UINT kMsgDisplayChecked = WM_APP + 5;
+// The grouping and the values can be in place while Explorer still shows the old groups (it
+// missed the regroup). Once two display checks in a row do not find the pinned group on top, the
+// view is regrouped; at most this many times per view.
+constexpr int kMaxRedisplays = 2;
 
 constexpr UINT kCmdReapply = 1;
 constexpr UINT kCmdCleanup = 2;
@@ -234,7 +239,11 @@ struct TrackedWindow {
     bool dropped = false;    // Explorer dropped the values of the grouping applied last
     bool gaveUp = false;     // the grouping did not hold; left alone for a while
     DWORD gaveUpTick = 0;
-    bool displayLogged = false;  // what Explorer shows was written to the log
+    bool displayLogged = false;  // what Explorer shows was checked (and written to the log)
+    LPARAM displayCheck = 0;     // the display check in progress (0: none)
+    int displayMisses = 0;       // display checks in a row that did not find the pinned group on top
+    int redisplays = 0;          // regroups in this view because the pinned group was not on screen
+    bool redisplay = false;      // regroup although the grouping and the values are in place
 
     // Date groups below the pinned group (dategroups.h).
     ComPtr<IShellFolder> localFolder;  // the folder in this process: reads the items' names and dates
@@ -280,6 +289,7 @@ private:
     void ArmSettingsWatch();
     void OnSettingsChanged();
     void UpdateButtons();
+    void OnDisplayChecked(LPARAM cookie, DisplayResult result);
 
     void WatchRenames();
     void OnShellChange(WPARAM wp, LPARAM lp);
@@ -315,6 +325,8 @@ private:
     HANDLE settingsEvent_ = nullptr;
     ExplorerButtons buttons_;
     bool dateGroups_ = true;
+    LPARAM displayChecks_ = 0;
+    std::wstring pinnedLabel_;  // the name Explorer shows for the pinned group
 
     // Renamed or moved pinned items (followed through shell change notifications on the
     // folders that contain pins).
@@ -409,6 +421,14 @@ int Agent::Run() {
     rescanPending_ = true;
     ArmWorkTimer();
     LogEnvironment(pins_.size());
+    if (IPropertyDescription* desc = nullptr; SUCCEEDED(PSGetPropertyDescription(kPinStateKeys[0], IID_PPV_ARGS(&desc)))) {
+        PWSTR text = nullptr;
+        PROPVARIANT pinned;
+        InitPropVariantFromUInt32(kPinnedValue, &pinned);
+        if (SUCCEEDED(desc->FormatForDisplay(pinned, PDFF_DEFAULT, &text)) && text) pinnedLabel_ = text;
+        CoTaskMemFree(text);
+        desc->Release();
+    }
     if (!enabled_) LogLine(L"the pinned group is turned off");
 
     HANDLE events[2];
@@ -484,6 +504,9 @@ LRESULT Agent::OnMessage(UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case kMsgShellChange:
             OnShellChange(wp, lp);
+            return 0;
+        case kMsgDisplayChecked:
+            OnDisplayChecked(lp, (DisplayResult)wp);
             return 0;
         case kMsgReapply:
             pins_ = PinStore::LoadAll();
@@ -699,6 +722,10 @@ bool Agent::AcquireView(TrackedWindow& w, bool* newSession) {
     w.dropped = false;
     w.gaveUp = false;
     w.displayLogged = false;
+    w.displayCheck = 0;
+    w.displayMisses = 0;
+    w.redisplays = 0;
+    w.redisplay = false;
     w.localFolder.Reset();
     w.dateKeyKnown = false;
     w.dated[0] = w.dated[1] = false;
@@ -935,28 +962,34 @@ void Agent::ProcessWindow(TrackedWindow& w) {
     if (w.enforce) {
         // The pins changed (or "reapply"): start over, also in a view the agent gave up on.
         w.displayLogged = false;
+        w.displayMisses = 0;
+        w.redisplays = 0;
         w.attempts = 0;
         w.churn = 0;
         w.dropped = false;
         w.gaveUp = false;
     }
     bool pinsHeld = current >= 0 && ascending && KeyMatches(w, current, names);
-    if (pinsHeld && DatesMatch(w, current, names)) {
+    if (pinsHeld && DatesMatch(w, current, names) && !w.redisplay) {
         w.attempts = 0;
         w.dropped = false;
         w.initialized = true;
         w.enforce = false;
         if (!w.displayLogged) {
-            // Record what Explorer actually shows (the values can be in place while Explorer
-            // still lists every item as "Unspecified", e.g. when the schema is not usable).
+            // Check what Explorer actually shows: the values can be in place while Explorer
+            // still shows the old groups or lists every item as "Unspecified" (OnDisplayChecked).
             w.displayLogged = true;
-            SHANDLE_PTR hwnd = 0;
-            if (SUCCEEDED(w.browser->get_HWND(&hwnd)) && hwnd) LogDisplayedGroups(reinterpret_cast<HWND>(hwnd), w.folderPath);
+            HWND window = w.viewWindow ? w.viewWindow : w.frame;
+            if (window) {
+                w.displayCheck = ++displayChecks_;
+                CheckDisplayedGroups(window, w.folderPath, pinnedLabel_, hwnd_, kMsgDisplayChecked, w.displayCheck);
+            }
         }
         return;
     }
-    // The pinned group is in place but the date groups are not: items were added or changed,
-    // or a day went by. Regroup, but this is not a grouping that failed to hold.
+    // The pinned group is in place but the date groups are not (items were added or changed,
+    // or a day went by), or Explorer does not show it. Regroup, but this is not a grouping that
+    // failed to hold.
     bool datesOnly = pinsHeld;
     if (w.gaveUp && GetTickCount() - w.gaveUpTick >= kRetryAfterGiveUpMs) {
         LogLine(L"trying %s again", w.folderPath.c_str());
@@ -1055,6 +1088,11 @@ void Agent::ProcessWindow(TrackedWindow& w) {
     w.dropped = false;
     w.initialized = true;
     w.enforce = false;
+    if (w.redisplay) {
+        // Check again what Explorer shows once this grouping holds.
+        w.redisplay = false;
+        w.displayLogged = false;
+    }
     if (current < 0 && !w.folderIdList.empty())
         MarkGrouped(w.folderPath, reinterpret_cast<PCIDLIST_ABSOLUTE>(w.folderIdList.data()));
     // Explorer reloads the view for the new grouping; check the result once that is done.
@@ -1251,6 +1289,33 @@ void Agent::OnSettingsChanged() {
         DoWork();
     }
     UpdateButtons();
+    ArmWorkTimer();
+}
+
+// The display check of a view whose grouping and values are in place came back.
+void Agent::OnDisplayChecked(LPARAM cookie, DisplayResult result) {
+    TrackedWindow* w = nullptr;
+    for (auto& t : windows_)
+        if (t->displayCheck == cookie) w = t.get();
+    if (!w) return;  // the view went away (or was checked again since)
+    w->displayCheck = 0;
+    if (result != DisplayResult::Missing || !enabled_ || !w->hasPins) {
+        w->displayMisses = 0;
+        return;
+    }
+    if (++w->displayMisses < 2) {
+        // Explorer may still have been drawing: look once more before regrouping.
+        w->displayLogged = false;
+    } else if (w->redisplays < kMaxRedisplays) {
+        w->displayMisses = 0;
+        w->redisplays++;
+        w->redisplay = true;
+        LogLine(L"the pinned group is not on screen in %s; regrouping (%d)", w->folderPath.c_str(), w->redisplays);
+    } else {
+        LogLine(L"the pinned group is still not on screen in %s after %d regroups", w->folderPath.c_str(), w->redisplays);
+        return;
+    }
+    Schedule(w, 0, false);
     ArmWorkTimer();
 }
 

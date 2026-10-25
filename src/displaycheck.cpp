@@ -15,6 +15,10 @@ namespace {
 struct Request {
     HWND window;
     std::wstring folder;
+    std::wstring label;
+    HWND notify;
+    UINT message;
+    LPARAM cookie;
 };
 
 // Group name -> topmost position and number of items Explorer has created elements for
@@ -86,27 +90,34 @@ std::wstring DescribeGroups(HWND window, std::wstring* firstGroup) {
 DWORD WINAPI CheckThread(void* param) {
     Request* request = static_cast<Request*>(param);
     Sleep(1500);  // let Explorer draw the new grouping
+    DisplayResult result = DisplayResult::Unknown;
     if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
         std::wstring first;
         std::wstring groups = DescribeGroups(request->window, &first);
-        bool shown = first == LoadStr(IDS_PROP_PINNED);
+        // No group read (the list is still being drawn, or UI Automation failed): unknown.
+        if (!first.empty()) result = first == request->label ? DisplayResult::Shown : DisplayResult::Missing;
         LogLine(L"display %s:%s%s", request->folder.c_str(), groups.c_str(),
-                shown ? L"" : L"  <- the pinned group is not shown");
+                result == DisplayResult::Missing ? L"  <- the pinned group is not shown" : L"");
         CoUninitialize();
     }
+    if (request->notify) PostMessageW(request->notify, request->message, (WPARAM)result, request->cookie);
     delete request;
     return 0;
 }
 
 }  // namespace
 
-void LogDisplayedGroups(HWND window, const std::wstring& folder) {
-    Request* request = new Request{window, folder};
+void CheckDisplayedGroups(HWND window, const std::wstring& folder, const std::wstring& pinnedLabel, HWND notify,
+                          UINT message, LPARAM cookie) {
+    Request* request = new Request{window, folder, pinnedLabel.empty() ? LoadStr(IDS_PROP_PINNED) : pinnedLabel,
+                                   notify, message, cookie};
     HANDLE thread = CreateThread(nullptr, 0, CheckThread, request, 0, nullptr);
-    if (thread)
+    if (thread) {
         CloseHandle(thread);
-    else
+    } else {
         delete request;
+        if (notify) PostMessageW(notify, message, (WPARAM)DisplayResult::Unknown, cookie);
+    }
 }
 
 }  // namespace ep
